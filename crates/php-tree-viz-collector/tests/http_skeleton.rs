@@ -1161,3 +1161,193 @@ fn success_path_log_line_carries_body_bytes_and_status_200() {
         "missing {expected_field} in: {line}"
     );
 }
+
+// ============================================================
+// Bounded-mpsc tests (added by the bounded-mpsc change)
+// ============================================================
+
+/// Write a config file that also sets `server.queue_capacity`.
+/// Same `<dir>/data/` auto-creation as `write_config`.
+fn write_config_with_queue_capacity(dir: &Path, bind: &str, queue_capacity: u32) -> PathBuf {
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let body = format!(
+        r#"[server]
+bind = "{bind}"
+queue_capacity = {queue_capacity}
+
+[auth]
+token = "{TOKEN}"
+session_salt = "{SALT}"
+
+[storage]
+data_dir = "{data_dir}"
+retention_days = 30
+"#,
+        data_dir = data_dir.display(),
+    );
+    let path = dir.join("collector.toml");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn successful_request_is_logged_as_dequeued_by_the_receiver() {
+    let dir = unique_tempdir("dequeued");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let host = "host-dequeue";
+    let pid: u64 = 4242;
+    let start_time: i64 = 17_000_000_000_000_000;
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, host, pid, start_time);
+
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+
+    // Receiver runs in a background tokio task; give it a beat.
+    std::thread::sleep(Duration::from_millis(200));
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    let key = synth_trace_key(host, pid, start_time);
+    let expected_field = format!("trace_key={key}");
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("dequeued batch") && l.contains(&expected_field))
+        .unwrap_or_else(|| {
+            panic!("no matching dequeued line for {expected_field} in stdout: {stdout:?}")
+        });
+    assert!(line.contains(".raw/batch-0001.msgpack"));
+}
+
+#[test]
+fn five_concurrent_same_trace_requests_with_capacity_1_produce_503s() {
+    let dir = unique_tempdir("backpressure_capacity_1");
+    let data_dir = dir.join("data");
+    let path = write_config_with_queue_capacity(&dir, "127.0.0.1:0", 1);
+    let collector = Collector::spawn(&path);
+
+    // All five threads target the same synthesised trace key. The
+    // permit is held across each request's commit_partial (~10 ms
+    // of fsync), so at least four of the five threads observe
+    // queue_capacity == 0 and get 503.
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-bp", 1234, 5_555_555);
+    let bound = collector.bound.clone();
+
+    let mut handles = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let bound = bound.clone();
+        let body = body.clone();
+        handles.push(std::thread::spawn(move || {
+            let req = ingest_request(&bound, &body);
+            send_raw(&bound, &req)
+        }));
+    }
+    let mut statuses = Vec::with_capacity(5);
+    for h in handles {
+        let (status, _) = h.join().unwrap();
+        statuses.push(status);
+    }
+
+    let n_503 = statuses.iter().filter(|&&s| s == 503).count();
+    let n_200 = statuses.iter().filter(|&&s| s == 200).count();
+    assert!(
+        n_503 >= 1,
+        "expected at least one 503 backpressure; got statuses {statuses:?}"
+    );
+    assert_eq!(
+        n_200 + n_503,
+        5,
+        "every response must be either 200 or 503; got {statuses:?}"
+    );
+
+    // Some 200s might have landed; the partial files for those are
+    // renamed away. No `.partial` should remain regardless.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        list_partials(&data_dir).is_empty(),
+        "503 paths must delete their partials"
+    );
+}
+
+#[test]
+fn backpressure_503_leaves_no_partial_file_in_tmp() {
+    let dir = unique_tempdir("backpressure_no_partial");
+    let data_dir = dir.join("data");
+    let path = write_config_with_queue_capacity(&dir, "127.0.0.1:0", 1);
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-no-partial", 99, 1_111);
+    let bound = collector.bound.clone();
+
+    let mut handles = Vec::with_capacity(8);
+    for _ in 0..8 {
+        let bound = bound.clone();
+        let body = body.clone();
+        handles.push(std::thread::spawn(move || {
+            let req = ingest_request(&bound, &body);
+            send_raw(&bound, &req)
+        }));
+    }
+    for h in handles {
+        let _ = h.join().unwrap();
+    }
+
+    std::thread::sleep(Duration::from_millis(200));
+    let partials = list_partials(&data_dir);
+    assert!(
+        partials.is_empty(),
+        "expected no partials after backpressure storm; got {partials:?}"
+    );
+}
+
+#[test]
+fn backpressure_503_response_body_and_header() {
+    let dir = unique_tempdir("backpressure_body");
+    let path = write_config_with_queue_capacity(&dir, "127.0.0.1:0", 1);
+    let collector = Collector::spawn(&path);
+
+    // Use a raw TCP read so we can inspect the full response (header
+    // block + body) rather than only the parsed body. We dispatch
+    // a burst, find the first 503, and assert on its raw bytes.
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-bphdr", 7, 99_999);
+    let bound = collector.bound.clone();
+
+    let mut handles = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let bound = bound.clone();
+        let body = body.clone();
+        handles.push(std::thread::spawn(move || {
+            // Re-implement send_raw inline so we can keep the raw
+            // response (head + body together).
+            let mut stream = TcpStream::connect(&bound).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let req = ingest_request(&bound, &body);
+            stream.write_all(&req).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }));
+    }
+    let raws: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let raw_503 = raws
+        .iter()
+        .find(|r| r.starts_with("HTTP/1.1 503"))
+        .unwrap_or_else(|| panic!("no 503 response among {raws:?}"));
+
+    // Body is after the blank line separator.
+    let (head, body_str) = raw_503
+        .split_once("\r\n\r\n")
+        .expect("response missing header/body delimiter");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "503 must carry Connection: close; head was: {head}"
+    );
+    assert_eq!(body_str, r#"{"error":"backpressure"}"#);
+}
