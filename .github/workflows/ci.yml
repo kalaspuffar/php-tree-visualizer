@@ -1,0 +1,64 @@
+name: CI
+
+# Runs the same three checks I run locally before every commit:
+#
+#   cargo fmt --all -- --check
+#   cargo clippy --all-targets --all-features -- -D warnings
+#   cargo test  --all-targets --all-features
+#
+# All three already gate every change locally; this workflow puts
+# the same gate in front of every PR and every push to `main` so
+# nothing slips in on a contributor's "I forgot to run cargo test"
+# day.
+#
+# The toolchain is pinned via `rust-toolchain.toml` (stable +
+# rustfmt + clippy components). `rustup show` honours that file on
+# first invocation, so we don't need to call `actions-rs/toolchain`
+# or hard-code a version here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel in-flight runs for the same ref when a new commit arrives.
+# Saves CI minutes on rapid-fire pushes; doesn't affect main pushes
+# (each main commit gets its own non-cancelled run via the unique
+# group key).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # `rust-toolchain.toml` pins the channel and the rustfmt +
+        # clippy components. `rustup show` resolves the file and
+        # installs whatever's missing.
+        run: rustup show
+
+      - name: Cache cargo
+        # Caches ~/.cargo registry + git db + target/. Keyed on
+        # Cargo.lock so a dependency bump cleanly invalidates.
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets --all-features
