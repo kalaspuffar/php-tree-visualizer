@@ -298,3 +298,49 @@ durable state, not from "what the first transaction told me to
 add".** Additive deltas only work when both transactions commit
 under a single failure boundary (one fsync, one process). The
 per-trace + index pair doesn't qualify.
+
+## 2026-05-23 — Dropping a WAL-mode SQLite Connection checkpoints the sidecars
+
+Dropping a `rusqlite::Connection` against a WAL-mode database
+triggers an implicit checkpoint at close: pages in
+`<key>.sqlite-wal` get applied to the main `.sqlite` file and the
+`-wal` typically shrinks to near-zero. `-shm` follows. This is
+standard SQLite behaviour but it has a sharp edge in any code that
+*stats* the sidecar sizes relative to the connection's lifecycle.
+
+Caught during `retention-sweeper`'s `delete_trace_freed_bytes_sums_per_trace_plus_raw`
+test. The original test:
+
+1. `record_batch(...)` — leaves `-wal` and `-shm` populated.
+2. Test stat's the trio → sees the populated sizes (~115 KB).
+3. Test calls `delete_trace(&key)`.
+4. `delete_trace` does `self.trace_conns.remove(key)` *first* —
+   dropping the cached `Connection`, which checkpoints WAL → main
+   and shrinks the sidecars to ~0.
+5. `delete_trace` then stats → sees the post-checkpoint sizes (~57 KB).
+6. Test asserts pre-stat == helper's stat. Fails by ~58 KB.
+
+Both numbers are "correct" measurements of the same files at
+different points in their lifecycle. The bug was in the test's
+mental model, not the helper.
+
+**The rule:** if you need to compare a pre-and-post measurement of
+WAL-mode SQLite file sizes across a code path that may drop the
+`Connection`, drop it yourself first so both measurements are
+taken from the same lifecycle state. In the fixed test:
+
+```rust
+storage.trace_conns.remove(&key); // checkpoint NOW
+let trio_total = stat_files(&trio_paths);
+let outcome = storage.delete_trace(&key).unwrap();
+assert_eq!(outcome.freed_bytes, trio_total + raw_size);
+```
+
+This generalises: every operation that asserts on per-trace
+SQLite *byte-size* invariants — disk-usage gauges (future Phase 8
+work per §3.6 / R-1), retention threshold experiments, file-size
+based test fixtures — needs the same discipline. The PHP API
+read path doesn't have this concern because it opens its own
+read-only connections that don't write to the WAL.
+
+Pinned in `crates/php-tree-viz-collector/src/storage/mod.rs::tests::delete_trace_freed_bytes_sums_per_trace_plus_raw`.

@@ -40,6 +40,17 @@ pub struct FinalizeOutcome {
     pub cpu_snapshot_available: bool,
 }
 
+/// Counters surfaced by `Storage::delete_trace`. The retention loop
+/// sums `freed_bytes` across the tick's prunes for its
+/// `swept retention …` summary line.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeleteOutcome {
+    /// On-disk bytes the prune reclaimed: per-trace SQLite + its
+    /// `-wal` + `-shm` sidecars + the contents of `<key>.raw/`.
+    /// Files already missing contribute zero.
+    pub freed_bytes: u64,
+}
+
 use crate::http::BatchSubmission;
 use crate::tracekey::TraceKey;
 use crate::wire;
@@ -287,6 +298,37 @@ impl Storage {
         Ok(keys)
     }
 
+    /// List every trace whose `start_time_ns` precedes `cutoff_ns`,
+    /// regardless of state. Used by the retention sweeper; backed by
+    /// the covering index `idx_traces_start_time` (per
+    /// `SPECIFICATION.md` §4.2). No `state` filter — a still-`active`
+    /// trace older than the retention window is also pruned, per the
+    /// §2.2 sweeper sketch.
+    pub fn list_expired_traces(&mut self, cutoff_ns: i64) -> Result<Vec<TraceKey>, StorageError> {
+        let mut stmt = self
+            .index_conn
+            .prepare_cached("SELECT trace_key FROM traces WHERE start_time_ns < ?1")
+            .map_err(|e| StorageError::Query {
+                context: "prepare list_expired_traces",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![cutoff_ns], |row| row.get::<_, String>(0))
+            .map_err(|e| StorageError::Query {
+                context: "query list_expired_traces",
+                source: e,
+            })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|e| StorageError::Query {
+                context: "iterate list_expired_traces",
+                source: e,
+            })?;
+            keys.push(TraceKey::from_raw(&raw));
+        }
+        Ok(keys)
+    }
+
     /// Close a trace's lifecycle: drain `pending_calls` into DQ-2
     /// anomalies, compute `cpu_snapshot_available`, flip
     /// `state = 'finalized'` in both databases, and evict the
@@ -409,6 +451,74 @@ impl Storage {
             cpu_snapshot_available: cpu_available,
         })
     }
+
+    /// Prune a trace from disk and from `index.sqlite`. Order of
+    /// operations is fixed:
+    ///
+    /// 1. Evict the per-trace SQLite connection from the cache so
+    ///    no open fd pins the about-to-be-unlinked inode.
+    /// 2. Stat the per-trace SQLite trio (`.sqlite`, `-wal`, `-shm`)
+    ///    and the contents of `<key>.raw/` for byte accounting.
+    /// 3. Unlink the four artifacts. `NotFound` is treated as
+    ///    success — the caller may be retrying a half-completed
+    ///    prune, or the operator may have manually deleted files.
+    /// 4. `DELETE FROM traces` for this `trace_key` in
+    ///    `index.sqlite`.
+    ///
+    /// The filesystem deletions run *before* the index DELETE so a
+    /// crash between the two leaves the row visible — the next
+    /// retention tick retries the file deletes (idempotent
+    /// `NotFound`) and then the row delete (succeeds). The
+    /// reverse order would orphan files on disk with no way to
+    /// find them again.
+    pub fn delete_trace(&mut self, key: &TraceKey) -> Result<DeleteOutcome, StorageError> {
+        // 1. Eviction first.
+        self.trace_conns.remove(key);
+
+        // 2. Size accounting.
+        let traces_dir = self.traces_dir.as_path();
+        let sqlite_path = traces_dir.join(format!("{}.sqlite", key.as_str()));
+        let wal_path = traces_dir.join(format!("{}.sqlite-wal", key.as_str()));
+        let shm_path = traces_dir.join(format!("{}.sqlite-shm", key.as_str()));
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+
+        let mut freed_bytes: u64 = 0;
+        freed_bytes = freed_bytes.saturating_add(file_size_or_zero(&sqlite_path)?);
+        freed_bytes = freed_bytes.saturating_add(file_size_or_zero(&wal_path)?);
+        freed_bytes = freed_bytes.saturating_add(file_size_or_zero(&shm_path)?);
+        freed_bytes = freed_bytes.saturating_add(directory_size_bytes(&raw_dir)?);
+
+        // 3. Filesystem deletes. Order within step 3 doesn't matter
+        //    for correctness — the index row is still present, so a
+        //    crash mid-step lets the next tick finish the job.
+        remove_file_idempotent(&sqlite_path)?;
+        remove_file_idempotent(&wal_path)?;
+        remove_file_idempotent(&shm_path)?;
+        remove_dir_all_idempotent(&raw_dir)?;
+
+        // 4. Index DELETE last.
+        let tx = self
+            .index_conn
+            .transaction()
+            .map_err(|e| StorageError::Query {
+                context: "delete_trace index begin",
+                source: e,
+            })?;
+        tx.execute(
+            "DELETE FROM traces WHERE trace_key = ?1",
+            params![key.as_str()],
+        )
+        .map_err(|e| StorageError::Query {
+            context: "delete traces row",
+            source: e,
+        })?;
+        tx.commit().map_err(|e| StorageError::Query {
+            context: "delete_trace index commit",
+            source: e,
+        })?;
+
+        Ok(DeleteOutcome { freed_bytes })
+    }
 }
 
 /// Pull every `(call_id, parent_call_id)` pair out of `pending_calls`
@@ -435,6 +545,92 @@ fn collect_pending_rows(tx: &Connection) -> Result<Vec<(i64, i64)>, StorageError
         })?);
     }
     Ok(out)
+}
+
+/// Stat a single file and return its length in bytes. A missing
+/// file returns `Ok(0)` — the retention sweeper treats "already
+/// gone" as zero contribution, not an error. Any other I/O failure
+/// surfaces as `StorageError::Io` so the loop can log it.
+fn file_size_or_zero(path: &Path) -> Result<u64, StorageError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(StorageError::Io {
+            context: "stat file for freed_bytes",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Sum the sizes of regular files directly inside `dir`. The
+/// retention sweeper points this at `<key>.raw/`, which is flat
+/// per `SPECIFICATION.md` §4.4.1 — sub-directories are not
+/// expected but are defensively skipped (counted as zero) so a
+/// hostile or stray nested directory doesn't break accounting.
+/// A missing directory returns `Ok(0)`.
+fn directory_size_bytes(dir: &Path) -> Result<u64, StorageError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(StorageError::Io {
+                context: "read_dir for freed_bytes",
+                path: dir.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut total: u64 = 0;
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            context: "iterate directory for freed_bytes",
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| StorageError::Io {
+            context: "stat directory entry",
+            path: entry.path(),
+            source,
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let meta = entry.metadata().map_err(|source| StorageError::Io {
+            context: "stat directory entry metadata",
+            path: entry.path(),
+            source,
+        })?;
+        total = total.saturating_add(meta.len());
+    }
+    Ok(total)
+}
+
+/// `std::fs::remove_file` but `NotFound` is `Ok(())`. Anything
+/// else propagates as `StorageError::Io`.
+fn remove_file_idempotent(path: &Path) -> Result<(), StorageError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StorageError::Io {
+            context: "remove_file",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `std::fs::remove_dir_all` but `NotFound` is `Ok(())`.
+fn remove_dir_all_idempotent(path: &Path) -> Result<(), StorageError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StorageError::Io {
+            context: "remove_dir_all",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// `cpu_snapshot_available` per `SPECIFICATION.md` §4.2: `false` when
@@ -1407,5 +1603,348 @@ mod tests {
         let idle = storage.list_idle_active_traces(250).unwrap();
         let idle_strs: Vec<&str> = idle.iter().map(|k| k.as_str()).collect();
         assert_eq!(idle_strs, vec![k2.as_str()]);
+    }
+
+    // ---- list_expired_traces ----
+
+    /// Build a record-batch helper that lets the test pin
+    /// `meta.start_time` (the column the retention sweeper reads),
+    /// since the existing `meta()` helper hard-codes it to `1`.
+    fn meta_with_start(host: &str, pid: u64, start_time: i64) -> Meta {
+        let mut m = meta(host, pid, start_time);
+        m.start_time = start_time;
+        m
+    }
+
+    fn record_trace_with_start_time(
+        storage: &mut Storage,
+        hex: &str,
+        host: &str,
+        start_time: i64,
+    ) -> TraceKey {
+        let key = TraceKey::from_raw(hex);
+        let sub = dummy_submission(&key, &storage.traces_dir);
+        let b = batch_with(
+            vec![dict_entry(7, "f")],
+            vec![call(1, 0, 7, 10)],
+            meta_with_start(host, 1, start_time),
+        );
+        storage.record_batch(&sub, &b, start_time).unwrap();
+        key
+    }
+
+    #[test]
+    fn list_expired_traces_filters_by_start_time() {
+        let dir = unique_dir("list_expired_filter");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+
+        let k1 = record_trace_with_start_time(
+            &mut storage,
+            "ee00000000000000000000000000ee01",
+            "h1",
+            100,
+        );
+        let k2 = record_trace_with_start_time(
+            &mut storage,
+            "ee00000000000000000000000000ee02",
+            "h2",
+            200,
+        );
+        let _k3 = record_trace_with_start_time(
+            &mut storage,
+            "ee00000000000000000000000000ee03",
+            "h3",
+            300,
+        );
+
+        let expired = storage.list_expired_traces(250).unwrap();
+        let strs: Vec<&str> = expired.iter().map(|k| k.as_str()).collect();
+        assert_eq!(strs.len(), 2);
+        assert!(strs.contains(&k1.as_str()));
+        assert!(strs.contains(&k2.as_str()));
+    }
+
+    #[test]
+    fn list_expired_traces_includes_active_traces() {
+        // No state filter: even a still-active trace gets pruned if
+        // it's older than the cutoff. Mirrors the SPECIFICATION.md
+        // §2.2 sweeper sketch.
+        let dir = unique_dir("list_expired_active");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "ee00000000000000000000000000ff01",
+            "active-host",
+            100,
+        );
+        let state: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "active", "sanity: state is still active");
+
+        let expired = storage.list_expired_traces(200).unwrap();
+        assert_eq!(
+            expired.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+            vec![key.as_str()]
+        );
+    }
+
+    #[test]
+    fn list_expired_traces_returns_empty_when_nothing_expired() {
+        let dir = unique_dir("list_expired_empty");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let _ = record_trace_with_start_time(
+            &mut storage,
+            "ee00000000000000000000000000aa01",
+            "fresh-host",
+            200,
+        );
+        let expired = storage.list_expired_traces(100).unwrap();
+        assert!(expired.is_empty());
+    }
+
+    // ---- delete_trace ----
+
+    #[test]
+    fn delete_trace_removes_per_trace_sqlite_plus_wal_shm() {
+        let dir = unique_dir("delete_files");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd01",
+            "del-host",
+            100,
+        );
+        // The synthetic-root seed + per-trace transaction commit in
+        // `record_batch` causes SQLite to materialise the -wal sidecar
+        // (and -shm under WAL). They may or may not exist depending on
+        // whether SQLite checkpointed; the assertion afterwards just
+        // says "they are gone now", not "they were here before".
+        let sqlite_path = traces_dir.join(format!("{}.sqlite", key.as_str()));
+        assert!(sqlite_path.is_file(), "main DB exists before delete");
+
+        storage.delete_trace(&key).unwrap();
+
+        assert!(!sqlite_path.exists(), "main DB removed");
+        assert!(
+            !traces_dir
+                .join(format!("{}.sqlite-wal", key.as_str()))
+                .exists(),
+            "-wal removed"
+        );
+        assert!(
+            !traces_dir
+                .join(format!("{}.sqlite-shm", key.as_str()))
+                .exists(),
+            "-shm removed"
+        );
+    }
+
+    #[test]
+    fn delete_trace_removes_raw_directory() {
+        let dir = unique_dir("delete_raw_dir");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd02",
+            "raw-host",
+            100,
+        );
+
+        // `record_batch` does NOT create `<key>.raw/` (that's the http
+        // layer's job). Fabricate the directory + one file so the test
+        // can assert it gets removed.
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        std::fs::write(raw_dir.join("batch-0001.msgpack"), b"hello").unwrap();
+
+        storage.delete_trace(&key).unwrap();
+
+        assert!(!raw_dir.exists(), "raw directory removed");
+    }
+
+    #[test]
+    fn delete_trace_deletes_index_row() {
+        let dir = unique_dir("delete_index_row");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd03",
+            "row-host",
+            100,
+        );
+        // Sanity: row exists.
+        let n_before: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_before, 1);
+
+        storage.delete_trace(&key).unwrap();
+
+        let n_after: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_after, 0);
+    }
+
+    #[test]
+    fn delete_trace_evicts_cached_connection() {
+        let dir = unique_dir("delete_evict");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd04",
+            "evict-host",
+            100,
+        );
+        assert!(
+            storage.has_cached_trace_conn(&key),
+            "record_batch caches the per-trace conn"
+        );
+        storage.delete_trace(&key).unwrap();
+        assert!(
+            !storage.has_cached_trace_conn(&key),
+            "delete_trace evicts the per-trace conn"
+        );
+    }
+
+    #[test]
+    fn delete_trace_freed_bytes_sums_per_trace_plus_raw() {
+        let dir = unique_dir("delete_freed_bytes");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd05",
+            "freed-host",
+            100,
+        );
+
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        // 100 bytes exactly.
+        std::fs::write(raw_dir.join("batch-0001.msgpack"), vec![0u8; 100]).unwrap();
+
+        // Evict the cached connection BEFORE we stat: dropping the
+        // SQLite handle triggers a final WAL checkpoint that shrinks
+        // the -wal/-shm sidecars. `delete_trace` itself does this
+        // eviction internally as its first step, so if the test stats
+        // before that eviction we'd see different sizes than the helper
+        // does. Match the helper's vantage point.
+        storage.trace_conns.remove(&key);
+
+        let trio_paths = [
+            traces_dir.join(format!("{}.sqlite", key.as_str())),
+            traces_dir.join(format!("{}.sqlite-wal", key.as_str())),
+            traces_dir.join(format!("{}.sqlite-shm", key.as_str())),
+        ];
+        let trio_total: u64 = trio_paths
+            .iter()
+            .map(|p| match std::fs::metadata(p) {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(err) => panic!("unexpected stat error on {p:?}: {err}"),
+            })
+            .sum();
+
+        let outcome = storage.delete_trace(&key).unwrap();
+        assert_eq!(outcome.freed_bytes, trio_total + 100);
+    }
+
+    #[test]
+    fn delete_trace_is_idempotent_when_files_already_gone() {
+        let dir = unique_dir("delete_idempotent");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd06",
+            "idem-host",
+            100,
+        );
+
+        // Simulate a half-completed prune: nuke the per-trace files
+        // (including the WAL sidecars, which may not exist on disk if
+        // SQLite checkpointed — `remove_file_idempotent` would tolerate
+        // NotFound, but our direct calls here would fail. Use the
+        // helpers' wrapper logic instead.)
+        for suffix in [".sqlite", ".sqlite-wal", ".sqlite-shm"] {
+            let p = traces_dir.join(format!("{}{suffix}", key.as_str()));
+            let _ = std::fs::remove_file(&p); // ignore NotFound
+        }
+
+        // Also evict the cached connection so SQLite doesn't keep an
+        // open fd preventing the unlink we already did.
+        storage.trace_conns.remove(&key);
+
+        let outcome = storage.delete_trace(&key).unwrap();
+        // freed_bytes may be 0 (files were gone) or non-zero (a -wal
+        // appeared since record_batch); either way, no panic.
+        let _ = outcome.freed_bytes;
+
+        let n: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "row still gets deleted on retry");
+    }
+
+    #[test]
+    fn delete_trace_prunes_an_active_trace_too() {
+        // The retention loop doesn't filter on state. Confirm
+        // delete_trace itself doesn't care either: an 'active' trace
+        // is pruned exactly like a 'finalized' one.
+        let dir = unique_dir("delete_active");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = record_trace_with_start_time(
+            &mut storage,
+            "dd00000000000000000000000000dd07",
+            "active-prune",
+            100,
+        );
+
+        let state: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "active", "sanity");
+
+        storage.delete_trace(&key).unwrap();
+
+        let n: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

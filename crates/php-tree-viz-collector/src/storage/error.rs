@@ -33,6 +33,16 @@ pub enum StorageError {
         context: &'static str,
         source: rusqlite::Error,
     },
+    /// A filesystem operation outside the SQLite layer failed —
+    /// `metadata`, `read_dir`, `remove_file`, `remove_dir_all`.
+    /// Used by the retention sweeper when stat-ing or unlinking
+    /// the per-trace files. `NotFound` is *not* surfaced as this
+    /// variant; the sweeper treats missing files as success.
+    Io {
+        context: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for StorageError {
@@ -64,6 +74,17 @@ impl std::fmt::Display for StorageError {
             Self::Query { context, source } => {
                 write!(f, "sqlite query failed ({context}): {source}")
             }
+            Self::Io {
+                context,
+                path,
+                source,
+            } => {
+                write!(
+                    f,
+                    "filesystem operation failed ({context}) at {}: {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -74,6 +95,7 @@ impl std::error::Error for StorageError {
             Self::Open { source, .. }
             | Self::SchemaApply { source, .. }
             | Self::Query { source, .. } => Some(source),
+            Self::Io { source, .. } => Some(source),
             Self::UnknownSchemaVersion { .. } => None,
         }
     }

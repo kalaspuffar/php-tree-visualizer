@@ -12,6 +12,7 @@
 mod config;
 mod finalize;
 mod http;
+mod retention;
 mod storage;
 mod tracekey;
 mod wire;
