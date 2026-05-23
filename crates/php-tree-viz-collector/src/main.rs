@@ -1,38 +1,65 @@
 //! The collector binary.
 //!
-//! Today this is a thin wrapper around the config loader: parse the
-//! `--config <path>` CLI flag, load and validate the TOML file at that
-//! path, print a single redacted summary line, and exit. Subsequent
-//! OpenSpec changes will replace the `println!` with the HTTP server,
-//! decoder, storage, finalize, and retention modules listed in
-//! `SPECIFICATION.md` §3.1.
+//! Load the TOML config, then bind an HTTP listener and serve until
+//! SIGTERM / SIGINT. Exit codes:
+//!
+//! - `0` — clean shutdown.
+//! - `1` — reserved for the Rust panic default.
+//! - `2` — configuration problem (bad CLI args, file unreadable,
+//!   parse error, validation failure).
+//! - `3` — HTTP / bind error.
 
 mod config;
+mod http;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use crate::config::{load_from_path, ConfigError};
+use crate::config::{load_from_path, Config, ConfigError};
 
 fn main() -> ExitCode {
-    match run(std::env::args().collect()) {
+    let args: Vec<String> = std::env::args().collect();
+    let path = match parse_args(&args) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("config error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match load_from_path(&path) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("config error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    print_startup_summary(&path, &cfg);
+
+    // Build a multi-thread runtime; bring axum up; serve until signal.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("http error: could not start tokio runtime: {err}");
+            return ExitCode::from(3);
+        }
+    };
+
+    match runtime.block_on(http::run(Arc::new(cfg))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Single-line stderr; stdout stays untouched.
-            eprintln!("config error: {err}");
-            // Exit 2 = configuration problem. 1 is reserved for the
-            // Rust panic default so the operator can distinguish
-            // "config is wrong" from "the program crashed."
-            ExitCode::from(2)
+            eprintln!("http error: {err}");
+            ExitCode::from(3)
         }
     }
 }
 
-fn run(args: Vec<String>) -> Result<(), ConfigError> {
-    let path = parse_args(&args)?;
-    let cfg = load_from_path(&path)?;
-    // The summary line is the only thing on stdout. Secrets are
-    // redacted by their Display impls; INV-2 is preserved.
+fn print_startup_summary(path: &std::path::Path, cfg: &Config) {
+    // Same redacted summary as before — secrets pass through their
+    // Display impls (`***`). This is the operator's startup banner.
     println!(
         "loaded config from {}: bind={} data_dir={} retention={}d \
          queue_capacity={} max_body_bytes={} log={}/{} token={} salt={}",
@@ -47,7 +74,6 @@ fn run(args: Vec<String>) -> Result<(), ConfigError> {
         cfg.auth.token,
         cfg.auth.session_salt,
     );
-    Ok(())
 }
 
 /// Hand-rolled CLI parser. Recognises exactly one flag: `--config

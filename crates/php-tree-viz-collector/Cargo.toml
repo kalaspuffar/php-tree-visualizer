@@ -7,5 +7,8 @@ description = "Collector + ingester for the php-analyze PHP profiling extension.
 license = "MIT"
 
 [dependencies]
+axum = "0.7"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 toml = "0.8"
+tower = "0.5"

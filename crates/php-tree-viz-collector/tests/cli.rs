@@ -8,10 +8,6 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_php-tree-viz-collector");
 
-/// `etc/collector.toml.example` is embedded at compile time so the
-/// test never resolves a relative path against the runtime CWD.
-const EXAMPLE: &str = include_str!("../../../etc/collector.toml.example");
-
 fn unique_tempdir(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -47,24 +43,6 @@ fn run_with_config(path: &Path) -> Output {
         .expect("failed to run the collector binary")
 }
 
-fn valid_minimal_config() -> String {
-    let token = "T".repeat(40);
-    let salt = "S".repeat(40);
-    format!(
-        r#"[server]
-bind = "127.0.0.1:8088"
-
-[auth]
-token = "{token}"
-session_salt = "{salt}"
-
-[storage]
-data_dir = "/var/lib/php-tree-viz"
-retention_days = 30
-"#
-    )
-}
-
 #[test]
 fn invocation_without_arguments_exits_two_with_one_stderr_line() {
     let out = run_binary(&[]);
@@ -95,57 +73,13 @@ fn invocation_with_nonexistent_config_path_exits_two_and_names_the_path() {
     assert_eq!(stderr.lines().count(), 1);
 }
 
-#[test]
-fn valid_config_exits_zero_with_one_redacted_stdout_line() {
-    let token = "T".repeat(40);
-    let salt = "S".repeat(40);
-    let dir = unique_tempdir("valid_minimal");
-    let path = write_config_in(&dir, &valid_minimal_config());
-
-    let out = run_with_config(&path);
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "expected success; stderr was: {stderr:?}"
-    );
-
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stderr.is_empty(), "stderr should be empty; was: {stderr:?}");
-    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout:?}");
-    assert!(stdout.contains("loaded config from"));
-    assert!(stdout.contains(path.to_str().unwrap()));
-    assert!(
-        !stdout.contains(&token),
-        "stdout leaked the token: {stdout:?}"
-    );
-    assert!(
-        !stdout.contains(&salt),
-        "stdout leaked the salt: {stdout:?}"
-    );
-}
-
-#[test]
-fn example_file_loads_via_binary_after_placeholder_substitution() {
-    let token = "T".repeat(40);
-    let salt = "S".repeat(40);
-    // `REPLACE_ME` is a prefix of `REPLACE_ME_TOO`, so substitute the
-    // longer string first.
-    let body = EXAMPLE
-        .replace("REPLACE_ME_TOO", &salt)
-        .replace("REPLACE_ME", &token);
-
-    let dir = unique_tempdir("example_load");
-    let path = write_config_in(&dir, &body);
-
-    let out = run_with_config(&path);
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "example file should load; stderr was: {stderr:?}"
-    );
-}
+// The previous `valid_config_exits_zero_with_one_redacted_stdout_line`
+// and `example_file_loads_via_binary_after_placeholder_substitution`
+// tests have moved to `tests/http_skeleton.rs`: now that loading a
+// valid config also starts an HTTP server that blocks until SIGTERM,
+// the run-to-completion shape no longer applies, and the equivalent
+// coverage uses the `Collector` spawn-and-kill helper from the http
+// integration tests.
 
 #[test]
 fn malformed_toml_exits_two_on_a_single_stderr_line() {
