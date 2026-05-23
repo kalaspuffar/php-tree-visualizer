@@ -25,11 +25,12 @@ use tokio::io::AsyncWriteExt;
 
 use super::storage;
 use super::tmp;
-use super::{BodyBytes, HttpError, SharedState};
+use super::{BatchSubmission, BodyBytes, HttpError, SharedState};
 use crate::tracekey;
 use crate::wire;
 
 const TOO_LARGE_BODY: &str = r#"{"error":"too_large"}"#;
+const BACKPRESSURE_BODY: &str = r#"{"error":"backpressure"}"#;
 const INTERNAL_BODY: &str = r#"{"error":"internal","detail":"could not buffer request"}"#;
 const MALFORMED_FRAME_BODY: &str = r#"{"error":"malformed_request"}"#;
 const TRACE_FULL_BODY_PREFIX: &str = r#"{"error":"trace_full","trace_key":""#;
@@ -125,7 +126,19 @@ pub async fn ingest(
         );
     }
 
-    // ---- Commit under per-trace lock ----
+    // ---- Reserve a slot on the bounded ingest channel ----
+    // Done before touching the trace's raw directory so a 503
+    // leaves zero on-disk artefacts for the rejected request.
+    // See design D-1.
+    let permit = match state.batch_tx.try_reserve() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            return with_body_bytes(backpressure_response(), bytes_read);
+        }
+    };
+
+    // ---- Commit under per-trace lock (permit held throughout) ----
     let key = tracekey::from_meta(&meta);
     let lock = state.lock_for(&key);
     let commit_result = {
@@ -136,13 +149,26 @@ pub async fn ingest(
     };
 
     match commit_result {
-        Ok(_target) => with_body_bytes(success_response(), bytes_read),
+        Ok(target) => {
+            // Use the permit to send. The send is infallible because
+            // the slot was reserved above; consuming it releases the
+            // permit's hold on the slot and queues the submission.
+            permit.send(BatchSubmission {
+                path: target,
+                trace_key: key,
+            });
+            with_body_bytes(success_response(), bytes_read)
+        }
         Err(HttpError::TraceFull { key }) => {
+            // Dropping the permit releases the reserved slot.
             // Leave the partial in place on trace_full so an
             // operator can inspect what could not be committed.
+            drop(permit);
             with_body_bytes(trace_full_response(&key), bytes_read)
         }
         Err(err) => {
+            // Dropping the permit releases the reserved slot.
+            drop(permit);
             let _ = tokio::fs::remove_file(&path).await;
             log_internal_error(&err);
             with_body_bytes(internal_response(), bytes_read)
@@ -237,6 +263,15 @@ fn too_large_response() -> Response<Body> {
         .header(header::CONNECTION, "close")
         .body(Body::from(TOO_LARGE_BODY))
         .expect("413 response is a fixed shape; build cannot fail")
+}
+
+fn backpressure_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONNECTION, "close")
+        .body(Body::from(BACKPRESSURE_BODY))
+        .expect("503 response is a fixed shape; build cannot fail")
 }
 
 fn internal_response() -> Response<Body> {
@@ -346,6 +381,40 @@ mod tests {
         let r = too_large_response();
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(r.headers().get(header::CONNECTION).unwrap(), "close");
+    }
+
+    #[test]
+    fn backpressure_response_has_correct_status_and_body() {
+        let r = backpressure_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(r.headers().get(header::CONNECTION).unwrap(), "close");
+    }
+
+    #[tokio::test]
+    async fn backpressure_response_body_is_the_documented_shape() {
+        let r = backpressure_response();
+        let body = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), BACKPRESSURE_BODY);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_returns_full_when_slot_is_taken() {
+        // Sanity check of the tokio primitive we depend on: with a
+        // channel of capacity 1, a single outstanding permit makes
+        // the next `try_reserve` fail with `Full`. If this ever
+        // breaks (e.g. tokio's mpsc reuses the slot mid-permit) the
+        //503 path would silently become unreachable.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<u32>(1);
+        let _permit = tx.try_reserve().expect("first reserve must succeed");
+        let err = tx.try_reserve().expect_err("second reserve must fail");
+        assert!(matches!(
+            err,
+            tokio::sync::mpsc::error::TrySendError::Full(_)
+        ));
     }
 
     #[test]

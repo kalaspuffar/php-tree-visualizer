@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use super::{router, storage, tmp, AppState, HttpError, SharedState};
+use super::{router, storage, tmp, AppState, BatchSubmission, HttpError, SharedState};
 use crate::config::Config;
 
 /// Entry point called from `main` after the config has been validated.
@@ -26,6 +26,27 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     // connect.
     let tmp_dir = tmp::ensure_clean_tmp_dir(&config.storage.data_dir)?;
     let traces_dir = storage::ensure_traces_dir(&config.storage.data_dir)?;
+
+    // Build the bounded ingest channel and spawn the placeholder
+    // receiver. The receiver currently drops every item after one
+    // log line; the future decoder slice replaces its body with
+    // `wire::decode + storage`. When axum's serve future ends, the
+    // router and AppState are dropped, the sender goes out of
+    // scope, and `recv()` returns `None` — the task exits cleanly
+    // without explicit shutdown plumbing.
+    let queue_capacity = config.server.queue_capacity as usize;
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<BatchSubmission>(queue_capacity);
+    tokio::spawn(async move {
+        while let Some(item) = batch_rx.recv().await {
+            // INV-2 unaffected: trace_key is not a secret (it's the
+            // on-disk path stem).
+            println!(
+                "dequeued batch path={} trace_key={}",
+                item.path.display(),
+                item.trace_key,
+            );
+        }
+    });
 
     let listener = TcpListener::bind(addr)
         .await
@@ -49,6 +70,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         tmp_dir,
         traces_dir,
         trace_locks: Default::default(),
+        batch_tx,
     });
 
     let app = router::build(state).into_make_service_with_connect_info::<SocketAddr>();
