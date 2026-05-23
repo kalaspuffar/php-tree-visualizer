@@ -84,50 +84,21 @@ impl Storage {
         let key = &submission.trace_key;
         let meta = &batch.meta;
 
-        // Sum per-batch wall ns; may be negative if any call has
-        // t_out < t_in (DQ-3 territory — anomaly detection lands
-        // with aggregation, not here).
+        // Sum per-batch wall ns. Clamp each call's delta to ≥ 0
+        // so a DQ-3 Call (t_out < t_in) doesn't *decrease* the
+        // running `traces.total_wall_ns`. The raw t_in / t_out
+        // values still flow through to aggregate_calls, which
+        // writes the inverted_time anomaly row with the original
+        // (signed) values in `detail`.
         let call_count = batch.calls.len() as i64;
         let total_wall_delta: i64 = batch
             .calls
             .iter()
-            .map(|c| c.t_out.saturating_sub(c.t_in))
+            .map(|c| c.t_out.saturating_sub(c.t_in).max(0))
             .sum();
 
-        // ---- index.sqlite upsert ----
-        let tx = self
-            .index_conn
-            .transaction()
-            .map_err(|e| StorageError::Query {
-                context: "index begin",
-                source: e,
-            })?;
-        tx.execute(
-            UPSERT_TRACE_SQL,
-            params![
-                key.as_str(),                // ?1 trace_key
-                &meta.trace_id,              // ?2 trace_id
-                &meta.host,                  // ?3 host
-                meta.pid as i64,             // ?4 pid (sqlite INTEGER is i64)
-                meta.start_time,             // ?5 start_time_ns
-                &meta.sapi,                  // ?6 sapi
-                &meta.uri_or_script,         // ?7 uri_or_script
-                received_at_ns,              // ?8 first_batch_at_ns / last_batch_at_ns
-                call_count,                  // ?9 call_count delta
-                total_wall_delta,            // ?10 total_wall_ns delta
-                meta.dropped_records as i64, // ?11 dropped_records
-            ],
-        )
-        .map_err(|e| StorageError::Query {
-            context: "upsert traces row",
-            source: e,
-        })?;
-        tx.commit().map_err(|e| StorageError::Query {
-            context: "index commit",
-            source: e,
-        })?;
-
-        // ---- per-trace SQLite ----
+        // ---- per-trace SQLite (runs first so its outcome feeds
+        //      the index update with the actual anomaly count) ----
         let trace_conn = self.ensure_trace_conn(key)?;
 
         let tx = trace_conn.transaction().map_err(|e| StorageError::Query {
@@ -184,12 +155,57 @@ impl Storage {
         // Seed the synthetic root (idempotent INSERT OR IGNORE)
         // and aggregate the batch's Calls into the per-trace
         // nodes tree. Both run inside the same transaction so a
-        // reader never sees a partial batch.
+        // reader never sees a partial batch. The outcome's
+        // `anomalies_added` feeds the index update below.
         aggregate::seed_synthetic_root(&tx)?;
         let outcome = aggregate::aggregate_calls(&tx, key, batch)?;
 
         tx.commit().map_err(|e| StorageError::Query {
             context: "trace commit",
+            source: e,
+        })?;
+
+        // ---- index.sqlite upsert ----
+        //
+        // Runs AFTER the per-trace transaction so the `anomaly_count`
+        // bump reflects what actually landed in the per-trace
+        // `anomalies` table. If this index transaction fails after
+        // the per-trace one committed, the trace will appear "empty"
+        // in list queries until the extension retries the same batch
+        // and the index update succeeds; the per-trace SQLite mean-
+        // while holds the durable record. Reverse desync (index
+        // ahead of per-trace) is not possible with this ordering.
+        let anomalies_delta = outcome.anomalies_added as i64;
+        let tx = self
+            .index_conn
+            .transaction()
+            .map_err(|e| StorageError::Query {
+                context: "index begin",
+                source: e,
+            })?;
+        tx.execute(
+            UPSERT_TRACE_SQL,
+            params![
+                key.as_str(),                // ?1 trace_key
+                &meta.trace_id,              // ?2 trace_id
+                &meta.host,                  // ?3 host
+                meta.pid as i64,             // ?4 pid (sqlite INTEGER is i64)
+                meta.start_time,             // ?5 start_time_ns
+                &meta.sapi,                  // ?6 sapi
+                &meta.uri_or_script,         // ?7 uri_or_script
+                received_at_ns,              // ?8 first_batch_at_ns / last_batch_at_ns
+                call_count,                  // ?9 call_count delta
+                total_wall_delta,            // ?10 total_wall_ns delta
+                meta.dropped_records as i64, // ?11 dropped_records
+                anomalies_delta,             // ?12 anomaly_count delta
+            ],
+        )
+        .map_err(|e| StorageError::Query {
+            context: "upsert traces row",
+            source: e,
+        })?;
+        tx.commit().map_err(|e| StorageError::Query {
+            context: "index commit",
             source: e,
         })?;
 
@@ -264,8 +280,10 @@ fn open_connection(path: &Path, schema_sql: &str) -> Result<Connection, StorageE
     Ok(conn)
 }
 
-/// Upsert SQL for the index `traces` row. Excluded.* refers to
-/// the values that would have been inserted on conflict.
+/// Upsert SQL for the index `traces` row. `excluded.*` refers to
+/// the values that would have been inserted on conflict; on the
+/// INSERT path the anomaly delta seeds the column, on the UPDATE
+/// path it accumulates.
 const UPSERT_TRACE_SQL: &str = "
 INSERT INTO traces (
   trace_key, trace_id, host, pid, start_time_ns, sapi, uri_or_script,
@@ -276,14 +294,15 @@ INSERT INTO traces (
   ?1, ?2, ?3, ?4, ?5, ?6, ?7,
   'active', ?8, ?8,
   1, ?9, ?10, ?11,
-  0, 1
+  ?12, 1
 )
 ON CONFLICT(trace_key) DO UPDATE SET
   batch_count       = traces.batch_count + 1,
   call_count        = traces.call_count + excluded.call_count,
   total_wall_ns     = traces.total_wall_ns + excluded.total_wall_ns,
   last_batch_at_ns  = excluded.last_batch_at_ns,
-  dropped_records   = excluded.dropped_records
+  dropped_records   = excluded.dropped_records,
+  anomaly_count     = traces.anomaly_count + excluded.anomaly_count
 ";
 
 const MIRROR_TRACE_META_SQL: &str = "
@@ -641,5 +660,70 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn anomaly_count_on_traces_row_mirrors_per_trace_anomalies() {
+        // Build a batch with 3 DQ-1 Calls (missing fn_id=99) and
+        // 2 DQ-3 Calls (t_out < t_in on a known fn_id=7), plus
+        // one normal Call. Expect 5 anomaly rows in the per-trace
+        // db and `traces.anomaly_count = 5` in the index.
+        let dir = unique_dir("anom_count");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("44444444444444444444444444444444");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let inverted = |id: u32| Call {
+            call_id: id,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 500,
+            t_out: 400,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        };
+        let b = batch_with(
+            vec![dict_entry(7, "ok")],
+            vec![
+                call(10, 0, 99, 100), // DQ-1
+                call(11, 0, 99, 100), // DQ-1
+                call(12, 0, 99, 100), // DQ-1
+                inverted(20),         // DQ-3
+                inverted(21),         // DQ-3
+                call(30, 0, 7, 100),  // normal
+            ],
+            meta("anom-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let n_index: i64 = storage
+            .index_conn
+            .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_index, 5);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let n_per_trace: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_per_trace, 5);
+
+        // Second batch: one more DQ-3, no DQ-1. Counter accumulates.
+        let b2 = batch_with(vec![], vec![inverted(22)], meta("anom-host", 1, 1));
+        storage.record_batch(&sub, &b2, 2_000).unwrap();
+        let n_index2: i64 = storage
+            .index_conn
+            .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_index2, 6);
+        let n_per_trace2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_per_trace2, 6);
     }
 }

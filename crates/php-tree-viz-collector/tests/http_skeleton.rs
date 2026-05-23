@@ -1002,6 +1002,153 @@ fn build_test_batch_with_chain(host: &str, pid: u64, start_time: i64) -> Vec<u8>
     .unwrap()
 }
 
+/// Build a tiny MessagePack batch with one top-level Call whose
+/// `fn_id` is **not** in `dict` — the canonical DQ-1 shape. The
+/// aggregation step will skip the Call and write one anomaly row
+/// with `kind = 'unresolved_fn'`.
+fn build_test_batch_with_unresolved_fn(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct TestMeta<'a> {
+        schema_version: u32,
+        trace_id: &'a str,
+        host: &'a str,
+        pid: u64,
+        start_time: i64,
+        sapi: &'a str,
+        uri_or_script: &'a str,
+        dropped_records: u64,
+    }
+    #[derive(Serialize)]
+    struct TestCall {
+        call_id: u32,
+        parent: u32,
+        #[serde(rename = "fn")]
+        fn_id: u32,
+        depth: u32,
+        t_in: i64,
+        t_out: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+        mem_in: i64,
+        mem_out: i64,
+        abnormal_exit: bool,
+    }
+    #[derive(Serialize)]
+    struct TestBatch<'a> {
+        meta: TestMeta<'a>,
+        dict: Vec<()>, // deliberately empty — `fn_id=99` won't resolve
+        calls: Vec<TestCall>,
+    }
+    rmp_serde::to_vec_named(&TestBatch {
+        meta: TestMeta {
+            schema_version: 1,
+            trace_id: ALL_ZERO_TRACE_ID,
+            host,
+            pid,
+            start_time,
+            sapi: "cli",
+            uri_or_script: "/tmp/dq1.php",
+            dropped_records: 0,
+        },
+        dict: vec![],
+        calls: vec![TestCall {
+            call_id: 1,
+            parent: 0,
+            fn_id: 99,
+            depth: 1,
+            t_in: 0,
+            t_out: 100,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        }],
+    })
+    .unwrap()
+}
+
+/// Build a tiny MessagePack batch with one top-level Call where
+/// `t_out < t_in` — the canonical DQ-3 shape. The Call folds into
+/// `nodes` with `total_wall_ns = 0` (via saturating_sub) and
+/// aggregation writes one anomaly row with
+/// `kind = 'inverted_time'` attached to the resulting node.
+fn build_test_batch_with_inverted_time(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct TestMeta<'a> {
+        schema_version: u32,
+        trace_id: &'a str,
+        host: &'a str,
+        pid: u64,
+        start_time: i64,
+        sapi: &'a str,
+        uri_or_script: &'a str,
+        dropped_records: u64,
+    }
+    #[derive(Serialize)]
+    struct TestDictEntry<'a> {
+        fn_id: u32,
+        fqn: &'a str,
+        file: &'a str,
+        line: u32,
+        kind: u8,
+    }
+    #[derive(Serialize)]
+    struct TestCall {
+        call_id: u32,
+        parent: u32,
+        #[serde(rename = "fn")]
+        fn_id: u32,
+        depth: u32,
+        t_in: i64,
+        t_out: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+        mem_in: i64,
+        mem_out: i64,
+        abnormal_exit: bool,
+    }
+    #[derive(Serialize)]
+    struct TestBatch<'a> {
+        meta: TestMeta<'a>,
+        dict: Vec<TestDictEntry<'a>>,
+        calls: Vec<TestCall>,
+    }
+    rmp_serde::to_vec_named(&TestBatch {
+        meta: TestMeta {
+            schema_version: 1,
+            trace_id: ALL_ZERO_TRACE_ID,
+            host,
+            pid,
+            start_time,
+            sapi: "cli",
+            uri_or_script: "/tmp/dq3.php",
+            dropped_records: 0,
+        },
+        dict: vec![TestDictEntry {
+            fn_id: 7,
+            fqn: "ns\\inverted",
+            file: "/tmp/dq3.php",
+            line: 1,
+            kind: 0,
+        }],
+        calls: vec![TestCall {
+            call_id: 1,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 500,
+            t_out: 400, // inverted on purpose
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        }],
+    })
+    .unwrap()
+}
+
 fn ingest_request(host: &str, body: &[u8]) -> Vec<u8> {
     request_with_body(
         "POST",
@@ -1773,11 +1920,11 @@ fn per_trace_sqlite_has_dict_after_first_batch() {
 }
 
 #[test]
-fn anomalies_table_stays_empty_in_aggregation_core() {
-    // Renamed from `aggregation_tables_stay_empty_after_recording`
-    // when `aggregation-core` populated nodes / call_to_node /
-    // pending_calls. Only `anomalies` remains empty in this slice;
-    // the anomaly-detection slice fills it.
+fn well_formed_fixture_produces_no_anomalies() {
+    // The captured `flat_calls` fixture is well-formed (all Calls
+    // carry a `fn_id` that's in dict, all have `t_in < t_out`), so
+    // none of the DQ kinds fire. Sanity baseline so a regression
+    // in the detection thresholds shows up here.
     let dir = unique_tempdir("anom_empty_e2e");
     let data_dir = dir.join("data");
     let path = write_config(&dir, "127.0.0.1:0");
@@ -1796,7 +1943,227 @@ fn anomalies_table_stays_empty_in_aggregation_core() {
     let n_anom: i64 = conn
         .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n_anom, 0, "anomalies stays empty until the anomaly slice");
+    assert_eq!(n_anom, 0, "well-formed fixture should produce no anomalies");
+
+    let n_index: i64 = open_index_db_ro(&data_dir)
+        .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_index, 0);
+}
+
+#[test]
+fn dq1_batch_writes_unresolved_fn_anomaly_e2e() {
+    let dir = unique_tempdir("dq1_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_unresolved_fn("dq1-host", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
+        .query_row(
+            "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(node_id, None);
+    assert_eq!(kind, "unresolved_fn");
+    assert_eq!(sample_call_id, 1);
+    assert_eq!(detail, "fn_id=99");
+
+    let n_index: i64 = open_index_db_ro(&data_dir)
+        .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_index, 1);
+}
+
+#[test]
+fn dq1_no_longer_emits_stderr_line() {
+    let dir = unique_tempdir("dq1_no_stderr");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_unresolved_fn("dq1-quiet", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let stderr = collector.stderr_so_far.lock().unwrap().clone();
+    assert!(
+        !stderr.contains("aggregate: dq1 skipped"),
+        "DQ-1 stderr line should be gone now that anomalies records it; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn decoded_batch_log_carries_anomalies_field() {
+    let dir = unique_tempdir("anom_log_field");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_unresolved_fn("dq1-log", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    let stdout = collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("decoded batch"))
+        .expect("decoded batch line must be present");
+    assert!(
+        line.contains("anomalies=1"),
+        "expected anomalies=1 in: {line}"
+    );
+}
+
+#[test]
+fn dq3_e2e_anomaly_attaches_to_resulting_node() {
+    let dir = unique_tempdir("dq3_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_inverted_time("dq3-host", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    // SELECT JOIN to confirm the anomaly's node_id resolves to a
+    // real `nodes` row with fn_id=7.
+    let (kind, fn_id, total_wall): (String, i64, i64) = conn
+        .query_row(
+            "SELECT a.kind, n.fn_id, n.total_wall_ns \
+             FROM anomalies a JOIN nodes n ON n.node_id = a.node_id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, "inverted_time");
+    assert_eq!(fn_id, 7);
+    assert_eq!(
+        total_wall, 0,
+        "the inverted wall clamps to 0; the row still folds"
+    );
+}
+
+#[test]
+fn anomaly_count_on_traces_row_mirrors_per_trace_anomalies_e2e() {
+    let dir = unique_tempdir("anom_count_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // Two requests: one DQ-1, one DQ-3, against different hosts
+    // (so two distinct trace_keys). Each trace's index row's
+    // anomaly_count must match its per-trace SQLite anomalies row
+    // count (1 each).
+    for (host, body) in [
+        (
+            "anom-e2e-a",
+            build_test_batch_with_unresolved_fn("anom-e2e-a", 1, 1),
+        ),
+        (
+            "anom-e2e-b",
+            build_test_batch_with_inverted_time("anom-e2e-b", 1, 1),
+        ),
+    ] {
+        let req = ingest_request(&collector.bound, &body);
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200, "host {host} request must 200");
+    }
+    // Wait for both decoded-batch lines.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stdout = collector.stdout_so_far.lock().unwrap().clone();
+        if stdout.matches("decoded batch").count() >= 2 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("only one decoded-batch line within 5s:\n{stdout}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let index = open_index_db_ro(&data_dir);
+    let mut stmt = index
+        .prepare("SELECT trace_key, anomaly_count FROM traces")
+        .unwrap();
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2, "two distinct traces");
+    for (trace_key, n_index) in rows {
+        let conn = open_trace_db_ro(&data_dir, &trace_key);
+        let n_per_trace: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n_per_trace, n_index,
+            "trace {trace_key}: index anomaly_count must match per-trace COUNT(*)"
+        );
+    }
+}
+
+#[test]
+fn consecutive_batches_with_anomalies_accumulate_the_counter() {
+    let dir = unique_tempdir("anom_accumulate");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // Two DQ-1 batches against the same host → same trace_key →
+    // counter must sum.
+    for _ in 0..2 {
+        let body = build_test_batch_with_unresolved_fn("anom-acc", 7, 7);
+        let req = ingest_request(&collector.bound, &body);
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stdout = collector.stdout_so_far.lock().unwrap().clone();
+        if stdout.matches("decoded batch").count() >= 2 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("only one decoded-batch line within 5s:\n{stdout}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let n_index: i64 = open_index_db_ro(&data_dir)
+        .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_index, 2, "two batches, one anomaly each, total 2");
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+    let n_per_trace: i64 = conn
+        .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_per_trace, 2);
 }
 
 #[test]

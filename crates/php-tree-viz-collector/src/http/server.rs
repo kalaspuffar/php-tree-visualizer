@@ -71,20 +71,21 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
                         match decoder_storage.record_batch(&item, &batch, received_at_ns) {
                             Ok(outcome) => {
                                 println!(
-                                    "decoded batch path={} trace_key={} dict={} calls={} nodes={} pending={}",
+                                    "decoded batch path={} trace_key={} dict={} calls={} nodes={} pending={} anomalies={}",
                                     item.path.display(),
                                     item.trace_key,
                                     batch.dict.len(),
                                     batch.calls.len(),
                                     outcome.nodes_touched,
                                     outcome.pending_total,
+                                    outcome.anomalies_added,
                                 );
                             }
                             Err(e) => {
                                 // Still log the decode visibility so the operator
                                 // can tell parse succeeded but storage refused.
                                 println!(
-                                    "decoded batch path={} trace_key={} dict={} calls={} nodes=? pending=?",
+                                    "decoded batch path={} trace_key={} dict={} calls={} nodes=? pending=? anomalies=?",
                                     item.path.display(),
                                     item.trace_key,
                                     batch.dict.len(),
