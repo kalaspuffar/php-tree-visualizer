@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::storage::StorageError;
 use crate::tracekey::TraceKey;
 
 #[derive(Debug)]
@@ -56,6 +57,10 @@ pub enum HttpError {
     /// A trace has accumulated 9999 batches and cannot accept any
     /// more. Defensive; proper §4.4.2 rollover is a future change.
     TraceFull { key: TraceKey },
+    /// `Storage::open` failed at startup (index.sqlite couldn't be
+    /// opened, schema apply failed, unknown user_version, …).
+    /// Exit code 3 — same family as bind / tmp-dir failures.
+    Storage { source: StorageError },
 }
 
 impl std::fmt::Display for HttpError {
@@ -104,6 +109,9 @@ impl std::fmt::Display for HttpError {
             Self::TraceFull { key } => {
                 write!(f, "trace {} has reached the 9999-batch cap", key)
             }
+            Self::Storage { source } => {
+                write!(f, "storage: {source}")
+            }
         }
     }
 }
@@ -118,6 +126,7 @@ impl std::error::Error for HttpError {
             | Self::TracesDir { source, .. }
             | Self::Rename { source, .. }
             | Self::Fsync { source, .. } => Some(source),
+            Self::Storage { source } => Some(source),
             Self::TraceFull { .. } => None,
         }
     }

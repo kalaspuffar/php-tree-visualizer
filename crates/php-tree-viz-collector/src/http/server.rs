@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use super::{router, storage, tmp, AppState, BatchSubmission, HttpError, SharedState};
+use super::{
+    router, storage as http_storage, tmp, AppState, BatchSubmission, HttpError, SharedState,
+};
 use crate::config::Config;
+use crate::storage::Storage;
 
 /// Entry point called from `main` after the config has been validated.
 /// Returns only when the server stops (graceful shutdown → `Ok`,
@@ -25,22 +28,34 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     // I/O failure here exits with status 3 before any client could
     // connect.
     let tmp_dir = tmp::ensure_clean_tmp_dir(&config.storage.data_dir)?;
-    let traces_dir = storage::ensure_traces_dir(&config.storage.data_dir)?;
+    let traces_dir = http_storage::ensure_traces_dir(&config.storage.data_dir)?;
+
+    // Open index.sqlite and prepare the per-trace connection map.
+    // Failure here exits status 3 before the listener binds —
+    // same family as bind / tmp-dir failures. The storage instance
+    // moves into the decoder task below.
+    let storage = Storage::open(&config.storage.data_dir, traces_dir.clone())
+        .map_err(|source| HttpError::Storage { source })?;
 
     // Build the bounded ingest channel and spawn the decoder task.
     // The decoder reads each committed batch file from disk, parses
-    // it via `wire::parse_batch`, and logs the decoded counts.
-    // Storage / aggregation are not in this slice — the `Batch` is
-    // dropped after logging. When axum's serve future ends, the
-    // router and AppState are dropped, the sender goes out of
-    // scope, and `recv()` returns `None` — the task exits cleanly
-    // without explicit shutdown plumbing.
+    // it via `wire::parse_batch`, logs the decoded counts, and
+    // invokes `Storage::record_batch` to persist the trace row +
+    // per-trace dict. Aggregation of calls into the `nodes` tree
+    // is a subsequent capability — this slice creates the tables
+    // but leaves them empty.
     //
-    // The decode runs on the tokio runtime without `spawn_blocking`
-    // — ~10 ms for a 10K-call batch is acceptable on the async
-    // path. Revisit if profiling shows runtime starvation.
+    // When axum's serve future ends, the router and AppState are
+    // dropped, the sender goes out of scope, `recv()` returns
+    // `None`, and the task exits cleanly without explicit
+    // shutdown plumbing.
+    //
+    // The decode + SQL writes run on the tokio runtime without
+    // `spawn_blocking` — ~10 ms per batch is acceptable on the
+    // async path. Revisit if profiling shows runtime starvation.
     let queue_capacity = config.server.queue_capacity as usize;
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<BatchSubmission>(queue_capacity);
+    let mut decoder_storage = storage;
     tokio::spawn(async move {
         while let Some(item) = batch_rx.recv().await {
             // INV-2 unaffected: `trace_key` is not a secret (it's
@@ -56,9 +71,14 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
                             batch.dict.len(),
                             batch.calls.len(),
                         );
-                        // The `Batch` is dropped here. Storage /
-                        // aggregation slices will replace this
-                        // drop with writes to per-trace SQLite.
+                        let received_at_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(0);
+                        if let Err(e) = decoder_storage.record_batch(&item, &batch, received_at_ns)
+                        {
+                            eprintln!("storage: {e} trace_key={}", item.trace_key);
+                        }
                     }
                     Err(err) => {
                         eprintln!(

@@ -930,21 +930,27 @@ fn valid_v1_body_returns_200_and_lands_at_canonical_path() {
 
     let traces_dir = data_dir.join("traces");
     std::thread::sleep(Duration::from_millis(100));
-    let dirs: Vec<_> = std::fs::read_dir(&traces_dir)
+    // Filter for the raw msgpack directory only — `traces/` now
+    // also holds the per-trace SQLite, its `-wal`, and its `-shm`
+    // sidecars (added by storage-sqlite). The durable-ingest
+    // contract is about the `.raw` directory; that's what we
+    // assert on here.
+    let raw_dirs: Vec<_> = std::fs::read_dir(&traces_dir)
         .unwrap()
         .filter_map(Result::ok)
         .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.ends_with(".raw"))
+        })
         .collect();
     assert_eq!(
-        dirs.len(),
+        raw_dirs.len(),
         1,
-        "expected exactly one trace dir under traces/, got {dirs:?}"
+        "expected exactly one .raw trace dir under traces/, got {raw_dirs:?}"
     );
-    let trace_raw = &dirs[0];
-    assert!(trace_raw
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|s| s.ends_with(".raw")));
+    let trace_raw = &raw_dirs[0];
 
     let batches: Vec<_> = std::fs::read_dir(trace_raw)
         .unwrap()
@@ -1492,4 +1498,236 @@ fn backpressure_503_response_body_and_header() {
         "503 must carry Connection: close; head was: {head}"
     );
     assert_eq!(body_str, r#"{"error":"backpressure"}"#);
+}
+
+// ============================================================
+// Storage tests (added by the storage-sqlite change)
+// ============================================================
+
+/// Open `<data_dir>/index.sqlite` read-only for test inspection.
+/// The collector itself writes to the same file via its own
+/// connection; SQLite's WAL mode lets the test read concurrent
+/// committed state.
+fn open_index_db_ro(data_dir: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        data_dir.join("index.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("could not open index.sqlite read-only")
+}
+
+/// Open `<data_dir>/traces/<key>.sqlite` read-only.
+fn open_trace_db_ro(data_dir: &Path, key: &str) -> rusqlite::Connection {
+    let path = data_dir.join("traces").join(format!("{key}.sqlite"));
+    rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap_or_else(|e| panic!("could not open {path:?}: {e}"))
+}
+
+#[test]
+fn valid_v1_body_records_a_trace_row() {
+    let dir = unique_tempdir("records_trace");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // The captured fixture: meta is fixed, dict.len()=2, calls.len()=10000.
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+
+    // Let the decoder finish writing.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let conn = open_index_db_ro(&data_dir);
+    let (trace_key, batch_count, call_count, state): (String, i64, i64, String) = conn
+        .query_row(
+            "SELECT trace_key, batch_count, call_count, state FROM traces",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("expected one row in traces");
+    assert_eq!(trace_key.len(), 32, "trace_key must be 32 hex chars");
+    assert_eq!(batch_count, 1);
+    assert_eq!(call_count, 10_000, "fixture has 10000 calls");
+    assert_eq!(state, "active");
+}
+
+#[test]
+fn consecutive_same_trace_batches_increment_counters_in_index() {
+    let dir = unique_tempdir("increment_counters");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-counters", 99, 4_242_424_242);
+    let calls_per_batch = 0; // build_test_batch ships empty calls/dict
+
+    for _ in 0..3 {
+        let req = ingest_request(&collector.bound, &body);
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let conn = open_index_db_ro(&data_dir);
+    let (batch_count, call_count, first_at, last_at): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT batch_count, call_count, first_batch_at_ns, last_batch_at_ns FROM traces",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(batch_count, 3);
+    assert_eq!(call_count, 3 * calls_per_batch);
+    assert!(
+        last_at >= first_at,
+        "last_at ({last_at}) must be >= first_at ({first_at})"
+    );
+}
+
+#[test]
+fn per_trace_sqlite_has_dict_after_first_batch() {
+    let dir = unique_tempdir("dict_present");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    std::thread::sleep(Duration::from_millis(250));
+
+    // Discover the trace key from the index DB (depends on fixture meta).
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+
+    let trace_conn = open_trace_db_ro(&data_dir, &trace_key);
+    let dict_count: i64 = trace_conn
+        .query_row("SELECT COUNT(*) FROM dict", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(dict_count, 2, "fixture's dict has 2 entries");
+
+    // Spot-check that the schema actually populated the row content.
+    let (fn_id, fqn): (i64, String) = trace_conn
+        .query_row(
+            "SELECT fn_id, fqn FROM dict ORDER BY fn_id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(fn_id > 0);
+    assert!(!fqn.is_empty(), "fqn must be populated");
+}
+
+#[test]
+fn aggregation_tables_stay_empty_after_recording() {
+    let dir = unique_tempdir("agg_empty_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    for table in ["nodes", "call_to_node", "pending_calls", "anomalies"] {
+        let n: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "{table} should be empty until the aggregation slice");
+    }
+}
+
+#[test]
+fn per_trace_dict_is_idempotent_across_batches_e2e() {
+    let dir = unique_tempdir("dict_idemp_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // Send the same fixture twice for the same synthesized trace.
+    for _ in 0..2 {
+        let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    let dict_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM dict", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(dict_count, 2, "dict should not duplicate across batches");
+}
+
+#[test]
+fn pragma_user_version_is_1_on_both_dbs() {
+    let dir = unique_tempdir("user_version_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let index_conn = open_index_db_ro(&data_dir);
+    let v: i64 = index_conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(v, 1, "index.sqlite user_version must be 1");
+
+    let trace_key: String = index_conn
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let trace_conn = open_trace_db_ro(&data_dir, &trace_key);
+    let v: i64 = trace_conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(v, 1, "per-trace .sqlite user_version must be 1");
+}
+
+#[test]
+fn trace_meta_mirrors_the_index_row_e2e() {
+    let dir = unique_tempdir("trace_meta_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let index_conn = open_index_db_ro(&data_dir);
+    let (key, host, pid): (String, String, i64) = index_conn
+        .query_row("SELECT trace_key, host, pid FROM traces", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+
+    let trace_conn = open_trace_db_ro(&data_dir, &key);
+    let (mkey, mhost, mpid, mstate): (String, String, i64, String) = trace_conn
+        .query_row(
+            "SELECT trace_key, host, pid, state FROM trace_meta",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(mkey, key);
+    assert_eq!(mhost, host);
+    assert_eq!(mpid, pid);
+    assert_eq!(mstate, "active");
 }

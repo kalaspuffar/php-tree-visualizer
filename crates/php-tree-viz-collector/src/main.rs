@@ -11,6 +11,7 @@
 
 mod config;
 mod http;
+mod storage;
 mod tracekey;
 mod wire;
 
