@@ -151,9 +151,18 @@ impl Config {
 
 impl Server {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.bind.parse::<SocketAddr>().map_err(|e| {
+        let addr: SocketAddr = self.bind.parse().map_err(|e| {
             ConfigError::bad_value("server.bind", format!("not a socket address: {e}"))
         })?;
+        // §3.4 / AC-3.4.1: the collector must not be reachable from
+        // outside the host. The reverse proxy is the only thing that
+        // talks to us.
+        if !addr.ip().is_loopback() {
+            return Err(ConfigError::bad_value(
+                "server.bind",
+                format!("must be a loopback address (127.0.0.0/8 or ::1) (got {addr})"),
+            ));
+        }
         if self.max_body_bytes == 0 {
             return Err(ConfigError::bad_value(
                 "server.max_body_bytes",
@@ -541,6 +550,46 @@ retention_days = 30
         let err = parse(&toml).expect_err("bad bind must fail");
         let msg = format!("{err}");
         assert!(msg.contains("server.bind"));
+    }
+
+    #[test]
+    fn ipv4_loopback_bind_is_accepted() {
+        let toml = replace_field(&full_toml(), "bind", "\"127.0.0.1:8088\"");
+        parse(&toml).expect("127.0.0.1 should pass");
+        let toml = replace_field(&full_toml(), "bind", "\"127.0.0.42:8088\"");
+        parse(&toml).expect("127.0.0.42 should pass — whole 127.0.0.0/8 is loopback");
+    }
+
+    #[test]
+    fn ipv6_loopback_bind_is_accepted() {
+        let toml = replace_field(&full_toml(), "bind", "\"[::1]:8088\"");
+        parse(&toml).expect("[::1] should pass");
+    }
+
+    #[test]
+    fn wildcard_ipv4_bind_is_rejected_as_non_loopback() {
+        let toml = replace_field(&full_toml(), "bind", "\"0.0.0.0:8088\"");
+        let err = parse(&toml).expect_err("wildcard bind must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("server.bind"));
+        assert!(
+            msg.contains("loopback"),
+            "expected loopback reason; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn routable_ipv4_bind_is_rejected_as_non_loopback() {
+        let toml = replace_field(&full_toml(), "bind", "\"192.168.1.1:8088\"");
+        let err = parse(&toml).expect_err("routable bind must fail");
+        assert!(format!("{err}").contains("loopback"));
+    }
+
+    #[test]
+    fn non_loopback_ipv6_bind_is_rejected() {
+        let toml = replace_field(&full_toml(), "bind", "\"[2001:db8::1]:8088\"");
+        let err = parse(&toml).expect_err("non-loopback ipv6 must fail");
+        assert!(format!("{err}").contains("loopback"));
     }
 
     #[test]
