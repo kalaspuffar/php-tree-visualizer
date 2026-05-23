@@ -64,20 +64,34 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
             match tokio::fs::read(&item.path).await {
                 Ok(bytes) => match crate::wire::parse_batch(&bytes) {
                     Ok(batch) => {
-                        println!(
-                            "decoded batch path={} trace_key={} dict={} calls={}",
-                            item.path.display(),
-                            item.trace_key,
-                            batch.dict.len(),
-                            batch.calls.len(),
-                        );
                         let received_at_ns = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as i64)
                             .unwrap_or(0);
-                        if let Err(e) = decoder_storage.record_batch(&item, &batch, received_at_ns)
-                        {
-                            eprintln!("storage: {e} trace_key={}", item.trace_key);
+                        match decoder_storage.record_batch(&item, &batch, received_at_ns) {
+                            Ok(outcome) => {
+                                println!(
+                                    "decoded batch path={} trace_key={} dict={} calls={} nodes={} pending={}",
+                                    item.path.display(),
+                                    item.trace_key,
+                                    batch.dict.len(),
+                                    batch.calls.len(),
+                                    outcome.nodes_touched,
+                                    outcome.pending_total,
+                                );
+                            }
+                            Err(e) => {
+                                // Still log the decode visibility so the operator
+                                // can tell parse succeeded but storage refused.
+                                println!(
+                                    "decoded batch path={} trace_key={} dict={} calls={} nodes=? pending=?",
+                                    item.path.display(),
+                                    item.trace_key,
+                                    batch.dict.len(),
+                                    batch.calls.len(),
+                                );
+                                eprintln!("storage: {e} trace_key={}", item.trace_key);
+                            }
                         }
                     }
                     Err(err) => {

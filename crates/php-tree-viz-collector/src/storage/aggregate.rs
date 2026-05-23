@@ -1,0 +1,910 @@
+//! Per-batch fold of `Call` records into the per-trace `nodes`
+//! tree. Implements `SPECIFICATION.md` §4.3 / §4.1.4 / BR-1.
+//!
+//! The flow inside one call to [`aggregate_calls`]:
+//!
+//! 1. Build the set of known `dict.fn_id` for this trace (one
+//!    SELECT). Calls referencing fn_ids not in the set are DQ-1
+//!    candidates and get skipped with a stderr log line.
+//! 2. Walk `batch.calls` **in reverse order**. The recorder
+//!    emits records in exit order; reversing yields
+//!    parents-before-children within a batch, so most in-batch
+//!    parent lookups succeed against `call_to_node` on the
+//!    first try.
+//! 3. For each Call:
+//!    - Resolve `parent_node_id`: `1` if `c.parent == 0`,
+//!      else `SELECT node_id FROM call_to_node WHERE call_id = ?`.
+//!    - If resolved: upsert the `(parent_node_id, fn_id)` bucket
+//!      (RETURNING node_id), bump the parent's
+//!      `children_total_wall_ns`, map `call_id → node_id`.
+//!    - If unresolved (cross-batch parent): insert into
+//!      `pending_calls`.
+//! 4. After the in-batch loop, drain `pending_calls` iteratively:
+//!    pending rows whose `parent_call_id` is now in
+//!    `call_to_node` get the same upsert + parent-bump + mapping
+//!    treatment, then are deleted. Loop until no progress.
+//!
+//! Anomaly rows (DQ-1, DQ-2, DQ-3) are **not** written by this
+//! slice. DQ-1 is the only one detected; the next slice
+//! (anomaly detection) converts the log line to an `anomalies`
+//! row.
+
+use std::collections::HashSet;
+
+use rusqlite::{params, Transaction};
+
+use super::StorageError;
+use crate::tracekey::TraceKey;
+use crate::wire;
+
+/// `node_id = 1` is the synthetic root (`SPECIFICATION.md`
+/// §4.3 notes). All top-level calls (wire `parent == 0`) become
+/// its children.
+const SYNTHETIC_ROOT_NODE_ID: i64 = 1;
+
+/// Counters surfaced to the caller for the `decoded batch`
+/// log line and the tests.
+#[derive(Debug, Default)]
+pub(crate) struct AggregateOutcome {
+    /// Distinct node rows touched (inserted or updated) by
+    /// this batch's aggregation. Includes both the in-batch
+    /// loop and the drain pass.
+    pub nodes_touched: u32,
+    /// Count of new `pending_calls` rows inserted during this
+    /// batch's in-batch loop.
+    pub pending_added: u32,
+    /// Count of `pending_calls` rows resolved (and deleted)
+    /// during this batch's drain pass.
+    pub pending_resolved: u32,
+    /// Total `pending_calls` rows remaining in the trace
+    /// after the drain pass.
+    pub pending_total: u32,
+    /// Calls skipped because their `fn_id` was missing from
+    /// the trace's `dict` (DQ-1).
+    pub dq1_skipped: u32,
+}
+
+/// Insert the synthetic root rows (`dict.fn_id=0`,
+/// `nodes.node_id=1`) if they don't already exist. Idempotent
+/// across batches; subsequent invocations are no-ops via
+/// `INSERT OR IGNORE`.
+pub(super) fn seed_synthetic_root(tx: &Transaction) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO dict (fn_id, fqn, file, line, kind) \
+         VALUES (0, '<root>', '', 0, 0)",
+        [],
+    )
+    .map_err(|e| StorageError::Query {
+        context: "seed synthetic-root dict entry",
+        source: e,
+    })?;
+    tx.execute(
+        "INSERT OR IGNORE INTO nodes \
+         (node_id, parent_node_id, fn_id, depth, \
+          call_count, total_wall_ns, children_total_wall_ns, \
+          total_cpu_u_ns, total_cpu_s_ns, total_mem_delta_bytes, \
+          abnormal_exit_count) \
+         VALUES (1, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0)",
+        [],
+    )
+    .map_err(|e| StorageError::Query {
+        context: "seed synthetic-root node row",
+        source: e,
+    })?;
+    Ok(())
+}
+
+/// Aggregate every call in `batch.calls` into the per-trace
+/// `nodes` tree per BR-1. The caller must have already
+/// accumulated `dict` and seeded the synthetic root (see
+/// `super::Storage::record_batch`).
+pub(super) fn aggregate_calls(
+    tx: &Transaction,
+    trace_key: &TraceKey,
+    batch: &wire::Batch,
+) -> Result<AggregateOutcome, StorageError> {
+    let mut outcome = AggregateOutcome::default();
+
+    let known = known_fn_ids(tx)?;
+
+    // ---- in-batch loop (reverse order = parents first) ----
+    for c in batch.calls.iter().rev() {
+        if !known.contains(&c.fn_id) {
+            // DQ-1: unresolved fn_id. Log + skip; no anomaly row
+            // (the anomaly slice will replace the log with an
+            // INSERT INTO anomalies).
+            eprintln!(
+                "aggregate: dq1 skipped trace_key={trace_key} call_id={} fn_id={}",
+                c.call_id, c.fn_id,
+            );
+            outcome.dq1_skipped += 1;
+            continue;
+        }
+
+        let parent_node_id = resolve_parent(tx, c.parent)?;
+        match parent_node_id {
+            Some(pid) => {
+                fold_call_into_nodes(tx, pid, c)?;
+                outcome.nodes_touched += 1;
+            }
+            None => {
+                insert_pending_call(tx, c)?;
+                outcome.pending_added += 1;
+            }
+        }
+    }
+
+    // ---- drain pending_calls ----
+    drain_pending(tx, &known, &mut outcome)?;
+
+    // Total pending rows after drain — operator visibility via
+    // the log line. Anything left here is a genuine cross-batch
+    // dependency that will resolve when the parent's batch
+    // arrives, OR a DQ-2 candidate at finalize time.
+    outcome.pending_total = count_pending(tx)?;
+
+    Ok(outcome)
+}
+
+/// Select the set of `fn_id` already in this trace's `dict`
+/// (including the synthetic root's `fn_id = 0`). Used to
+/// pre-validate Calls so a DQ-1 doesn't blow the transaction
+/// via FK violation on `nodes.fn_id`.
+fn known_fn_ids(tx: &Transaction) -> Result<HashSet<u32>, StorageError> {
+    let mut stmt =
+        tx.prepare_cached("SELECT fn_id FROM dict")
+            .map_err(|e| StorageError::Query {
+                context: "prepare known_fn_ids",
+                source: e,
+            })?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| StorageError::Query {
+            context: "query known_fn_ids",
+            source: e,
+        })?;
+    let mut set = HashSet::new();
+    for row in rows {
+        let id = row.map_err(|e| StorageError::Query {
+            context: "iterate known_fn_ids",
+            source: e,
+        })?;
+        // Cast back from i64 (SQLite INTEGER). fn_ids are
+        // u32-sized in the wire spec.
+        set.insert(id as u32);
+    }
+    Ok(set)
+}
+
+/// `parent` on the wire is the parent call's `call_id`; `0`
+/// means "no parent" (top-level call → synthetic root).
+fn resolve_parent(tx: &Transaction, parent_call_id: u32) -> Result<Option<i64>, StorageError> {
+    if parent_call_id == 0 {
+        return Ok(Some(SYNTHETIC_ROOT_NODE_ID));
+    }
+    let mut stmt = tx
+        .prepare_cached("SELECT node_id FROM call_to_node WHERE call_id = ?1")
+        .map_err(|e| StorageError::Query {
+            context: "prepare resolve_parent",
+            source: e,
+        })?;
+    let result = stmt
+        .query_row(params![parent_call_id as i64], |row| row.get::<_, i64>(0))
+        .map(Some);
+    match result {
+        Ok(node_id) => Ok(node_id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Query {
+            context: "query resolve_parent",
+            source: e,
+        }),
+    }
+}
+
+/// Upsert the `(parent_node_id, fn_id)` bucket in `nodes`,
+/// bump the parent's `children_total_wall_ns`, and map the
+/// Call's `call_id` to the resulting node. Pure side-effect on
+/// the connection; no return value beyond the propagated error.
+fn fold_call_into_nodes(
+    tx: &Transaction,
+    parent_node_id: i64,
+    c: &wire::Call,
+) -> Result<(), StorageError> {
+    let wall = c.t_out.saturating_sub(c.t_in);
+    let mem_delta = c.mem_out.saturating_sub(c.mem_in);
+    let abnormal_count: i64 = if c.abnormal_exit { 1 } else { 0 };
+
+    let node_id: i64 = {
+        let mut stmt = tx
+            .prepare_cached(UPSERT_NODE_SQL)
+            .map_err(|e| StorageError::Query {
+                context: "prepare upsert node",
+                source: e,
+            })?;
+        stmt.query_row(
+            params![
+                parent_node_id, // ?1
+                c.fn_id as i64, // ?2
+                c.depth as i64, // ?3
+                wall,           // ?4 total_wall_ns delta
+                c.cpu_u,        // ?5
+                c.cpu_s,        // ?6
+                mem_delta,      // ?7
+                abnormal_count, // ?8
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Query {
+            context: "upsert node",
+            source: e,
+        })?
+    };
+
+    // Maintain parent's children_total_wall_ns. Per spec §4.3
+    // note: "children_total_wall_ns is incremented on the parent
+    // whenever a child node has its total_wall_ns increased.
+    // Self time on read is total_wall_ns - children_total_wall_ns."
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "UPDATE nodes SET children_total_wall_ns = children_total_wall_ns + ?1 \
+                 WHERE node_id = ?2",
+            )
+            .map_err(|e| StorageError::Query {
+                context: "prepare bump parent children_total_wall_ns",
+                source: e,
+            })?;
+        stmt.execute(params![wall, parent_node_id])
+            .map_err(|e| StorageError::Query {
+                context: "bump parent children_total_wall_ns",
+                source: e,
+            })?;
+    }
+
+    // Map the wire-level call_id to the resulting node_id so
+    // downstream Calls referencing this call_id as a parent can
+    // look it up.
+    {
+        let mut stmt = tx
+            .prepare_cached("INSERT OR IGNORE INTO call_to_node (call_id, node_id) VALUES (?1, ?2)")
+            .map_err(|e| StorageError::Query {
+                context: "prepare insert call_to_node",
+                source: e,
+            })?;
+        stmt.execute(params![c.call_id as i64, node_id])
+            .map_err(|e| StorageError::Query {
+                context: "insert call_to_node",
+                source: e,
+            })?;
+    }
+    Ok(())
+}
+
+/// Insert a Call into `pending_calls` for a future batch's
+/// drain pass. The Call's full payload is stored verbatim
+/// because the drain pass needs the same deltas the in-batch
+/// loop would have computed.
+fn insert_pending_call(tx: &Transaction, c: &wire::Call) -> Result<(), StorageError> {
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO pending_calls \
+             (call_id, parent_call_id, fn_id, t_in_ns, t_out_ns, \
+              cpu_u_ns, cpu_s_ns, mem_in_bytes, mem_out_bytes, abnormal_exit) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .map_err(|e| StorageError::Query {
+            context: "prepare insert pending_calls row",
+            source: e,
+        })?;
+    stmt.execute(params![
+        c.call_id as i64,
+        c.parent as i64,
+        c.fn_id as i64,
+        c.t_in,
+        c.t_out,
+        c.cpu_u,
+        c.cpu_s,
+        c.mem_in,
+        c.mem_out,
+        i64::from(c.abnormal_exit),
+    ])
+    .map_err(|e| StorageError::Query {
+        context: "insert pending_calls row",
+        source: e,
+    })?;
+    Ok(())
+}
+
+/// Iteratively resolve pending rows whose parent is now in
+/// `call_to_node`. Loops until a pass resolves zero rows.
+fn drain_pending(
+    tx: &Transaction,
+    known: &HashSet<u32>,
+    outcome: &mut AggregateOutcome,
+) -> Result<(), StorageError> {
+    loop {
+        // Materialise the resolvable rows first so we can
+        // mutate the table inside the loop without holding the
+        // SELECT's cursor.
+        let resolvable: Vec<PendingRow> = {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT p.call_id, p.parent_call_id, p.fn_id, p.t_in_ns, p.t_out_ns, \
+                            p.cpu_u_ns, p.cpu_s_ns, p.mem_in_bytes, p.mem_out_bytes, \
+                            p.abnormal_exit, c.node_id \
+                     FROM pending_calls p \
+                     JOIN call_to_node c ON c.call_id = p.parent_call_id",
+                )
+                .map_err(|e| StorageError::Query {
+                    context: "prepare drain query",
+                    source: e,
+                })?;
+            let rows =
+                stmt.query_map([], PendingRow::from_row)
+                    .map_err(|e| StorageError::Query {
+                        context: "query drain pending",
+                        source: e,
+                    })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| StorageError::Query {
+                    context: "collect drain pending rows",
+                    source: e,
+                })?
+        };
+
+        if resolvable.is_empty() {
+            break;
+        }
+
+        for row in &resolvable {
+            // Pre-validate fn_id against dict — a pending Call
+            // whose fn_id never appeared in dict is DQ-1 territory.
+            // Same handling as the in-batch path: log + skip +
+            // delete the pending row (so it doesn't accumulate
+            // forever).
+            if !known.contains(&row.fn_id) {
+                eprintln!(
+                    "aggregate: dq1 skipped (drained) call_id={} fn_id={}",
+                    row.call_id, row.fn_id,
+                );
+                outcome.dq1_skipped += 1;
+                tx.execute(
+                    "DELETE FROM pending_calls WHERE call_id = ?1",
+                    params![row.call_id],
+                )
+                .map_err(|e| StorageError::Query {
+                    context: "delete pending dq1",
+                    source: e,
+                })?;
+                continue;
+            }
+
+            // Reconstruct the wire Call shape just enough to
+            // pass to fold_call_into_nodes. We don't carry
+            // `depth` in pending_calls; the closest stand-in is
+            // parent_depth + 1, which we look up.
+            let parent_depth: i64 = tx
+                .query_row(
+                    "SELECT depth FROM nodes WHERE node_id = ?1",
+                    params![row.parent_node_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| StorageError::Query {
+                    context: "lookup parent depth",
+                    source: e,
+                })?;
+            let synthetic_call = wire::Call {
+                call_id: row.call_id as u32,
+                parent: row.parent_call_id as u32,
+                fn_id: row.fn_id,
+                depth: (parent_depth + 1) as u32,
+                t_in: row.t_in_ns,
+                t_out: row.t_out_ns,
+                cpu_u: row.cpu_u_ns,
+                cpu_s: row.cpu_s_ns,
+                mem_in: row.mem_in_bytes,
+                mem_out: row.mem_out_bytes,
+                abnormal_exit: row.abnormal_exit != 0,
+            };
+            fold_call_into_nodes(tx, row.parent_node_id, &synthetic_call)?;
+
+            tx.execute(
+                "DELETE FROM pending_calls WHERE call_id = ?1",
+                params![row.call_id],
+            )
+            .map_err(|e| StorageError::Query {
+                context: "delete drained pending",
+                source: e,
+            })?;
+            outcome.pending_resolved += 1;
+            outcome.nodes_touched += 1;
+        }
+    }
+    Ok(())
+}
+
+fn count_pending(tx: &Transaction) -> Result<u32, StorageError> {
+    tx.query_row("SELECT COUNT(*) FROM pending_calls", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|n| n as u32)
+    .map_err(|e| StorageError::Query {
+        context: "count pending_calls",
+        source: e,
+    })
+}
+
+#[derive(Debug)]
+struct PendingRow {
+    call_id: i64,
+    parent_call_id: i64,
+    fn_id: u32,
+    t_in_ns: i64,
+    t_out_ns: i64,
+    cpu_u_ns: i64,
+    cpu_s_ns: i64,
+    mem_in_bytes: i64,
+    mem_out_bytes: i64,
+    abnormal_exit: i64,
+    parent_node_id: i64,
+}
+
+impl PendingRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            call_id: row.get(0)?,
+            parent_call_id: row.get(1)?,
+            fn_id: row.get::<_, i64>(2)? as u32,
+            t_in_ns: row.get(3)?,
+            t_out_ns: row.get(4)?,
+            cpu_u_ns: row.get(5)?,
+            cpu_s_ns: row.get(6)?,
+            mem_in_bytes: row.get(7)?,
+            mem_out_bytes: row.get(8)?,
+            abnormal_exit: row.get(9)?,
+            parent_node_id: row.get(10)?,
+        })
+    }
+}
+
+/// UPSERT for the `nodes` bucket per BR-1. `RETURNING node_id`
+/// (SQLite 3.35+; bundled rusqlite ships much newer) hands back
+/// the node_id regardless of whether the INSERT or the UPDATE
+/// branch ran, so the caller can bump the parent and write
+/// `call_to_node` without a separate SELECT.
+const UPSERT_NODE_SQL: &str = "
+INSERT INTO nodes (
+  parent_node_id, fn_id, depth,
+  call_count, total_wall_ns, total_cpu_u_ns, total_cpu_s_ns,
+  total_mem_delta_bytes, abnormal_exit_count
+) VALUES (
+  ?1, ?2, ?3,
+  1, ?4, ?5, ?6,
+  ?7, ?8
+)
+ON CONFLICT(parent_node_id, fn_id) DO UPDATE SET
+  call_count            = nodes.call_count + 1,
+  total_wall_ns         = nodes.total_wall_ns + excluded.total_wall_ns,
+  total_cpu_u_ns        = nodes.total_cpu_u_ns + excluded.total_cpu_u_ns,
+  total_cpu_s_ns        = nodes.total_cpu_s_ns + excluded.total_cpu_s_ns,
+  total_mem_delta_bytes = nodes.total_mem_delta_bytes + excluded.total_mem_delta_bytes,
+  abnormal_exit_count   = nodes.abnormal_exit_count + excluded.abnormal_exit_count
+RETURNING node_id
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracekey::TraceKey;
+    use crate::wire::{Batch, Call, DictEntry, Meta};
+    use rusqlite::Connection;
+
+    /// Open an in-memory SQLite, apply the per-trace schema,
+    /// seed the synthetic root. Returns a single Connection.
+    /// Tests can run multiple aggregations against this; each
+    /// aggregation opens its own transaction inside the test.
+    fn fresh_trace_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; \
+             PRAGMA synchronous = NORMAL; \
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        conn.execute_batch(super::super::schema::TRACE_SCHEMA)
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        seed_synthetic_root(&tx).unwrap();
+        tx.commit().unwrap();
+        conn
+    }
+
+    fn aggregate_in(conn: &mut Connection, batch: &Batch) -> AggregateOutcome {
+        let key = TraceKey::from_raw("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx = conn.transaction().unwrap();
+        let outcome = aggregate_calls(&tx, &key, batch).unwrap();
+        tx.commit().unwrap();
+        outcome
+    }
+
+    fn meta() -> Meta {
+        Meta {
+            schema_version: 1,
+            trace_id: "00000000-0000-0000-0000-000000000000".into(),
+            host: "h".into(),
+            pid: 1,
+            start_time: 1,
+            sapi: "cli".into(),
+            uri_or_script: "x".into(),
+            dropped_records: 0,
+        }
+    }
+
+    fn dict_entry(fn_id: u32) -> DictEntry {
+        DictEntry {
+            fn_id,
+            fqn: format!("ns\\fn_{fn_id}"),
+            file: "/tmp/x.php".into(),
+            line: 1,
+            kind: 0,
+        }
+    }
+
+    fn call(call_id: u32, parent: u32, fn_id: u32, wall: i64) -> Call {
+        Call {
+            call_id,
+            parent,
+            fn_id,
+            depth: if parent == 0 { 1 } else { 2 },
+            t_in: 0,
+            t_out: wall,
+            cpu_u: wall / 10,
+            cpu_s: wall / 20,
+            mem_in: 0,
+            mem_out: wall * 8,
+            abnormal_exit: false,
+        }
+    }
+
+    /// Insert dict entries directly (the real `record_batch` would
+    /// have done this before calling `aggregate_calls`).
+    fn install_dict(conn: &Connection, entries: &[DictEntry]) {
+        for d in entries {
+            conn.execute(
+                "INSERT OR IGNORE INTO dict (fn_id, fqn, file, line, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![d.fn_id as i64, &d.fqn, &d.file, d.line as i64, d.kind as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    // ---- synthetic root ----
+
+    #[test]
+    fn synthetic_root_exists_after_seed() {
+        let conn = fresh_trace_db();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE node_id = 1 AND parent_node_id IS NULL AND fn_id = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dict WHERE fn_id = 0 AND fqn = '<root>'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn seed_is_idempotent() {
+        let conn = fresh_trace_db();
+        // Call seed again on its own transaction.
+        let tx = conn.unchecked_transaction().unwrap();
+        seed_synthetic_root(&tx).unwrap();
+        tx.commit().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE node_id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    // ---- in-batch loop ----
+
+    #[test]
+    fn single_top_level_call_lands_under_root() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(7)],
+            calls: vec![call(1, 0, 7, 200)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.nodes_touched, 1);
+        assert_eq!(outcome.pending_added, 0);
+
+        let (parent_id, fn_id, call_count, total_wall): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT parent_node_id, fn_id, call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(parent_id, SYNTHETIC_ROOT_NODE_ID);
+        assert_eq!(fn_id, 7);
+        assert_eq!(call_count, 1);
+        assert_eq!(total_wall, 200);
+
+        // root's children_total_wall_ns bumped
+        let root_children: i64 = conn
+            .query_row(
+                "SELECT children_total_wall_ns FROM nodes WHERE node_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_children, 200);
+
+        // call_to_node populated
+        let mapped: i64 = conn
+            .query_row(
+                "SELECT node_id FROM call_to_node WHERE call_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(mapped > 1, "should be a real node, not synthetic root");
+    }
+
+    #[test]
+    fn br1_buckets_same_parent_fn() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(7)],
+            calls: vec![call(1, 0, 7, 100), call(2, 0, 7, 200), call(3, 0, 7, 50)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        // 3 calls collapse into ONE node row (BR-1). nodes_touched
+        // counts touches, not distinct nodes — 3 calls all touched
+        // the same row, so the counter is 3.
+        assert_eq!(outcome.nodes_touched, 3);
+
+        let n_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE fn_id = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n_rows, 1, "BR-1: one bucket per (parent, fn)");
+
+        let (cc, tw): (i64, i64) = conn
+            .query_row(
+                "SELECT call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cc, 3);
+        assert_eq!(tw, 350);
+    }
+
+    #[test]
+    fn different_fn_ids_under_same_parent_are_distinct_nodes() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7), dict_entry(8)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(7), dict_entry(8)],
+            calls: vec![call(1, 0, 7, 100), call(2, 0, 8, 200)],
+        };
+        aggregate_in(&mut conn, &batch);
+        let n_under_root: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE parent_node_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_under_root, 2);
+    }
+
+    #[test]
+    fn three_deep_chain_in_reverse_exit_order_resolves_in_one_batch() {
+        // Wire shape: children exit first, so the batch is
+        // [grandchild, child, parent] in array order. Reverse
+        // iteration (parent first) means no pending needed.
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(1), dict_entry(2), dict_entry(3)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(1), dict_entry(2), dict_entry(3)],
+            calls: vec![
+                // grandchild (call_id=10), parent is child (call_id=20)
+                Call {
+                    call_id: 10,
+                    parent: 20,
+                    fn_id: 1,
+                    depth: 3,
+                    t_in: 1,
+                    t_out: 5,
+                    cpu_u: 0,
+                    cpu_s: 0,
+                    mem_in: 0,
+                    mem_out: 0,
+                    abnormal_exit: false,
+                },
+                // child (call_id=20), parent is top-level (call_id=30)
+                Call {
+                    call_id: 20,
+                    parent: 30,
+                    fn_id: 2,
+                    depth: 2,
+                    t_in: 1,
+                    t_out: 10,
+                    cpu_u: 0,
+                    cpu_s: 0,
+                    mem_in: 0,
+                    mem_out: 0,
+                    abnormal_exit: false,
+                },
+                // top-level (call_id=30), parent = 0
+                Call {
+                    call_id: 30,
+                    parent: 0,
+                    fn_id: 3,
+                    depth: 1,
+                    t_in: 1,
+                    t_out: 20,
+                    cpu_u: 0,
+                    cpu_s: 0,
+                    mem_in: 0,
+                    mem_out: 0,
+                    abnormal_exit: false,
+                },
+            ],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.pending_added, 0, "reverse iter handles in-batch");
+        assert_eq!(outcome.pending_total, 0);
+
+        // Three non-root nodes + synthetic root
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 4, "synthetic root + 3 user-call nodes");
+    }
+
+    // ---- pending_calls + drain ----
+
+    #[test]
+    fn cross_batch_parent_goes_pending_and_resolves_later() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7), dict_entry(8)]);
+
+        // Batch A: a child whose parent (call_id=100) isn't seen.
+        let batch_a = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(10, 100, 7, 50)],
+        };
+        let outcome_a = aggregate_in(&mut conn, &batch_a);
+        assert_eq!(outcome_a.pending_added, 1);
+        assert_eq!(outcome_a.nodes_touched, 0);
+        assert_eq!(outcome_a.pending_total, 1);
+
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 1);
+        let nodes_fn_7: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE fn_id = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(nodes_fn_7, 0, "child should be pending, not aggregated yet");
+
+        // Batch B: the parent shows up.
+        let batch_b = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(100, 0, 8, 300)],
+        };
+        let outcome_b = aggregate_in(&mut conn, &batch_b);
+        assert_eq!(outcome_b.pending_resolved, 1);
+        assert_eq!(outcome_b.pending_total, 0);
+
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+        let nodes_fn_7: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE fn_id = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(nodes_fn_7, 1, "child should now be aggregated under fn=8");
+    }
+
+    #[test]
+    fn pending_whose_parent_never_arrives_stays_put() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7), dict_entry(99)]);
+
+        // Batch with one orphan child (parent call_id=999 never arrives).
+        let orphan_batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(10, 999, 7, 50)],
+        };
+        aggregate_in(&mut conn, &orphan_batch);
+
+        // Send 10 unrelated batches; none reference call_id=999 as a Call.
+        for i in 0..10 {
+            let unrelated_batch = Batch {
+                meta: meta(),
+                dict: vec![],
+                calls: vec![call(500 + i, 0, 99, 100)],
+            };
+            aggregate_in(&mut conn, &unrelated_batch);
+        }
+
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_calls WHERE call_id = 10",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "orphan must still be pending");
+    }
+
+    // ---- DQ-1 detection ----
+
+    #[test]
+    fn dq1_call_is_skipped_and_rest_aggregate() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]); // fn_id=99 deliberately missing
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(7)],
+            calls: vec![call(1, 0, 99, 100), call(2, 0, 7, 200)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.dq1_skipped, 1);
+        assert_eq!(outcome.nodes_touched, 1);
+
+        let n_under_root: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE parent_node_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_under_root, 1, "only fn=7 should land");
+    }
+
+    #[test]
+    fn synthetic_root_fn0_is_in_known_set_so_no_dq1_for_root_children() {
+        // Children of root reference parent=0 (the wire convention),
+        // so resolve_parent returns Some(1) without consulting
+        // call_to_node, and the child's own fn_id is what gets
+        // DQ-1-checked. This test just sanity-checks that fn_id=0
+        // is in the known set after seed.
+        let conn = fresh_trace_db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let known = known_fn_ids(&tx).unwrap();
+        assert!(
+            known.contains(&0u32),
+            "synthetic root's fn_id must be in known set"
+        );
+    }
+}

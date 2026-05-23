@@ -171,6 +171,28 @@ impl Collector {
             stderr_so_far: stderr_buf,
         }
     }
+
+    /// Block until `substring` appears in captured stdout, or panic
+    /// with a diagnostic snapshot once `timeout` elapses. Used as a
+    /// deterministic synchronisation point with the decoder task —
+    /// fixed sleeps were flaky once aggregation's 10K-call hot path
+    /// pushed end-to-end latency from ~5ms to ~200ms.
+    fn wait_for_stdout(&self, substring: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let stdout = self.stdout_so_far.lock().unwrap().clone();
+            if stdout.contains(substring) {
+                return stdout;
+            }
+            if Instant::now() > deadline {
+                let stderr = self.stderr_so_far.lock().unwrap().clone();
+                panic!(
+                    "timed out waiting for {substring:?} in stdout within {timeout:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for Collector {
@@ -868,6 +890,118 @@ fn build_test_batch(
 
 const ALL_ZERO_TRACE_ID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// Build a tiny MessagePack batch with one top-level call and one
+/// child of that call — exercises the aggregation path end-to-end
+/// without depending on captured fixtures, which all happen to be
+/// mid-trace snapshots (every chain roots on the script body whose
+/// exit hasn't reached us yet).
+///
+/// Wire shape:
+/// - dict: two entries (`fn_id = 1` for the parent, `fn_id = 2` for
+///   the child).
+/// - calls (exit order, so child first):
+///   - `{ call_id: 1, parent: 2, fn: 2, wall: 50 }` (child)
+///   - `{ call_id: 2, parent: 0, fn: 1, wall: 200 }` (top-level)
+fn build_test_batch_with_chain(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct TestMeta<'a> {
+        schema_version: u32,
+        trace_id: &'a str,
+        host: &'a str,
+        pid: u64,
+        start_time: i64,
+        sapi: &'a str,
+        uri_or_script: &'a str,
+        dropped_records: u64,
+    }
+    #[derive(Serialize)]
+    struct TestDictEntry<'a> {
+        fn_id: u32,
+        fqn: &'a str,
+        file: &'a str,
+        line: u32,
+        kind: u8,
+    }
+    #[derive(Serialize)]
+    struct TestCall {
+        call_id: u32,
+        parent: u32,
+        #[serde(rename = "fn")]
+        fn_id: u32,
+        depth: u32,
+        t_in: i64,
+        t_out: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+        mem_in: i64,
+        mem_out: i64,
+        abnormal_exit: bool,
+    }
+    #[derive(Serialize)]
+    struct TestBatch<'a> {
+        meta: TestMeta<'a>,
+        dict: Vec<TestDictEntry<'a>>,
+        calls: Vec<TestCall>,
+    }
+    rmp_serde::to_vec_named(&TestBatch {
+        meta: TestMeta {
+            schema_version: 1,
+            trace_id: ALL_ZERO_TRACE_ID,
+            host,
+            pid,
+            start_time,
+            sapi: "cli",
+            uri_or_script: "/tmp/chain.php",
+            dropped_records: 0,
+        },
+        dict: vec![
+            TestDictEntry {
+                fn_id: 1,
+                fqn: "ns\\top",
+                file: "/tmp/chain.php",
+                line: 1,
+                kind: 0,
+            },
+            TestDictEntry {
+                fn_id: 2,
+                fqn: "ns\\child",
+                file: "/tmp/chain.php",
+                line: 10,
+                kind: 0,
+            },
+        ],
+        calls: vec![
+            TestCall {
+                call_id: 1,
+                parent: 2,
+                fn_id: 2,
+                depth: 2,
+                t_in: 100,
+                t_out: 150,
+                cpu_u: 5,
+                cpu_s: 2,
+                mem_in: 0,
+                mem_out: 1024,
+                abnormal_exit: false,
+            },
+            TestCall {
+                call_id: 2,
+                parent: 0,
+                fn_id: 1,
+                depth: 1,
+                t_in: 0,
+                t_out: 200,
+                cpu_u: 20,
+                cpu_s: 5,
+                mem_in: 0,
+                mem_out: 4096,
+                abnormal_exit: false,
+            },
+        ],
+    })
+    .unwrap()
+}
+
 fn ingest_request(host: &str, body: &[u8]) -> Vec<u8> {
     request_with_body(
         "POST",
@@ -1536,7 +1670,7 @@ fn valid_v1_body_records_a_trace_row() {
     assert_eq!(status, 200);
 
     // Let the decoder finish writing.
-    std::thread::sleep(Duration::from_millis(250));
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
 
     let conn = open_index_db_ro(&data_dir);
     let (trace_key, batch_count, call_count, state): (String, i64, i64, String) = conn
@@ -1567,7 +1701,21 @@ fn consecutive_same_trace_batches_increment_counters_in_index() {
         let (status, _) = send_raw(&collector.bound, &req);
         assert_eq!(status, 200);
     }
-    std::thread::sleep(Duration::from_millis(250));
+    // Wait for all three to land. The decoder logs one
+    // "decoded batch" line per submission; the third occurrence is
+    // our quiescence signal.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stdout = collector.stdout_so_far.lock().unwrap().clone();
+        let count = stdout.matches("decoded batch").count();
+        if count >= 3 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("only {count}/3 decoded-batch lines within 5s\nstdout:\n{stdout}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let conn = open_index_db_ro(&data_dir);
     let (batch_count, call_count, first_at, last_at): (i64, i64, i64, i64) = conn
@@ -1595,7 +1743,7 @@ fn per_trace_sqlite_has_dict_after_first_batch() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    std::thread::sleep(Duration::from_millis(250));
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
 
     // Discover the trace key from the index DB (depends on fixture meta).
     let trace_key: String = open_index_db_ro(&data_dir)
@@ -1603,15 +1751,19 @@ fn per_trace_sqlite_has_dict_after_first_batch() {
         .unwrap();
 
     let trace_conn = open_trace_db_ro(&data_dir, &trace_key);
+    // Filter out the synthetic root (fn_id=0) so we count only the
+    // dict entries that came over the wire.
     let dict_count: i64 = trace_conn
-        .query_row("SELECT COUNT(*) FROM dict", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM dict WHERE fn_id > 0", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(dict_count, 2, "fixture's dict has 2 entries");
 
     // Spot-check that the schema actually populated the row content.
     let (fn_id, fqn): (i64, String) = trace_conn
         .query_row(
-            "SELECT fn_id, fqn FROM dict ORDER BY fn_id LIMIT 1",
+            "SELECT fn_id, fqn FROM dict WHERE fn_id > 0 ORDER BY fn_id LIMIT 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1621,8 +1773,12 @@ fn per_trace_sqlite_has_dict_after_first_batch() {
 }
 
 #[test]
-fn aggregation_tables_stay_empty_after_recording() {
-    let dir = unique_tempdir("agg_empty_e2e");
+fn anomalies_table_stays_empty_in_aggregation_core() {
+    // Renamed from `aggregation_tables_stay_empty_after_recording`
+    // when `aggregation-core` populated nodes / call_to_node /
+    // pending_calls. Only `anomalies` remains empty in this slice;
+    // the anomaly-detection slice fills it.
+    let dir = unique_tempdir("anom_empty_e2e");
     let data_dir = dir.join("data");
     let path = write_config(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
@@ -1630,19 +1786,167 @@ fn aggregation_tables_stay_empty_after_recording() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    std::thread::sleep(Duration::from_millis(250));
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
         .unwrap();
     let conn = open_trace_db_ro(&data_dir, &trace_key);
 
-    for table in ["nodes", "call_to_node", "pending_calls", "anomalies"] {
-        let n: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0, "{table} should be empty until the aggregation slice");
+    let n_anom: i64 = conn
+        .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_anom, 0, "anomalies stays empty until the anomaly slice");
+}
+
+#[test]
+fn aggregated_nodes_populate_after_a_batch() {
+    // The captured fixtures are mid-trace snapshots: every chain
+    // roots on a call_id whose exit hasn't reached us, so nothing
+    // aggregates from them alone. Use a synthetic batch with a real
+    // `parent=0` top-level call so the aggregation path produces
+    // observable rows.
+    let dir = unique_tempdir("nodes_populate");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_chain("host-agg", 100, 1_000_001);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    // Synthetic root + the two user-call nodes from the chain.
+    let n_nodes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        n_nodes, 3,
+        "expected synthetic root + 2 user nodes; got {n_nodes}"
+    );
+
+    // The top-level call (fn_id=1) sits under root; the child
+    // (fn_id=2) sits under the top-level node.
+    let top_self: i64 = conn
+        .query_row("SELECT total_wall_ns FROM nodes WHERE fn_id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let top_children: i64 = conn
+        .query_row(
+            "SELECT children_total_wall_ns FROM nodes WHERE fn_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(top_self, 200);
+    assert_eq!(top_children, 50, "child contributed its 50ns wall");
+
+    // For every non-root node, children_total_wall_ns ≤
+    // total_wall_ns (self_wall non-negative).
+    let mut stmt = conn
+        .prepare("SELECT total_wall_ns, children_total_wall_ns FROM nodes WHERE node_id > 1")
+        .unwrap();
+    let rows: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for (total, children) in rows {
+        assert!(
+            total >= children,
+            "self_wall must be non-negative: total={total} children={children}"
+        );
     }
+}
+
+#[test]
+fn synthetic_root_exists_post_aggregation() {
+    let dir = unique_tempdir("synth_root_e2e");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    let (node_id, fn_id): (i64, i64) = conn
+        .query_row(
+            "SELECT node_id, fn_id FROM nodes WHERE parent_node_id IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(node_id, 1);
+    assert_eq!(fn_id, 0);
+
+    // Dict carries the <root> entry too.
+    let fqn: String = conn
+        .query_row("SELECT fqn FROM dict WHERE fn_id = 0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fqn, "<root>");
+}
+
+#[test]
+fn call_to_node_populates_e2e() {
+    // Use the synthetic chain: captured fixtures aren't usable —
+    // every chain in them roots on an unseen call_id, so nothing
+    // ever lands in `call_to_node`.
+    let dir = unique_tempdir("c2n_populate");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_chain("host-c2n", 200, 1_000_002);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM call_to_node", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "one mapping per Call in the chain (top + child)");
+}
+
+#[test]
+fn decoded_batch_log_carries_nodes_and_pending_fields() {
+    let dir = unique_tempdir("log_nodes_pending");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    let stdout = collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("decoded batch"))
+        .unwrap_or_else(|| panic!("no decoded batch line in stdout: {stdout:?}"));
+    assert!(line.contains("nodes="), "missing nodes= field in: {line}");
+    assert!(
+        line.contains("pending="),
+        "missing pending= field in: {line}"
+    );
 }
 
 #[test]
@@ -1658,15 +1962,29 @@ fn per_trace_dict_is_idempotent_across_batches_e2e() {
         let (status, _) = send_raw(&collector.bound, &req);
         assert_eq!(status, 200);
     }
-    std::thread::sleep(Duration::from_millis(250));
+    // Wait for both submissions to finish recording.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stdout = collector.stdout_so_far.lock().unwrap().clone();
+        if stdout.matches("decoded batch").count() >= 2 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("only one decoded-batch line within 5s\nstdout:\n{stdout}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
         .unwrap();
     let conn = open_trace_db_ro(&data_dir, &trace_key);
 
+    // Filter out the synthetic root (fn_id=0).
     let dict_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM dict", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM dict WHERE fn_id > 0", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(dict_count, 2, "dict should not duplicate across batches");
 }
@@ -1681,7 +1999,7 @@ fn pragma_user_version_is_1_on_both_dbs() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    std::thread::sleep(Duration::from_millis(250));
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
 
     let index_conn = open_index_db_ro(&data_dir);
     let v: i64 = index_conn
@@ -1709,7 +2027,7 @@ fn trace_meta_mirrors_the_index_row_e2e() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    std::thread::sleep(Duration::from_millis(250));
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
 
     let index_conn = open_index_db_ro(&data_dir);
     let (key, host, pid): (String, String, i64) = index_conn
