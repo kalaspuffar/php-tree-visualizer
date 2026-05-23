@@ -9,7 +9,9 @@ license = "MIT"
 [dependencies]
 axum = "0.7"
 http-body-util = "0.1"
+rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "sync"] }
 toml = "0.8"
 tower = "0.5"

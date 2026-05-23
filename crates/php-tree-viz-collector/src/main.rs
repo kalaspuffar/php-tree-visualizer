@@ -11,6 +11,8 @@
 
 mod config;
 mod http;
+mod tracekey;
+mod wire;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
