@@ -1193,13 +1193,148 @@ retention_days = 30
     path
 }
 
+/// Build a v1 batch whose first `Call` has `abnormal_exit` encoded
+/// as an integer instead of a bool. `parse_meta` (the request-path
+/// parser) only materialises the `meta` block, so it'll accept this
+/// body and the request will return `200`. The decoder's
+/// `parse_batch` then fails with a type-mismatch error on the
+/// `abnormal_exit` field — exactly the malformed-on-disk path we
+/// want to exercise.
+fn build_batch_with_broken_call(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct TestMeta {
+        schema_version: u32,
+        trace_id: String,
+        host: String,
+        pid: u64,
+        start_time: i64,
+        sapi: String,
+        uri_or_script: String,
+        dropped_records: u64,
+    }
+    // A `Call` lookalike whose `abnormal_exit` is `u8`, not bool.
+    #[derive(Serialize)]
+    struct BrokenCall {
+        call_id: u32,
+        parent: u32,
+        #[serde(rename = "fn")]
+        fn_id: u32,
+        depth: u32,
+        t_in: i64,
+        t_out: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+        mem_in: i64,
+        mem_out: i64,
+        abnormal_exit: u8, // ← wire spec says bool; this is the corruption
+    }
+    #[derive(Serialize)]
+    struct BrokenBatch {
+        meta: TestMeta,
+        dict: Vec<()>,
+        calls: Vec<BrokenCall>,
+    }
+    rmp_serde::to_vec_named(&BrokenBatch {
+        meta: TestMeta {
+            schema_version: 1,
+            trace_id: ALL_ZERO_TRACE_ID.into(),
+            host: host.into(),
+            pid,
+            start_time,
+            sapi: "cli".into(),
+            uri_or_script: "/tmp/x.php".into(),
+            dropped_records: 0,
+        },
+        dict: vec![],
+        calls: vec![BrokenCall {
+            call_id: 1,
+            parent: 0,
+            fn_id: 1,
+            depth: 0,
+            t_in: 0,
+            t_out: 1,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: 1, // an integer where a bool is required
+        }],
+    })
+    .unwrap()
+}
+
 #[test]
-fn successful_request_is_logged_as_dequeued_by_the_receiver() {
-    let dir = unique_tempdir("dequeued");
+fn decoder_logs_error_and_continues_after_malformed_batch() {
+    let dir = unique_tempdir("decoder_recovery");
     let path = write_config(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
 
-    let host = "host-dequeue";
+    // First request: broken Call. `parse_meta` accepts it (only
+    // looks at `meta`), so the 200 happens; the decoder then trips
+    // on `abnormal_exit`-as-int and logs to stderr.
+    let broken = build_batch_with_broken_call("host-broken", 11, 1_111_111);
+    let (status, _) = send_raw(&collector.bound, &ingest_request(&collector.bound, &broken));
+    assert_eq!(
+        status, 200,
+        "broken-call body still 200s — parse_meta only reads `meta`"
+    );
+
+    // Second request: well-formed batch (empty dict + calls). The
+    // decoder must still be alive and process it. Use a different
+    // host so the synthesised trace_key differs from the first.
+    let good = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-good", 12, 2_222_222);
+    let (status, _) = send_raw(&collector.bound, &ingest_request(&collector.bound, &good));
+    assert_eq!(status, 200);
+
+    // Let both decoder iterations run.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    let stderr = collector.stderr_so_far.lock().unwrap().clone();
+
+    // Stderr should mention the parse failure with the broken
+    // trace's key.
+    let broken_key = synth_trace_key("host-broken", 11, 1_111_111);
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.starts_with("decoder: parse failed") && l.contains(&broken_key)),
+        "expected a `decoder: parse failed` stderr line for the broken trace; \
+         stderr was:\n{stderr}",
+    );
+
+    // Stdout should have a `decoded batch` line for the second
+    // (well-formed) request, proving the decoder kept running.
+    let good_key = synth_trace_key("host-good", 12, 2_222_222);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("decoded batch") && l.contains(&good_key)),
+        "expected a `decoded batch` line for the good trace after the broken one; \
+         stdout was:\n{stdout}",
+    );
+
+    // And no `decoded batch` line for the broken trace.
+    assert!(
+        !stdout
+            .lines()
+            .any(|l| l.starts_with("decoded batch") && l.contains(&broken_key)),
+        "decoded line for the broken trace shouldn't exist; stdout: {stdout}",
+    );
+}
+
+#[test]
+fn successful_request_is_logged_as_decoded_by_the_receiver() {
+    // Renamed from `..._dequeued_...` when the `wire-decoder` change
+    // replaced the placeholder receiver with a real decoder. The log
+    // line now carries the decoded counts (`dict` / `calls`) instead
+    // of just acknowledging the dequeue.
+    let dir = unique_tempdir("decoded");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let host = "host-decode";
     let pid: u64 = 4242;
     let start_time: i64 = 17_000_000_000_000_000;
     let body = build_test_batch(1, ALL_ZERO_TRACE_ID, host, pid, start_time);
@@ -1208,18 +1343,23 @@ fn successful_request_is_logged_as_dequeued_by_the_receiver() {
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
 
-    // Receiver runs in a background tokio task; give it a beat.
+    // Decoder runs in a background tokio task; give it a beat.
     std::thread::sleep(Duration::from_millis(200));
     let stdout = collector.stdout_so_far.lock().unwrap().clone();
     let key = synth_trace_key(host, pid, start_time);
     let expected_field = format!("trace_key={key}");
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("dequeued batch") && l.contains(&expected_field))
+        .find(|l| l.starts_with("decoded batch") && l.contains(&expected_field))
         .unwrap_or_else(|| {
-            panic!("no matching dequeued line for {expected_field} in stdout: {stdout:?}")
+            panic!("no matching decoded line for {expected_field} in stdout: {stdout:?}")
         });
     assert!(line.contains(".raw/batch-0001.msgpack"));
+    // `build_test_batch` ships `dict = []` and `calls = []`, so the
+    // log line should show counts of 0 for both. This anchors the
+    // test against the format, not against a specific workload.
+    assert!(line.contains("dict=0"), "missing dict=0 in: {line}");
+    assert!(line.contains("calls=0"), "missing calls=0 in: {line}");
 }
 
 #[test]
