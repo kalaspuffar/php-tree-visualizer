@@ -1,0 +1,9 @@
+[package]
+name = "php-tree-viz-collector"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Collector + ingester for the php-analyze PHP profiling extension."
+license = "MIT"
+
+[dependencies]

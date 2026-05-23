@@ -4,3 +4,7 @@
 /CLAUDE.md
 /.claude
 /openspec
+/REQUIREMENTS.md
+
+# Rust build artifacts
+/target/
