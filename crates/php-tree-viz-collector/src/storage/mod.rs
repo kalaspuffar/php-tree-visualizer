@@ -9,6 +9,7 @@
 //!
 //! Implements `SPECIFICATION.md` §4.2 / §4.3 / §8.2 / AD-2.
 
+mod aggregate;
 mod error;
 mod schema;
 
@@ -18,6 +19,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 
 pub use error::StorageError;
+
+pub(crate) use aggregate::AggregateOutcome;
 
 use crate::http::BatchSubmission;
 use crate::tracekey::TraceKey;
@@ -77,7 +80,7 @@ impl Storage {
         submission: &BatchSubmission,
         batch: &wire::Batch,
         received_at_ns: i64,
-    ) -> Result<(), StorageError> {
+    ) -> Result<AggregateOutcome, StorageError> {
         let key = &submission.trace_key;
         let meta = &batch.meta;
 
@@ -178,12 +181,19 @@ impl Storage {
             }
         }
 
+        // Seed the synthetic root (idempotent INSERT OR IGNORE)
+        // and aggregate the batch's Calls into the per-trace
+        // nodes tree. Both run inside the same transaction so a
+        // reader never sees a partial batch.
+        aggregate::seed_synthetic_root(&tx)?;
+        let outcome = aggregate::aggregate_calls(&tx, key, batch)?;
+
         tx.commit().map_err(|e| StorageError::Query {
             context: "trace commit",
             source: e,
         })?;
 
-        Ok(())
+        Ok(outcome)
     }
 
     fn ensure_trace_conn(&mut self, key: &TraceKey) -> Result<&mut Connection, StorageError> {
@@ -511,8 +521,12 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_tables_stay_empty_after_record_batch() {
-        let dir = unique_dir("agg_empty");
+    fn only_anomalies_stays_empty_after_aggregation_core() {
+        // Renamed from `aggregation_tables_stay_empty_after_record_batch`
+        // when `aggregation-core` made the decoder write to
+        // `nodes` / `call_to_node` / `pending_calls`. Only the
+        // `anomalies` table remains empty until the anomaly slice.
+        let dir = unique_dir("agg_post_core");
         let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
         let key = TraceKey::from_raw("dddddddddddddddddddddddddddddddd");
         let sub = dummy_submission(&key, &dir.join("traces"));
@@ -526,14 +540,34 @@ mod tests {
 
         let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
         let conn = Connection::open(&trace_path).unwrap();
-        for table in ["nodes", "call_to_node", "pending_calls", "anomalies"] {
-            let n: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(n, 0, "{table} should be empty");
-        }
+
+        // `anomalies` is the only table still empty in this slice.
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            n_anom, 0,
+            "anomalies should be empty until the anomaly slice"
+        );
+
+        // `nodes` populates: synthetic root + the one user call's node.
+        let n_nodes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n_nodes, 2, "synthetic root + one user node");
+
+        // `call_to_node` populates: one row for the one user call.
+        let n_c2n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_to_node", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n_c2n, 1);
+
+        // `pending_calls` empty (the call had parent=0 → resolved
+        // immediately against the synthetic root).
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 0);
     }
 
     #[test]
