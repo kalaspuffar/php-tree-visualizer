@@ -814,11 +814,13 @@ fn log_line_includes_body_bytes_for_413_abort() {
 
 use serde::Serialize;
 
-/// A captured real batch from the handover fixtures. `trace_id` is
-/// all-zero, so the TraceKey synthesis path is exercised; `host`,
-/// `pid`, and `start_time` come from the original capture.
-const FIXTURE_FLAT_CALLS_1: &[u8] =
-    include_bytes!("../../../handover/batches/flat_calls/batch-0001.msgpack");
+/// A captured real batch from the `flat_calls` workload. The source
+/// is the gitignored `handover/batches/` directory; the copy under
+/// `tests/fixtures/` is what's tracked in git and visible to CI.
+/// `trace_id` is all-zero in the capture, so the TraceKey synthesis
+/// path is exercised; `host`, `pid`, and `start_time` come from
+/// the original capture.
+const FIXTURE_FLAT_CALLS_1: &[u8] = include_bytes!("fixtures/flat_calls/batch-0001.msgpack");
 
 /// Build a synthetic batch via `rmp_serde::to_vec_named`. Used by
 /// edge-case tests that need a specific `schema_version` or

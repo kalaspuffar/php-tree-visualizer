@@ -91,8 +91,11 @@ mod tests {
     use serde::Serialize;
     use std::collections::BTreeMap;
 
+    // A real captured batch (gitignored `handover/` was the source);
+    // the file lives under `tests/fixtures/` so it is tracked in git
+    // and reachable in CI.
     const FIXTURE_FLAT_CALLS_1: &[u8] =
-        include_bytes!("../../../handover/batches/flat_calls/batch-0001.msgpack");
+        include_bytes!("../tests/fixtures/flat_calls/batch-0001.msgpack");
 
     /// Test-only Serialize-friendly Meta. Mirrors the real Meta
     /// field-by-field so `rmp_serde::to_vec_named` produces a body
