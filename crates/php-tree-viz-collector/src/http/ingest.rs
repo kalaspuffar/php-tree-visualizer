@@ -1,26 +1,19 @@
-//! Streaming `POST /ingest/v1` handler.
+//! Streaming `POST /ingest/v1` handler with durable commit.
 //!
-//! Reads the request body frame-by-frame and writes it to
-//! `<tmp_dir>/<random>.partial`. Two cap-enforcement paths:
+//! Per-request flow (see SPECIFICATION.md §2.2):
 //!
-//! - **Fast-path 413**: a `Content-Length` header above the cap
-//!   short-circuits before any body bytes are read.
-//! - **Running-count 413**: each frame increments a counter; once it
-//!   exceeds the cap we delete the partial file, abort the read, and
-//!   return `413` with `Connection: close`.
+//! 1. Fast-path 413 on oversize `Content-Length`.
+//! 2. Stream body frame-by-frame into `tmp/<random>.partial`.
+//!    Running-count 413 on cap exceeded; 400 on body stream error.
+//! 3. Read the partial back, decode the `meta` block.
+//!    Malformed → 400. `schema_version != 1` → 422.
+//! 4. Compute `TraceKey` from meta; acquire per-trace mutex.
+//! 5. Atomic rename → `traces/<key>.raw/batch-NNNN.msgpack`.
+//! 6. fsync(file) + fsync(parent_dir).
+//! 7. Return `200` with empty body.
 //!
-//! On success (body fully read, within cap) the handler still
-//! returns `501 Not Implemented` per the interim contract — fsync
-//! and atomic rename land in the next change. The partial file is
-//! left on disk for that change to pick up.
-//!
-//! Internal write failures become `500` with a documented JSON body.
-//! The path that failed is logged so the operator can find it.
-//!
-//! On every response the handler attaches a `BodyBytes(u64)`
-//! extension carrying the count of bytes actually read from the
-//! wire; the request-logging middleware turns that into the
-//! `body_bytes=<N>` field on the log line.
+//! Every response carries a `BodyBytes(u64)` extension so the
+//! request-logging middleware can emit `body_bytes=<N>`.
 
 use std::path::Path;
 
@@ -30,14 +23,17 @@ use axum::http::{header, HeaderMap, Response, StatusCode};
 use http_body_util::BodyExt;
 use tokio::io::AsyncWriteExt;
 
+use super::storage;
 use super::tmp;
 use super::{BodyBytes, HttpError, SharedState};
+use crate::tracekey;
+use crate::wire;
 
-const NOT_IMPLEMENTED_BODY: &str =
-    r#"{"error":"not_yet_implemented","detail":"body handling lands in the next change"}"#;
 const TOO_LARGE_BODY: &str = r#"{"error":"too_large"}"#;
 const INTERNAL_BODY: &str = r#"{"error":"internal","detail":"could not buffer request"}"#;
-const MALFORMED_REQUEST_BODY: &str = r#"{"error":"malformed_request"}"#;
+const MALFORMED_FRAME_BODY: &str = r#"{"error":"malformed_request"}"#;
+const TRACE_FULL_BODY_PREFIX: &str = r#"{"error":"trace_full","trace_key":""#;
+const TRACE_FULL_BODY_SUFFIX: &str = r#""}"#;
 
 pub async fn ingest(
     State(state): State<SharedState>,
@@ -46,14 +42,14 @@ pub async fn ingest(
 ) -> Response<Body> {
     let mut bytes_read: u64 = 0;
 
-    // Fast-path 413: declared Content-Length above the cap means we
-    // never open a file or read a byte.
+    // ---- Fast-path 413 ----
     if let Some(declared) = declared_content_length(&headers) {
         if declared > state.max_body_bytes {
             return with_body_bytes(too_large_response(), 0);
         }
     }
 
+    // ---- Stream body to tmp ----
     let filename = tmp::make_filename();
     let path = state.tmp_dir.join(format!("{filename}.partial"));
 
@@ -75,36 +71,83 @@ pub async fn ingest(
     )
     .await;
 
-    let response = match outcome {
-        Outcome::Ok => {
-            if let Err(err) = file.flush().await {
-                let _ = tokio::fs::remove_file(&path).await;
-                log_internal_error(&HttpError::TmpWrite {
-                    path: path.clone(),
-                    source: err,
-                });
-                internal_response()
-            } else {
-                drop(file);
-                not_yet_implemented_response()
-            }
-        }
+    match outcome {
         Outcome::OverCap => {
             let _ = tokio::fs::remove_file(&path).await;
-            too_large_response()
+            return with_body_bytes(too_large_response(), bytes_read);
         }
         Outcome::FrameError => {
             let _ = tokio::fs::remove_file(&path).await;
-            malformed_request_response()
+            return with_body_bytes(malformed_frame_response(), bytes_read);
         }
         Outcome::WriteError(err) => {
             let _ = tokio::fs::remove_file(&path).await;
             log_internal_error(&err);
-            internal_response()
+            return with_body_bytes(internal_response(), bytes_read);
+        }
+        Outcome::Ok => {}
+    }
+
+    if let Err(source) = file.flush().await {
+        let _ = tokio::fs::remove_file(&path).await;
+        log_internal_error(&HttpError::TmpWrite {
+            path: path.clone(),
+            source,
+        });
+        return with_body_bytes(internal_response(), bytes_read);
+    }
+    drop(file);
+
+    // ---- Decode meta ----
+    let body_bytes_on_disk = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(source) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            log_internal_error(&HttpError::TmpWrite {
+                path: path.clone(),
+                source,
+            });
+            return with_body_bytes(internal_response(), bytes_read);
         }
     };
+    let meta = match wire::parse_meta(&body_bytes_on_disk) {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            return with_body_bytes(malformed_msgpack_response(&format!("{err}")), bytes_read);
+        }
+    };
+    if meta.schema_version != 1 {
+        let _ = tokio::fs::remove_file(&path).await;
+        return with_body_bytes(
+            unsupported_schema_version_response(meta.schema_version),
+            bytes_read,
+        );
+    }
 
-    with_body_bytes(response, bytes_read)
+    // ---- Commit under per-trace lock ----
+    let key = tracekey::from_meta(&meta);
+    let lock = state.lock_for(&key);
+    let commit_result = {
+        // `tokio::sync::Mutex` is async-aware; holding the guard
+        // across the rename + fsync `await`s is the intended use.
+        let _guard = lock.lock().await;
+        storage::commit_partial(&path, &state.traces_dir, &key).await
+    };
+
+    match commit_result {
+        Ok(_target) => with_body_bytes(success_response(), bytes_read),
+        Err(HttpError::TraceFull { key }) => {
+            // Leave the partial in place on trace_full so an
+            // operator can inspect what could not be committed.
+            with_body_bytes(trace_full_response(&key), bytes_read)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            log_internal_error(&err);
+            with_body_bytes(internal_response(), bytes_read)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -115,11 +158,6 @@ enum Outcome {
     WriteError(HttpError),
 }
 
-/// Drive the body stream until it's fully consumed, the cap is
-/// exceeded, or an error occurs. Writes each data frame to `file`
-/// and increments `*bytes_read` by the frame size as bytes are
-/// received from the wire (so the count is accurate even on a 413
-/// abort).
 async fn stream_body_to_file(
     body: &mut Body,
     file: &mut tokio::fs::File,
@@ -134,7 +172,7 @@ async fn stream_body_to_file(
         };
         let data = match frame.into_data() {
             Ok(d) => d,
-            Err(_) => continue, // trailer or other non-data frame
+            Err(_) => continue,
         };
         *bytes_read += data.len() as u64;
         if *bytes_read > cap {
@@ -160,11 +198,6 @@ fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
 }
 
 async fn open_partial(path: &Path) -> Result<tokio::fs::File, HttpError> {
-    // `tokio::fs::OpenOptions` doesn't expose `.mode()` directly on
-    // Unix, so we build a `std::fs::OpenOptions`, apply the mode via
-    // the platform-specific `OpenOptionsExt`, open synchronously,
-    // and hand the resulting handle to tokio. The blocking `open`
-    // is a single syscall and acceptable on the async path.
     let mut opts = std::fs::OpenOptions::new();
     opts.create_new(true).write(true);
     apply_partial_mode(&mut opts);
@@ -189,12 +222,12 @@ fn with_body_bytes(mut resp: Response<Body>, bytes: u64) -> Response<Body> {
     resp
 }
 
-fn not_yet_implemented_response() -> Response<Body> {
+fn success_response() -> Response<Body> {
     Response::builder()
-        .status(StatusCode::NOT_IMPLEMENTED)
+        .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(NOT_IMPLEMENTED_BODY))
-        .expect("placeholder response is a fixed shape; build cannot fail")
+        .body(Body::empty())
+        .expect("200 response is a fixed shape; build cannot fail")
 }
 
 fn too_large_response() -> Response<Body> {
@@ -215,19 +248,65 @@ fn internal_response() -> Response<Body> {
         .expect("500 response is a fixed shape; build cannot fail")
 }
 
-fn malformed_request_response() -> Response<Body> {
+fn malformed_frame_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONNECTION, "close")
-        .body(Body::from(MALFORMED_REQUEST_BODY))
+        .body(Body::from(MALFORMED_FRAME_BODY))
         .expect("400 response is a fixed shape; build cannot fail")
 }
 
+/// 400 with a documented MessagePack-parse body. Detail is the
+/// wire error's `Display`, JSON-escaped naively (we control the
+/// inputs — they have no control characters beyond what serde
+/// produces, but escape quotes + backslashes defensively).
+fn malformed_msgpack_response(detail: &str) -> Response<Body> {
+    let escaped = escape_json(detail);
+    let body = format!(r#"{{"error":"malformed_msgpack","detail":"{escaped}"}}"#);
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("400 response build cannot fail")
+}
+
+fn unsupported_schema_version_response(got: u32) -> Response<Body> {
+    let body = format!(r#"{{"error":"unsupported_schema_version","got":{got}}}"#);
+    Response::builder()
+        .status(StatusCode::UNPROCESSABLE_ENTITY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("422 response build cannot fail")
+}
+
+fn trace_full_response(key: &crate::tracekey::TraceKey) -> Response<Body> {
+    let mut body = String::with_capacity(64);
+    body.push_str(TRACE_FULL_BODY_PREFIX);
+    body.push_str(key.as_str());
+    body.push_str(TRACE_FULL_BODY_SUFFIX);
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("500 trace_full response build cannot fail")
+}
+
+fn escape_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            // Control characters → space (defensive; should not appear in WireError display).
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn log_internal_error(err: &HttpError) {
-    // Mirror the single-line stderr convention used elsewhere in the
-    // crate. The `obs` sub-module will swap this for structured
-    // logging when it lands.
     eprintln!("http error during ingest: {err}");
 }
 
@@ -250,7 +329,7 @@ mod tests {
             Some(1024)
         );
         assert_eq!(
-            declared_content_length(&headers_with_cl("18446744073709551615")), // u64::MAX
+            declared_content_length(&headers_with_cl("18446744073709551615")),
             Some(u64::MAX)
         );
     }
@@ -266,32 +345,58 @@ mod tests {
     fn too_large_response_carries_connection_close() {
         let r = too_large_response();
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let conn = r.headers().get(header::CONNECTION).unwrap();
-        assert_eq!(conn, "close");
+        assert_eq!(r.headers().get(header::CONNECTION).unwrap(), "close");
     }
 
     #[test]
     fn internal_response_carries_connection_close() {
         let r = internal_response();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let conn = r.headers().get(header::CONNECTION).unwrap();
-        assert_eq!(conn, "close");
+        assert_eq!(r.headers().get(header::CONNECTION).unwrap(), "close");
     }
 
-    #[tokio::test]
-    async fn placeholder_returns_501_with_documented_body() {
-        let r = not_yet_implemented_response();
-        assert_eq!(r.status(), StatusCode::NOT_IMPLEMENTED);
+    #[test]
+    fn unsupported_schema_version_response_carries_got_value() {
+        let r = unsupported_schema_version_response(7);
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            r.headers().get(header::CONNECTION).is_none(),
+            "422 must not force connection close"
+        );
+    }
 
-        let body_bytes = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
-        let body = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(body.contains("not_yet_implemented"));
-        assert!(body.contains("body handling lands in the next change"));
+    #[test]
+    fn malformed_msgpack_response_includes_detail() {
+        let r = malformed_msgpack_response(r#"bad "quote" and \backslash"#);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            r.headers().get(header::CONNECTION).is_none(),
+            "400-malformed must not force connection close"
+        );
+    }
+
+    #[test]
+    fn success_response_is_empty_200() {
+        let r = success_response();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn escape_json_handles_quotes_and_backslashes() {
+        assert_eq!(escape_json(r#"abc"def"#), r#"abc\"def"#);
+        assert_eq!(escape_json(r#"a\b"#), r#"a\\b"#);
+        assert_eq!(escape_json("normal text"), "normal text");
+    }
+
+    #[test]
+    fn escape_json_replaces_control_chars_with_space() {
+        assert_eq!(escape_json("a\nb"), "a b");
+        assert_eq!(escape_json("a\tb"), "a b");
     }
 
     #[test]
     fn body_bytes_extension_round_trips() {
-        let r = with_body_bytes(not_yet_implemented_response(), 42);
+        let r = with_body_bytes(success_response(), 42);
         let extension = r.extensions().get::<BodyBytes>().copied();
         assert_eq!(extension.map(|b| b.0), Some(42));
     }

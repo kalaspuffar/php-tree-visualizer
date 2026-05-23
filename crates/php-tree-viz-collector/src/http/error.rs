@@ -8,6 +8,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::tracekey::TraceKey;
+
 #[derive(Debug)]
 pub enum HttpError {
     /// `TcpListener::bind` failed (address in use, permission denied,
@@ -33,6 +35,27 @@ pub enum HttpError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// `<data_dir>/traces/` or `<data_dir>/traces/<key>.raw/` could
+    /// not be created or chmod-ed.
+    TracesDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The atomic rename from `tmp/<rand>.partial` into
+    /// `traces/<key>.raw/batch-NNNN.msgpack` failed.
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        source: std::io::Error,
+    },
+    /// `sync_all()` on a file or directory failed.
+    Fsync {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A trace has accumulated 9999 batches and cannot accept any
+    /// more. Defensive; proper §4.4.2 rollover is a future change.
+    TraceFull { key: TraceKey },
 }
 
 impl std::fmt::Display for HttpError {
@@ -58,6 +81,29 @@ impl std::fmt::Display for HttpError {
                     source
                 )
             }
+            Self::TracesDir { path, source } => {
+                write!(
+                    f,
+                    "could not prepare traces directory {}: {}",
+                    path.display(),
+                    source
+                )
+            }
+            Self::Rename { from, to, source } => {
+                write!(
+                    f,
+                    "could not rename {} -> {}: {}",
+                    from.display(),
+                    to.display(),
+                    source
+                )
+            }
+            Self::Fsync { path, source } => {
+                write!(f, "fsync of {} failed: {}", path.display(), source)
+            }
+            Self::TraceFull { key } => {
+                write!(f, "trace {} has reached the 9999-batch cap", key)
+            }
         }
     }
 }
@@ -68,7 +114,11 @@ impl std::error::Error for HttpError {
             Self::Bind { source, .. }
             | Self::Serve(source)
             | Self::TmpDir { source, .. }
-            | Self::TmpWrite { source, .. } => Some(source),
+            | Self::TmpWrite { source, .. }
+            | Self::TracesDir { source, .. }
+            | Self::Rename { source, .. }
+            | Self::Fsync { source, .. } => Some(source),
+            Self::TraceFull { .. } => None,
         }
     }
 }

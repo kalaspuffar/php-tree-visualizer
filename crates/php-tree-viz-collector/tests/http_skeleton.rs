@@ -343,27 +343,10 @@ fn correct_token_wrong_content_type_returns_415() {
     assert_eq!(status, 415);
 }
 
-#[test]
-fn valid_request_returns_501_placeholder() {
-    let dir = unique_tempdir("placeholder");
-    let path = write_config(&dir, "127.0.0.1:0");
-    let collector = Collector::spawn(&path);
-
-    let req = request(
-        "POST",
-        "/ingest/v1",
-        &[
-            ("Authorization", &format!("Bearer {TOKEN}")),
-            ("Content-Type", MEDIA_TYPE),
-        ],
-        "",
-        &collector.bound,
-    );
-    let (status, body) = send_raw(&collector.bound, &req);
-    assert_eq!(status, 501);
-    assert!(body.contains("not_yet_implemented"));
-    assert!(body.contains("body handling lands in the next change"));
-}
+// `valid_request_returns_501_placeholder` was removed when the
+// durable-ingest change retired the 501 placeholder. The new
+// `valid_v1_body_returns_200_and_lands_at_canonical_path` below
+// covers the post-durability success path.
 
 #[test]
 fn unknown_path_returns_404() {
@@ -707,99 +690,23 @@ fn chunked_body_exceeding_cap_returns_413_and_cleans_up() {
     );
 }
 
-#[test]
-fn within_cap_body_lands_on_disk_as_partial() {
-    let dir = unique_tempdir("within_cap");
-    let path = write_config_with_overrides(
-        &dir,
-        "127.0.0.1:0",
-        dir.join("data").to_str().unwrap(),
-        Some(10_240),
-    );
-    let data_dir = dir.join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let collector = Collector::spawn(&path);
+// `within_cap_body_lands_on_disk_as_partial` was removed when the
+// durable-ingest change started renaming partial files into
+// `traces/<key>.raw/batch-NNNN.msgpack` on success. The post-
+// durability equivalent is `valid_v1_body_returns_200_and_lands_at_canonical_path`,
+// which uses a real captured fixture and asserts the canonical
+// path. The MODIFIED "Request body is streamed to a unique tmp
+// file" spec now requires the partial to *not* be observable in
+// tmp/ after a 200.
 
-    let body = vec![b'A'; 1024];
-    let req = request_with_body(
-        "POST",
-        "/ingest/v1",
-        &[
-            ("Authorization", &format!("Bearer {TOKEN}")),
-            ("Content-Type", MEDIA_TYPE),
-        ],
-        &body,
-        &collector.bound,
-    );
-    let (status, resp_body) = send_raw(&collector.bound, &req);
-    assert_eq!(status, 501);
-    assert!(resp_body.contains("not_yet_implemented"));
-
-    // Allow the handler to flush + close. Then verify exactly one
-    // partial file of length 1024 exists.
-    std::thread::sleep(Duration::from_millis(100));
-    let partials = list_partials(&data_dir);
-    assert_eq!(
-        partials.len(),
-        1,
-        "expected 1 partial file, got {partials:?}"
-    );
-    let size = std::fs::metadata(&partials[0]).unwrap().len();
-    assert_eq!(size, 1024, "partial file size mismatch");
-}
-
-#[test]
-fn concurrent_requests_produce_distinct_partial_files() {
-    let dir = unique_tempdir("concurrent_partials");
-    let path = write_config_with_overrides(
-        &dir,
-        "127.0.0.1:0",
-        dir.join("data").to_str().unwrap(),
-        Some(10_240),
-    );
-    let data_dir = dir.join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let collector = Collector::spawn(&path);
-
-    let bound = collector.bound.clone();
-    let mut handles = Vec::with_capacity(8);
-    for i in 0..8u8 {
-        let bound = bound.clone();
-        handles.push(std::thread::spawn(move || {
-            let body = vec![i; 64];
-            let req = request_with_body(
-                "POST",
-                "/ingest/v1",
-                &[
-                    ("Authorization", &format!("Bearer {TOKEN}")),
-                    ("Content-Type", MEDIA_TYPE),
-                ],
-                &body,
-                &bound,
-            );
-            send_raw(&bound, &req)
-        }));
-    }
-    for h in handles {
-        let (status, _) = h.join().unwrap();
-        assert_eq!(status, 501);
-    }
-
-    std::thread::sleep(Duration::from_millis(150));
-    let partials = list_partials(&data_dir);
-    assert_eq!(
-        partials.len(),
-        8,
-        "expected 8 distinct partial files, got {partials:?}"
-    );
-    let mut names: Vec<_> = partials
-        .iter()
-        .map(|p| p.file_name().unwrap().to_owned())
-        .collect();
-    names.sort();
-    names.dedup();
-    assert_eq!(names.len(), 8, "filenames are not distinct");
-}
+// `concurrent_requests_produce_distinct_partial_files` was removed
+// when the durable-ingest change renamed partial files away on
+// success. The post-durability equivalent for filename uniqueness
+// is `make_filename`'s unit test in `src/http/tmp.rs`. The
+// post-durability equivalent for concurrent rename safety is
+// `concurrent_same_trace_requests_each_get_a_unique_batch_number`
+// below, which asserts that 5 concurrent same-trace requests each
+// land at a distinct `batch-NNNN`.
 
 #[test]
 fn startup_wipes_pre_existing_partial_files() {
@@ -847,39 +754,12 @@ fn tmp_dir_creation_failure_exits_3() {
     assert_eq!(stderr.lines().count(), 1);
 }
 
-#[test]
-fn log_line_includes_body_bytes_for_within_cap_request() {
-    let dir = unique_tempdir("log_body_bytes_ok");
-    let path = write_config_with_overrides(
-        &dir,
-        "127.0.0.1:0",
-        dir.join("data").to_str().unwrap(),
-        Some(10_240),
-    );
-    std::fs::create_dir_all(dir.join("data")).unwrap();
-    let collector = Collector::spawn(&path);
-
-    let body = vec![b'A'; 1024];
-    let req = request_with_body(
-        "POST",
-        "/ingest/v1",
-        &[
-            ("Authorization", &format!("Bearer {TOKEN}")),
-            ("Content-Type", MEDIA_TYPE),
-        ],
-        &body,
-        &collector.bound,
-    );
-    let (status, _) = send_raw(&collector.bound, &req);
-    assert_eq!(status, 501);
-
-    std::thread::sleep(Duration::from_millis(150));
-    let stdout = collector.stdout_so_far.lock().unwrap().clone();
-    assert!(
-        stdout.contains("body_bytes=1024"),
-        "stdout missing body_bytes=1024: {stdout:?}"
-    );
-}
+// `log_line_includes_body_bytes_for_within_cap_request` was
+// removed when the durable-ingest change retired the 501
+// placeholder. The post-durability equivalent is
+// `success_path_log_line_carries_body_bytes_and_status_200`
+// below, which sends a valid v1 batch and asserts the log line
+// carries the body byte count plus `status=200`.
 
 #[test]
 fn log_line_includes_body_bytes_for_413_abort() {
@@ -925,5 +805,359 @@ fn log_line_includes_body_bytes_for_413_abort() {
     assert!(
         n >= 1024,
         "expected body_bytes >= cap (1024) on 413 abort, got {n}"
+    );
+}
+
+// ============================================================
+// Durable-ingest tests (added by the durable-ingest change)
+// ============================================================
+
+use serde::Serialize;
+
+/// A captured real batch from the handover fixtures. `trace_id` is
+/// all-zero, so the TraceKey synthesis path is exercised; `host`,
+/// `pid`, and `start_time` come from the original capture.
+const FIXTURE_FLAT_CALLS_1: &[u8] =
+    include_bytes!("../../../handover/batches/flat_calls/batch-0001.msgpack");
+
+/// Build a synthetic batch via `rmp_serde::to_vec_named`. Used by
+/// edge-case tests that need a specific `schema_version` or
+/// `trace_id` value that the captured fixtures don't carry.
+fn build_test_batch(
+    schema_version: u32,
+    trace_id: &str,
+    host: &str,
+    pid: u64,
+    start_time: i64,
+) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct TestMeta<'a> {
+        schema_version: u32,
+        trace_id: &'a str,
+        host: &'a str,
+        pid: u64,
+        start_time: i64,
+        sapi: &'a str,
+        uri_or_script: &'a str,
+        dropped_records: u64,
+    }
+    #[derive(Serialize)]
+    struct TestBatch<'a> {
+        meta: TestMeta<'a>,
+        dict: Vec<()>,
+        calls: Vec<()>,
+    }
+    rmp_serde::to_vec_named(&TestBatch {
+        meta: TestMeta {
+            schema_version,
+            trace_id,
+            host,
+            pid,
+            start_time,
+            sapi: "cli",
+            uri_or_script: "/tmp/test.php",
+            dropped_records: 0,
+        },
+        dict: vec![],
+        calls: vec![],
+    })
+    .unwrap()
+}
+
+const ALL_ZERO_TRACE_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+fn ingest_request(host: &str, body: &[u8]) -> Vec<u8> {
+    request_with_body(
+        "POST",
+        "/ingest/v1",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        body,
+        host,
+    )
+}
+
+fn list_batch_files(traces_dir: &Path, trace_key: &str) -> Vec<PathBuf> {
+    let trace_dir = traces_dir.join(format!("{trace_key}.raw"));
+    if !trace_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut out: Vec<_> = std::fs::read_dir(&trace_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|s| s == "msgpack")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Compute the synthesised TraceKey for an all-zero trace_id.
+/// Mirrors `src/tracekey.rs::synthesize` so tests can predict where
+/// the batch file lands.
+fn synth_trace_key(host: &str, pid: u64, start_time: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(host.as_bytes());
+    h.update(pid.to_le_bytes());
+    h.update(start_time.to_le_bytes());
+    let d = h.finalize();
+    d[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+#[test]
+fn valid_v1_body_returns_200_and_lands_at_canonical_path() {
+    let dir = unique_tempdir("v1_durable");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
+    let (status, resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200, "expected 200; body was: {resp_body:?}");
+    assert!(resp_body.is_empty(), "200 must have empty body");
+
+    let traces_dir = data_dir.join("traces");
+    std::thread::sleep(Duration::from_millis(100));
+    let dirs: Vec<_> = std::fs::read_dir(&traces_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(
+        dirs.len(),
+        1,
+        "expected exactly one trace dir under traces/, got {dirs:?}"
+    );
+    let trace_raw = &dirs[0];
+    assert!(trace_raw
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|s| s.ends_with(".raw")));
+
+    let batches: Vec<_> = std::fs::read_dir(trace_raw)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(batches.len(), 1, "expected one batch file, got {batches:?}");
+    assert!(batches[0].ends_with("batch-0001.msgpack"));
+    assert_eq!(std::fs::read(&batches[0]).unwrap(), FIXTURE_FLAT_CALLS_1);
+
+    let leftovers = list_partials(&data_dir);
+    assert!(
+        leftovers.is_empty(),
+        "expected no partial files; got {leftovers:?}"
+    );
+}
+
+#[test]
+fn consecutive_batches_for_same_trace_number_monotonically() {
+    let dir = unique_tempdir("monotonic");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-mono", 42, 9_999_999);
+    for _ in 0..3 {
+        let req = ingest_request(&collector.bound, &body);
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200);
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+    let key = synth_trace_key("host-mono", 42, 9_999_999);
+    let batches = list_batch_files(&data_dir.join("traces"), &key);
+    assert_eq!(batches.len(), 3, "want 3 batches; got {batches:?}");
+    let names: Vec<_> = batches
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "batch-0001.msgpack".to_owned(),
+            "batch-0002.msgpack".to_owned(),
+            "batch-0003.msgpack".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn schema_version_2_returns_422_and_deletes_partial() {
+    let dir = unique_tempdir("schema_v2");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(2, ALL_ZERO_TRACE_ID, "h", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 422);
+    assert_eq!(
+        resp_body,
+        r#"{"error":"unsupported_schema_version","got":2}"#
+    );
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        list_partials(&data_dir).is_empty(),
+        "422 must delete the partial file"
+    );
+    let traces_dir = data_dir.join("traces");
+    let dirs: Vec<_> = std::fs::read_dir(&traces_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        dirs.is_empty(),
+        "422 must not create a trace dir; got {dirs:?}"
+    );
+}
+
+#[test]
+fn non_msgpack_body_returns_400() {
+    let dir = unique_tempdir("not_msgpack");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(&collector.bound, b"hello, world");
+    let (status, resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 400);
+    assert!(
+        resp_body.starts_with(r#"{"error":"malformed_msgpack""#),
+        "wrong body: {resp_body:?}"
+    );
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(list_partials(&data_dir).is_empty());
+}
+
+#[test]
+fn body_missing_meta_returns_400() {
+    let dir = unique_tempdir("no_meta");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    #[derive(Serialize)]
+    struct NoMeta {
+        dict: Vec<()>,
+        calls: Vec<()>,
+    }
+    let body = rmp_serde::to_vec_named(&NoMeta {
+        dict: vec![],
+        calls: vec![],
+    })
+    .unwrap();
+
+    let req = ingest_request(&collector.bound, &body);
+    let (status, resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 400);
+    assert!(resp_body.starts_with(r#"{"error":"malformed_msgpack""#));
+}
+
+#[test]
+fn concurrent_same_trace_requests_each_get_a_unique_batch_number() {
+    let dir = unique_tempdir("concurrent_same");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "host-concur", 7, 1_234_567);
+    let bound = collector.bound.clone();
+
+    let mut handles = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let bound = bound.clone();
+        let body = body.clone();
+        handles.push(std::thread::spawn(move || {
+            let req = ingest_request(&bound, &body);
+            send_raw(&bound, &req)
+        }));
+    }
+    for h in handles {
+        let (status, _) = h.join().unwrap();
+        assert_eq!(status, 200);
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+    let key = synth_trace_key("host-concur", 7, 1_234_567);
+    let batches = list_batch_files(&data_dir.join("traces"), &key);
+    assert_eq!(batches.len(), 5, "want 5 batches; got {batches:?}");
+    let names: std::collections::BTreeSet<_> = batches
+        .iter()
+        .map(|p| p.file_name().unwrap().to_owned())
+        .collect();
+    assert_eq!(names.len(), 5, "names must be distinct");
+    for i in 1..=5 {
+        let expected = format!("batch-{i:04}.msgpack");
+        assert!(
+            names.iter().any(|n| n.to_str() == Some(&expected)),
+            "missing {expected}: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn numbering_continues_across_restart() {
+    let dir = unique_tempdir("restart_numbering");
+    let data_dir = dir.join("data");
+    let path = write_config(&dir, "127.0.0.1:0");
+
+    let host = "host-restart";
+    let pid = 11;
+    let start_time = 4_242_424_242;
+    let key = synth_trace_key(host, pid, start_time);
+
+    // Pre-create batch-0001 to simulate a previous run.
+    let trace_dir = data_dir.join("traces").join(format!("{key}.raw"));
+    std::fs::create_dir_all(&trace_dir).unwrap();
+    std::fs::write(trace_dir.join("batch-0001.msgpack"), b"earlier").unwrap();
+
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, host, pid, start_time);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+
+    std::thread::sleep(Duration::from_millis(100));
+    let batches = list_batch_files(&data_dir.join("traces"), &key);
+    assert_eq!(batches.len(), 2);
+    assert!(batches[1].ends_with("batch-0002.msgpack"));
+}
+
+#[test]
+fn success_path_log_line_carries_body_bytes_and_status_200() {
+    let dir = unique_tempdir("log_200");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch(1, ALL_ZERO_TRACE_ID, "h", 1, 1);
+    let body_len = body.len();
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+
+    std::thread::sleep(Duration::from_millis(150));
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("status=200") && l.contains("body_bytes="))
+        .unwrap_or_else(|| panic!("no 200 log line: {stdout:?}"));
+    let expected_field = format!("body_bytes={body_len}");
+    assert!(
+        line.contains(&expected_field),
+        "missing {expected_field} in: {line}"
     );
 }
