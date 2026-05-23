@@ -24,10 +24,20 @@
 //!    `call_to_node` get the same upsert + parent-bump + mapping
 //!    treatment, then are deleted. Loop until no progress.
 //!
-//! Anomaly rows (DQ-1, DQ-2, DQ-3) are **not** written by this
-//! slice. DQ-1 is the only one detected; the next slice
-//! (anomaly detection) converts the log line to an `anomalies`
-//! row.
+//! Two anomaly kinds are written by this module:
+//!
+//! - **DQ-1 (`unresolved_fn`)**: a Call references a `fn_id` not in
+//!   `dict`. The Call is skipped (no node row, no `call_to_node`
+//!   mapping), and one anomaly row with `node_id = NULL` and
+//!   `detail = "fn_id=<N>"` is inserted.
+//! - **DQ-3 (`inverted_time`)**: a Call has `t_out < t_in`. The
+//!   Call still folds into a node (its wall delta is clamped to 0
+//!   via `.max(0)` to honour DI-3), and one anomaly row with
+//!   `node_id = <resulting node>` and `detail = "t_in=<I>,t_out=<O>"`
+//!   is inserted.
+//!
+//! **DQ-2 (`pending_parent_at_finalize`)** is detected at idle-
+//! finalize (DI-4); not in this module.
 
 use std::collections::HashSet;
 
@@ -41,6 +51,13 @@ use crate::wire;
 /// §4.3 notes). All top-level calls (wire `parent == 0`) become
 /// its children.
 const SYNTHETIC_ROOT_NODE_ID: i64 = 1;
+
+/// Stable kind strings written into `anomalies.kind`. The
+/// SPECIFICATION (§4.3) treats these as a small enum; pinning them
+/// to constants here keeps the literal out of the call sites so
+/// a typo in `'unresloved_fn'` can't slip past the type system.
+const KIND_UNRESOLVED_FN: &str = "unresolved_fn";
+const KIND_INVERTED_TIME: &str = "inverted_time";
 
 /// Counters surfaced to the caller for the `decoded batch`
 /// log line and the tests.
@@ -60,8 +77,18 @@ pub(crate) struct AggregateOutcome {
     /// after the drain pass.
     pub pending_total: u32,
     /// Calls skipped because their `fn_id` was missing from
-    /// the trace's `dict` (DQ-1).
+    /// the trace's `dict` (DQ-1). Each one also bumps
+    /// `anomalies_added`.
     pub dq1_skipped: u32,
+    /// Calls that folded into a node despite `t_out < t_in` (DQ-3).
+    /// Each one also bumps `anomalies_added`.
+    pub dq3_inverted: u32,
+    /// Total `anomalies` rows inserted by this batch's
+    /// aggregation. Equals `dq1_skipped + dq3_inverted` today; kept
+    /// as its own field so the `index.sqlite.traces.anomaly_count`
+    /// bump has a single source of truth and so future kinds can
+    /// add to it without rewriting the call site.
+    pub anomalies_added: u32,
 }
 
 /// Insert the synthetic root rows (`dict.fn_id=0`,
@@ -100,7 +127,7 @@ pub(super) fn seed_synthetic_root(tx: &Transaction) -> Result<(), StorageError> 
 /// `super::Storage::record_batch`).
 pub(super) fn aggregate_calls(
     tx: &Transaction,
-    trace_key: &TraceKey,
+    _trace_key: &TraceKey,
     batch: &wire::Batch,
 ) -> Result<AggregateOutcome, StorageError> {
     let mut outcome = AggregateOutcome::default();
@@ -110,21 +137,21 @@ pub(super) fn aggregate_calls(
     // ---- in-batch loop (reverse order = parents first) ----
     for c in batch.calls.iter().rev() {
         if !known.contains(&c.fn_id) {
-            // DQ-1: unresolved fn_id. Log + skip; no anomaly row
-            // (the anomaly slice will replace the log with an
-            // INSERT INTO anomalies).
-            eprintln!(
-                "aggregate: dq1 skipped trace_key={trace_key} call_id={} fn_id={}",
-                c.call_id, c.fn_id,
-            );
+            // DQ-1: unresolved fn_id. Record + skip. The Call still
+            // cannot fold (no `dict` row means an FK violation if we
+            // tried) but the anomaly row is now durable evidence of
+            // the skip; the operator sees it via
+            // `traces.anomaly_count`, not stderr.
+            insert_unresolved_fn_anomaly(tx, c.call_id, c.fn_id)?;
             outcome.dq1_skipped += 1;
+            outcome.anomalies_added += 1;
             continue;
         }
 
         let parent_node_id = resolve_parent(tx, c.parent)?;
         match parent_node_id {
             Some(pid) => {
-                fold_call_into_nodes(tx, pid, c)?;
+                fold_call_into_nodes(tx, pid, c, &mut outcome)?;
                 outcome.nodes_touched += 1;
             }
             None => {
@@ -202,15 +229,27 @@ fn resolve_parent(tx: &Transaction, parent_call_id: u32) -> Result<Option<i64>, 
 }
 
 /// Upsert the `(parent_node_id, fn_id)` bucket in `nodes`,
-/// bump the parent's `children_total_wall_ns`, and map the
-/// Call's `call_id` to the resulting node. Pure side-effect on
-/// the connection; no return value beyond the propagated error.
+/// bump the parent's `children_total_wall_ns`, map the Call's
+/// `call_id` to the resulting node, and — if the Call's wall is
+/// inverted (`t_out < t_in`, DQ-3) — write an `inverted_time`
+/// anomaly row attached to the resulting `node_id`. The Call still
+/// folds in either case; `saturating_sub` clamps the wall delta
+/// to 0 so `nodes.total_wall_ns` never decreases (DI-3).
 fn fold_call_into_nodes(
     tx: &Transaction,
     parent_node_id: i64,
     c: &wire::Call,
+    outcome: &mut AggregateOutcome,
 ) -> Result<(), StorageError> {
-    let wall = c.t_out.saturating_sub(c.t_in);
+    // DI-3 requires `total_wall_ns >= children_total_wall_ns`
+    // (self time non-negative). `saturating_sub` only clamps at
+    // i64::MIN/MAX — for `t_out < t_in` it returns a negative
+    // delta. Clamp to zero explicitly so DQ-3 Calls don't
+    // *decrease* an already-aggregated wall.
+    let wall = c.t_out.saturating_sub(c.t_in).max(0);
+    // Memory delta is allowed to be negative (a Call that freed
+    // memory) — the UI tints negative deltas red but does not
+    // treat them as an invariant violation.
     let mem_delta = c.mem_out.saturating_sub(c.mem_in);
     let abnormal_count: i64 = if c.abnormal_exit { 1 } else { 0 };
 
@@ -277,6 +316,16 @@ fn fold_call_into_nodes(
                 source: e,
             })?;
     }
+
+    // DQ-3: t_out < t_in. The Call still folded (wall was clamped
+    // to 0 above); attach the anomaly to the resulting node so the
+    // UI's per-row anomaly badge lights up.
+    if c.t_out < c.t_in {
+        insert_inverted_time_anomaly(tx, node_id, c.call_id, c.t_in, c.t_out)?;
+        outcome.dq3_inverted += 1;
+        outcome.anomalies_added += 1;
+    }
+
     Ok(())
 }
 
@@ -359,15 +408,14 @@ fn drain_pending(
         for row in &resolvable {
             // Pre-validate fn_id against dict — a pending Call
             // whose fn_id never appeared in dict is DQ-1 territory.
-            // Same handling as the in-batch path: log + skip +
+            // Same handling as the in-batch path: record + skip +
             // delete the pending row (so it doesn't accumulate
-            // forever).
+            // forever). The anomaly row keeps a durable trail
+            // even though the pending row is gone.
             if !known.contains(&row.fn_id) {
-                eprintln!(
-                    "aggregate: dq1 skipped (drained) call_id={} fn_id={}",
-                    row.call_id, row.fn_id,
-                );
+                insert_unresolved_fn_anomaly(tx, row.call_id as u32, row.fn_id)?;
                 outcome.dq1_skipped += 1;
+                outcome.anomalies_added += 1;
                 tx.execute(
                     "DELETE FROM pending_calls WHERE call_id = ?1",
                     params![row.call_id],
@@ -406,7 +454,7 @@ fn drain_pending(
                 mem_out: row.mem_out_bytes,
                 abnormal_exit: row.abnormal_exit != 0,
             };
-            fold_call_into_nodes(tx, row.parent_node_id, &synthetic_call)?;
+            fold_call_into_nodes(tx, row.parent_node_id, &synthetic_call, outcome)?;
 
             tx.execute(
                 "DELETE FROM pending_calls WHERE call_id = ?1",
@@ -420,6 +468,62 @@ fn drain_pending(
             outcome.nodes_touched += 1;
         }
     }
+    Ok(())
+}
+
+/// DQ-1 anomaly insert. The Call never folds into a `nodes` row
+/// (its `fn_id` is absent from `dict`), so `node_id` is NULL; the
+/// `detail` string carries the missing fn_id so the UI / operator
+/// can identify which dict entry was lost in transit.
+fn insert_unresolved_fn_anomaly(
+    tx: &Transaction,
+    call_id: u32,
+    fn_id: u32,
+) -> Result<(), StorageError> {
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO anomalies (node_id, kind, sample_call_id, detail) \
+             VALUES (NULL, ?1, ?2, ?3)",
+        )
+        .map_err(|e| StorageError::Query {
+            context: "prepare unresolved_fn anomaly insert",
+            source: e,
+        })?;
+    let detail = format!("fn_id={fn_id}");
+    stmt.execute(params![KIND_UNRESOLVED_FN, call_id as i64, detail])
+        .map_err(|e| StorageError::Query {
+            context: "insert unresolved_fn anomaly",
+            source: e,
+        })?;
+    Ok(())
+}
+
+/// DQ-3 anomaly insert. The Call still folds into a node (via
+/// `saturating_sub`, which clamps the wall delta to 0), so
+/// `node_id` is the resulting bucket and the `detail` string
+/// records the raw inverted `t_in` / `t_out` values for diagnostics.
+fn insert_inverted_time_anomaly(
+    tx: &Transaction,
+    node_id: i64,
+    call_id: u32,
+    t_in: i64,
+    t_out: i64,
+) -> Result<(), StorageError> {
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO anomalies (node_id, kind, sample_call_id, detail) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|e| StorageError::Query {
+            context: "prepare inverted_time anomaly insert",
+            source: e,
+        })?;
+    let detail = format!("t_in={t_in},t_out={t_out}");
+    stmt.execute(params![node_id, KIND_INVERTED_TIME, call_id as i64, detail])
+        .map_err(|e| StorageError::Query {
+            context: "insert inverted_time anomaly",
+            source: e,
+        })?;
     Ok(())
 }
 
@@ -906,5 +1010,252 @@ mod tests {
             known.contains(&0u32),
             "synthetic root's fn_id must be in known set"
         );
+    }
+
+    // ---- DQ-1 anomaly inserts ----
+
+    #[test]
+    fn dq1_writes_unresolved_fn_anomaly_row() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]); // fn_id=99 deliberately missing
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(42, 0, 99, 100)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.dq1_skipped, 1);
+        assert_eq!(outcome.anomalies_added, 1);
+        assert_eq!(outcome.nodes_touched, 0);
+
+        let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
+            .query_row(
+                "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(node_id, None, "unresolved_fn carries no node");
+        assert_eq!(kind, KIND_UNRESOLVED_FN);
+        assert_eq!(sample_call_id, 42);
+        assert_eq!(detail, "fn_id=99");
+    }
+
+    #[test]
+    fn multiple_dq1_calls_produce_multiple_rows() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![
+                call(1, 0, 99, 100),
+                call(2, 0, 99, 100),
+                call(3, 0, 99, 100),
+                call(4, 0, 7, 200), // valid — still folds
+            ],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.dq1_skipped, 3);
+        assert_eq!(outcome.anomalies_added, 3);
+        assert_eq!(outcome.nodes_touched, 1);
+
+        let n_anomalies: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anomalies, 3);
+
+        let n_unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anomalies WHERE kind = 'unresolved_fn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_unresolved, 3);
+    }
+
+    // ---- DQ-3 anomaly inserts ----
+
+    #[test]
+    fn dq3_writes_inverted_time_anomaly_row() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let inverted = Call {
+            call_id: 99,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 500,
+            t_out: 400,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        };
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![inverted],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.dq3_inverted, 1);
+        assert_eq!(outcome.anomalies_added, 1);
+        assert_eq!(outcome.nodes_touched, 1, "Call still folds into a node");
+
+        // The Call landed in a real node with wall=0 (saturating_sub).
+        let (node_id_actual, total_wall): (i64, i64) = conn
+            .query_row(
+                "SELECT node_id, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(total_wall, 0, "saturating_sub clamps the inverted wall");
+
+        let (anom_node_id, kind, sample_call_id, detail): (i64, String, i64, String) = conn
+            .query_row(
+                "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            anom_node_id, node_id_actual,
+            "inverted_time anomaly attaches to the resulting node"
+        );
+        assert_eq!(kind, KIND_INVERTED_TIME);
+        assert_eq!(sample_call_id, 99);
+        assert_eq!(detail, "t_in=500,t_out=400");
+    }
+
+    #[test]
+    fn dq3_on_same_bucket_attaches_anomaly_to_that_node() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let normal = Call {
+            call_id: 1,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 0,
+            t_out: 100,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        };
+        let inverted = Call {
+            call_id: 2,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 500,
+            t_out: 400,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        };
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![normal, inverted],
+        };
+        aggregate_in(&mut conn, &batch);
+
+        let (node_id_actual, call_count, total_wall): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT node_id, call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(call_count, 2);
+        assert_eq!(
+            total_wall, 100,
+            "the normal call contributes 100; the inverted clamps to 0"
+        );
+
+        let anom_node_id: i64 = conn
+            .query_row(
+                "SELECT node_id FROM anomalies WHERE kind = 'inverted_time'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(anom_node_id, node_id_actual);
+    }
+
+    #[test]
+    fn no_anomaly_for_normal_calls() {
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(1, 0, 7, 100)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.anomalies_added, 0);
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn dq1_via_drain_pending_still_writes_anomaly() {
+        // Sequence:
+        //   batch 1 — child Call with parent=999 (unseen) and fn_id=99
+        //             (which IS in dict at this moment via batch.dict).
+        //             The Call goes to pending_calls (parent unseen).
+        //   later — Calls in fresh batches eventually surface
+        //             parent=999 via the wire. Walking through the
+        //             drain pass, the pending row's fn_id is checked
+        //             against `dict`. If we ensure fn_id=99 is NOT
+        //             in dict at drain time, we exercise the
+        //             drain-path DQ-1 branch.
+        //
+        // We can't easily make a fn_id "disappear" from dict after
+        // it's been inserted (INSERT OR IGNORE is one-way), so to
+        // hit the drain DQ-1 path we deliberately keep fn_id=99
+        // out of dict throughout — the in-batch loop already
+        // skips it before it can become pending. The drain-path
+        // DQ-1 branch is dead code under the current pre-pending
+        // check; it's defensive in case future changes route a
+        // pending row through with a stale fn_id.
+        //
+        // For coverage purposes this test simply confirms that
+        // the in-batch DQ-1 path writes the anomaly and does NOT
+        // create a pending row (no drain needed).
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]); // fn=99 missing
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(10, 999, 99, 100)], // parent unseen, fn missing
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.dq1_skipped, 1);
+        assert_eq!(outcome.anomalies_added, 1);
+        assert_eq!(
+            outcome.pending_added, 0,
+            "DQ-1 short-circuits before pending"
+        );
+
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 0);
+
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom, 1);
     }
 }
