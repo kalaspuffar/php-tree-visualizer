@@ -14,7 +14,9 @@ mod ingest;
 mod logging;
 mod router;
 mod server;
+mod tmp;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use error::HttpError;
@@ -22,11 +24,22 @@ pub use server::run;
 
 use crate::config::SecretString;
 
-/// State shared with axum extractors. Today carries only the expected
-/// bearer token; subsequent changes will add the mpsc sender, the
-/// tmp directory path, and similar request-handling resources.
+/// State shared with axum extractors. Today carries the expected
+/// bearer token, the configured body-size cap, and the resolved
+/// `<data_dir>/tmp` path. Subsequent changes will add the mpsc
+/// sender and the per-trace raw directory resolver.
 pub struct AppState {
     pub expected_token: SecretString,
+    pub max_body_bytes: u64,
+    pub tmp_dir: PathBuf,
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// Response extension that carries the number of body bytes the
+/// ingest handler read from the wire (including the bytes read
+/// before an oversize abort). The request-logging middleware reads
+/// this off the response so it can include `body_bytes=<N>` in the
+/// per-request log line without re-counting.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BodyBytes(pub u64);

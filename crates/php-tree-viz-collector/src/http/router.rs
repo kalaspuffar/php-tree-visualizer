@@ -2,6 +2,7 @@
 //! subsequent changes add layers and handlers around this skeleton
 //! rather than rewriting it.
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::post;
 use axum::Router;
@@ -35,7 +36,15 @@ use super::{auth, content_type, ingest, logging, SharedState};
 /// behavior.
 pub fn build(state: SharedState) -> Router {
     Router::new()
-        .route("/ingest/v1", post(ingest::ingest))
+        // axum's `DefaultBodyLimit` defaults to 2 MiB and would
+        // short-circuit oversize requests with a non-spec response
+        // body before our handler runs. Disable it so the handler
+        // can enforce the operator-configured cap and produce the
+        // documented `{"error":"too_large"}` shape.
+        .route(
+            "/ingest/v1",
+            post(ingest::ingest).layer(DefaultBodyLimit::disable()),
+        )
         .route_layer(from_fn(content_type::require_msgpack_content_type))
         .route_layer(from_fn_with_state(
             state.clone(),

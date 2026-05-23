@@ -6,6 +6,7 @@
 //! refused to start.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum HttpError {
@@ -18,6 +19,20 @@ pub enum HttpError {
     /// The HTTP server task itself returned an I/O error during
     /// `axum::serve(...).await`.
     Serve(std::io::Error),
+    /// `<data_dir>/tmp/` could not be created, chmod-ed, or scanned
+    /// at startup. Surface during boot; exit 3.
+    TmpDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A streaming write to a `.partial` tmp file failed at runtime
+    /// (disk full, fs error, …). Caught at the handler boundary and
+    /// surfaced to the client as `500`; the operator sees the path
+    /// in the per-request log line.
+    TmpWrite {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for HttpError {
@@ -27,6 +42,22 @@ impl std::fmt::Display for HttpError {
                 write!(f, "could not bind {addr}: {source}")
             }
             Self::Serve(source) => write!(f, "http server failed: {source}"),
+            Self::TmpDir { path, source } => {
+                write!(
+                    f,
+                    "could not prepare tmp directory {}: {}",
+                    path.display(),
+                    source
+                )
+            }
+            Self::TmpWrite { path, source } => {
+                write!(
+                    f,
+                    "could not write to tmp file {}: {}",
+                    path.display(),
+                    source
+                )
+            }
         }
     }
 }
@@ -34,7 +65,10 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Bind { source, .. } | Self::Serve(source) => Some(source),
+            Self::Bind { source, .. }
+            | Self::Serve(source)
+            | Self::TmpDir { source, .. }
+            | Self::TmpWrite { source, .. } => Some(source),
         }
     }
 }
@@ -64,7 +98,41 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "x"),
         };
         let serve = HttpError::Serve(std::io::Error::other("x"));
+        let tmp_dir = HttpError::TmpDir {
+            path: PathBuf::from("/x"),
+            source: std::io::Error::other("x"),
+        };
+        let tmp_write = HttpError::TmpWrite {
+            path: PathBuf::from("/x/y.partial"),
+            source: std::io::Error::other("x"),
+        };
         assert!(std::error::Error::source(&bind).is_some());
         assert!(std::error::Error::source(&serve).is_some());
+        assert!(std::error::Error::source(&tmp_dir).is_some());
+        assert!(std::error::Error::source(&tmp_write).is_some());
+    }
+
+    #[test]
+    fn display_tmp_dir_is_single_line_and_names_path() {
+        let err = HttpError::TmpDir {
+            path: PathBuf::from("/var/lib/php-tree-viz/tmp"),
+            source: std::io::Error::other("permission denied"),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("/var/lib/php-tree-viz/tmp"));
+        assert!(rendered.contains("permission denied"));
+        assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn display_tmp_write_is_single_line_and_names_path() {
+        let err = HttpError::TmpWrite {
+            path: PathBuf::from("/var/lib/php-tree-viz/tmp/abc.partial"),
+            source: std::io::Error::other("disk full"),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("abc.partial"));
+        assert!(rendered.contains("disk full"));
+        assert!(!rendered.contains('\n'));
     }
 }

@@ -26,17 +26,44 @@ fn unique_tempdir(label: &str) -> PathBuf {
     dir
 }
 
+/// Write a config file with a per-test data directory under `dir`.
+/// Each test gets its own `<dir>/data/` and the collector's tmp
+/// subdir lands at `<dir>/data/tmp/`, so concurrent runs do not
+/// collide. Returns the path to the written `collector.toml`.
 fn write_config(dir: &Path, bind: &str) -> PathBuf {
+    write_config_with_overrides(dir, bind, dir.join("data").to_str().unwrap(), None)
+}
+
+/// Like `write_config` but lets a test override the `data_dir` or
+/// the body-size cap. `data_dir` is *not* created automatically when
+/// overridden (so tests can exercise the failure path).
+fn write_config_with_overrides(
+    dir: &Path,
+    bind: &str,
+    data_dir: &str,
+    max_body_bytes: Option<u64>,
+) -> PathBuf {
+    // Create the data directory by default so the server can mkdir
+    // its `tmp/` subdir at startup. The override-path failure tests
+    // (e.g. `tmp_dir_creation_failure_exits_3`) pass a path that
+    // can't be created.
+    let auto_data = dir.join("data");
+    if data_dir == auto_data.to_str().unwrap_or("") {
+        std::fs::create_dir_all(&auto_data).unwrap();
+    }
+    let extra_server = max_body_bytes
+        .map(|n| format!("max_body_bytes = {n}\n"))
+        .unwrap_or_default();
     let body = format!(
         r#"[server]
 bind = "{bind}"
-
+{extra_server}
 [auth]
 token = "{TOKEN}"
 session_salt = "{SALT}"
 
 [storage]
-data_dir = "/var/lib/php-tree-viz"
+data_dir = "{data_dir}"
 retention_days = 30
 "#
     );
@@ -518,20 +545,385 @@ const EXAMPLE_FILE: &str = include_str!("../../../etc/collector.toml.example");
 fn example_config_file_loads_and_server_binds() {
     let token = "T".repeat(40);
     let salt = "S".repeat(40);
-    // `REPLACE_ME` is a prefix of `REPLACE_ME_TOO`, so substitute the
-    // longer string first.
+    let dir = unique_tempdir("example_file");
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // `REPLACE_ME` is a prefix of `REPLACE_ME_TOO`, so substitute
+    // the longer string first. The example pins port 8088 and the
+    // operator-default data_dir; tests need ephemeral ports and a
+    // writable per-test data dir.
     let body = EXAMPLE_FILE
         .replace("REPLACE_ME_TOO", &salt)
         .replace("REPLACE_ME", &token)
-        // The example pins port 8088; tests must use ephemeral ports
-        // to avoid conflicts between parallel runs.
-        .replace("127.0.0.1:8088", "127.0.0.1:0");
+        .replace("127.0.0.1:8088", "127.0.0.1:0")
+        .replace("/var/lib/php-tree-viz", data_dir.to_str().unwrap());
 
-    let dir = unique_tempdir("example_file");
     let path = dir.join("collector.toml");
     std::fs::write(&path, body).unwrap();
 
     // Spawning the Collector implicitly asserts the binary loaded the
     // config and bound a port — if either failed, `spawn` panics.
     let _collector = Collector::spawn(&path);
+}
+
+// ============================================================
+// Body-streaming tests (added by the body-streaming change)
+// ============================================================
+
+/// Build a request with explicit `Content-Length` (used to exercise
+/// the fast-path 413). The body is included verbatim after headers.
+fn request_with_body(
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    host: &str,
+) -> Vec<u8> {
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {len}\r\n",
+        len = body.len(),
+    );
+    for (name, value) in headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str("\r\n");
+    let mut bytes = req.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Build a chunked-encoded request. Each `chunks` entry becomes its
+/// own chunk. The terminating `0\r\n\r\n` closes the body. Used to
+/// exercise the streaming-cap path without `Content-Length`.
+fn chunked_request(
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    chunks: &[&[u8]],
+    host: &str,
+) -> Vec<u8> {
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n",
+    );
+    for (name, value) in headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str("\r\n");
+    let mut bytes = req.into_bytes();
+    for chunk in chunks {
+        bytes.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        bytes.extend_from_slice(chunk);
+        bytes.extend_from_slice(b"\r\n");
+    }
+    bytes.extend_from_slice(b"0\r\n\r\n");
+    bytes
+}
+
+fn list_partials(data_dir: &Path) -> Vec<PathBuf> {
+    let tmp = data_dir.join("tmp");
+    if !tmp.is_dir() {
+        return Vec::new();
+    }
+    std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "partial"))
+        .collect()
+}
+
+#[test]
+fn content_length_above_cap_returns_413_without_partial_file() {
+    let dir = unique_tempdir("cl_above_cap");
+    let path = write_config_with_overrides(
+        &dir,
+        "127.0.0.1:0",
+        dir.join("data").to_str().unwrap(),
+        Some(1024),
+    );
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let collector = Collector::spawn(&path);
+
+    let body = vec![0u8; 4096];
+    let req = request_with_body(
+        "POST",
+        "/ingest/v1",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        &body,
+        &collector.bound,
+    );
+    let (status, resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 413);
+    assert_eq!(resp_body, r#"{"error":"too_large"}"#);
+
+    // Allow the server a brief moment to flush its log line; ensure
+    // no partial file ever materialised in tmp/.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        list_partials(&data_dir).len(),
+        0,
+        "fast-path 413 should not create any partial files"
+    );
+}
+
+#[test]
+fn chunked_body_exceeding_cap_returns_413_and_cleans_up() {
+    let dir = unique_tempdir("chunked_over_cap");
+    let path = write_config_with_overrides(
+        &dir,
+        "127.0.0.1:0",
+        dir.join("data").to_str().unwrap(),
+        Some(1024),
+    );
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let collector = Collector::spawn(&path);
+
+    // Two ~2500-byte chunks → 5000 total, well over the 1024 cap.
+    let chunk = vec![b'x'; 2500];
+    let req = chunked_request(
+        "POST",
+        "/ingest/v1",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        &[chunk.as_slice(), chunk.as_slice()],
+        &collector.bound,
+    );
+    let (status, _resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 413);
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        list_partials(&data_dir).len(),
+        0,
+        "413-on-stream should delete the partial file it created"
+    );
+}
+
+#[test]
+fn within_cap_body_lands_on_disk_as_partial() {
+    let dir = unique_tempdir("within_cap");
+    let path = write_config_with_overrides(
+        &dir,
+        "127.0.0.1:0",
+        dir.join("data").to_str().unwrap(),
+        Some(10_240),
+    );
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let collector = Collector::spawn(&path);
+
+    let body = vec![b'A'; 1024];
+    let req = request_with_body(
+        "POST",
+        "/ingest/v1",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        &body,
+        &collector.bound,
+    );
+    let (status, resp_body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 501);
+    assert!(resp_body.contains("not_yet_implemented"));
+
+    // Allow the handler to flush + close. Then verify exactly one
+    // partial file of length 1024 exists.
+    std::thread::sleep(Duration::from_millis(100));
+    let partials = list_partials(&data_dir);
+    assert_eq!(
+        partials.len(),
+        1,
+        "expected 1 partial file, got {partials:?}"
+    );
+    let size = std::fs::metadata(&partials[0]).unwrap().len();
+    assert_eq!(size, 1024, "partial file size mismatch");
+}
+
+#[test]
+fn concurrent_requests_produce_distinct_partial_files() {
+    let dir = unique_tempdir("concurrent_partials");
+    let path = write_config_with_overrides(
+        &dir,
+        "127.0.0.1:0",
+        dir.join("data").to_str().unwrap(),
+        Some(10_240),
+    );
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let collector = Collector::spawn(&path);
+
+    let bound = collector.bound.clone();
+    let mut handles = Vec::with_capacity(8);
+    for i in 0..8u8 {
+        let bound = bound.clone();
+        handles.push(std::thread::spawn(move || {
+            let body = vec![i; 64];
+            let req = request_with_body(
+                "POST",
+                "/ingest/v1",
+                &[
+                    ("Authorization", &format!("Bearer {TOKEN}")),
+                    ("Content-Type", MEDIA_TYPE),
+                ],
+                &body,
+                &bound,
+            );
+            send_raw(&bound, &req)
+        }));
+    }
+    for h in handles {
+        let (status, _) = h.join().unwrap();
+        assert_eq!(status, 501);
+    }
+
+    std::thread::sleep(Duration::from_millis(150));
+    let partials = list_partials(&data_dir);
+    assert_eq!(
+        partials.len(),
+        8,
+        "expected 8 distinct partial files, got {partials:?}"
+    );
+    let mut names: Vec<_> = partials
+        .iter()
+        .map(|p| p.file_name().unwrap().to_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 8, "filenames are not distinct");
+}
+
+#[test]
+fn startup_wipes_pre_existing_partial_files() {
+    let dir = unique_tempdir("startup_wipe");
+    let data_dir = dir.join("data");
+    let tmp = data_dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let leftover = tmp.join("0123456789abcdef0123456789abcdef.partial");
+    std::fs::write(&leftover, b"stale").unwrap();
+    assert!(leftover.exists());
+
+    let path = write_config_with_overrides(&dir, "127.0.0.1:0", data_dir.to_str().unwrap(), None);
+    let _collector = Collector::spawn(&path);
+
+    // Collector::spawn returned once `listening on …` was printed,
+    // which is *after* `ensure_clean_tmp_dir`. So the partial must
+    // already be gone.
+    assert!(
+        !leftover.exists(),
+        "startup did not delete the pre-existing partial file"
+    );
+}
+
+#[test]
+fn tmp_dir_creation_failure_exits_3() {
+    let dir = unique_tempdir("tmp_dir_failure");
+    // Make `data_dir` point at a regular file so `mkdir(data_dir/tmp)`
+    // can't succeed (ENOTDIR).
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"not a dir").unwrap();
+    let path = write_config_with_overrides(&dir, "127.0.0.1:0", blocker.to_str().unwrap(), None);
+
+    let out = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .output()
+        .expect("spawn failed");
+    assert_eq!(out.status.code(), Some(3), "expected http exit code 3");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(blocker.to_str().unwrap()),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("tmp"), "stderr should name tmp: {stderr:?}");
+    assert_eq!(stderr.lines().count(), 1);
+}
+
+#[test]
+fn log_line_includes_body_bytes_for_within_cap_request() {
+    let dir = unique_tempdir("log_body_bytes_ok");
+    let path = write_config_with_overrides(
+        &dir,
+        "127.0.0.1:0",
+        dir.join("data").to_str().unwrap(),
+        Some(10_240),
+    );
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    let collector = Collector::spawn(&path);
+
+    let body = vec![b'A'; 1024];
+    let req = request_with_body(
+        "POST",
+        "/ingest/v1",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        &body,
+        &collector.bound,
+    );
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 501);
+
+    std::thread::sleep(Duration::from_millis(150));
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    assert!(
+        stdout.contains("body_bytes=1024"),
+        "stdout missing body_bytes=1024: {stdout:?}"
+    );
+}
+
+#[test]
+fn log_line_includes_body_bytes_for_413_abort() {
+    let dir = unique_tempdir("log_body_bytes_413");
+    let path = write_config_with_overrides(
+        &dir,
+        "127.0.0.1:0",
+        dir.join("data").to_str().unwrap(),
+        Some(1024),
+    );
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    let collector = Collector::spawn(&path);
+
+    // Chunked body so we go down the running-count path (the
+    // Content-Length fast-path would log body_bytes=0).
+    let chunk = vec![b'x'; 2500];
+    let req = chunked_request(
+        "POST",
+        "/ingest/v1",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        &[chunk.as_slice(), chunk.as_slice()],
+        &collector.bound,
+    );
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 413);
+
+    std::thread::sleep(Duration::from_millis(150));
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+
+    // Find the log line for this request and parse its body_bytes.
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("status=413") && l.contains("body_bytes="))
+        .unwrap_or_else(|| panic!("no 413 log line in stdout: {stdout:?}"));
+    let n: u64 = line
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("body_bytes="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse body_bytes from: {line}"));
+    assert!(
+        n >= 1024,
+        "expected body_bytes >= cap (1024) on 413 abort, got {n}"
+    );
 }
