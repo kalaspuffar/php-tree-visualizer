@@ -1,2 +1,6 @@
 [toolchain]
 channel = "stable"
+# rustfmt + clippy are in the default `stable` profile already; the
+# explicit list documents the dependency for CI (.github/workflows/ci.yml)
+# and any contributor running with a non-default profile.
+components = ["rustfmt", "clippy"]
