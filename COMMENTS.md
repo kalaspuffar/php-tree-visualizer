@@ -217,3 +217,84 @@ reference the constants. The third kind
 (`pending_parent_at_finalize`) is owned by the idle-finalize
 slice — when adding it, define `KIND_PENDING_PARENT_AT_FINALIZE`
 the same way; do not inline the string.
+
+## 2026-05-23 — `TraceKey::from_raw` is no longer `#[cfg(test)]`
+
+`tracekey.rs::from_raw(s)` wraps a `String` into a `TraceKey`
+without validation. It was test-only — the only production
+constructor is `from_meta(meta)`, which validates and either
+copies the wire `trace_id` or synthesises from `(host, pid,
+start_time)`. `idle-finalize` needed to round-trip 32-hex stems
+*back* out of `SELECT trace_key FROM traces` so the finalize
+loop could call `finalize_trace(&key, …)`, so the gate had to
+come off.
+
+The doc comment on `from_raw` now spells out the contract:
+production callers SHOULD only pass strings that this codebase
+previously produced via `from_meta` and persisted into a
+`traces.trace_key` column. There is no runtime check; the
+caller is trusted because the upstream of every production use
+is our own write path. If a future caller wants to accept
+external input as a trace key, build a validating constructor
+beside `from_raw` rather than feeding the unchecked one.
+
+Concrete production callers today (`crates/php-tree-viz-collector`):
+
+- `storage::Storage::list_idle_active_traces` — the only one.
+
+If you add a second one, audit it: what's the source of the
+string, and is the implicit "32-hex stem produced by us"
+contract honoured?
+
+## 2026-05-23 — Two-DB counters: reconcile absolutely at finalize, accumulate at record
+
+Two distinct write patterns now touch `index.sqlite.traces.anomaly_count`:
+
+- **`Storage::record_batch`** uses `anomaly_count = anomaly_count
+  + excluded.anomaly_count` in `UPSERT_TRACE_SQL`. Correct — the
+  per-batch delta is computed inside the per-trace transaction
+  and bumped on the next index transaction. The two transactions
+  commit in order (per-trace first), so a crash between them
+  leaves the per-trace ahead; the extension's retry resends the
+  batch, the per-trace inserts the same anomalies *again* (we
+  accept this trade-off — see `anomaly-detection`'s design.md),
+  and the index catches up. Drift window is bounded to "one
+  failed batch's worth".
+- **`Storage::finalize_trace`** must use `anomaly_count = ?1`
+  with the *absolute* per-trace `SELECT COUNT(*) FROM anomalies`
+  value as the parameter. Additive arithmetic here looks fine on
+  the happy path but diverges from the
+  `traces.anomaly_count == per-trace COUNT(*)` invariant under
+  a crash between finalize_trace's per-trace commit and its
+  index commit:
+
+  1. Per-trace tx commits: pending drained, N DQ-2 rows inserted,
+     `trace_meta.state = 'finalized'`.
+  2. Process killed before the index UPDATE.
+  3. On restart, the finalize loop's next tick sees the trace
+     still `state = 'active'` in the index and retries.
+  4. The retry's `pending_calls` is already empty → 0 new DQ-2
+     inserts → if the SQL were additive (`+ 0`), the index
+     counter would stay at its pre-finalize value, *missing N*.
+
+  Computing the absolute count from inside the per-trace tx and
+  passing it through means the retry's index UPDATE reconciles
+  to the right number regardless of how many partial attempts
+  preceded it.
+
+Test pin: `late_batch_after_finalize_reactivates_state` and
+`finalize_trace_is_idempotent_under_retry` in
+`crates/php-tree-viz-collector/src/storage/mod.rs::tests` cover
+the happy path and the simulated crash window respectively. The
+crash test rolls the index DB back manually after the first
+`finalize_trace` returns, then calls `finalize_trace` again on
+the same key and asserts (a) no duplicate DQ-2 rows landed and
+(b) the index counter is now correct.
+
+The rule generalises: **when one logical update spans two
+serialised transactions on two databases, the second
+transaction must be able to compute its target value from
+durable state, not from "what the first transaction told me to
+add".** Additive deltas only work when both transactions commit
+under a single failure boundary (one fsync, one process). The
+per-trace + index pair doesn't qualify.
