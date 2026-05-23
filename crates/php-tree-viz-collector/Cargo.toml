@@ -13,6 +13,6 @@ rmp-serde = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "sync", "time"] }
 toml = "0.8"
 tower = "0.5"

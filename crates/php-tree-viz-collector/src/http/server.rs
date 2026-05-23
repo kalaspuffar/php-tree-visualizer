@@ -6,11 +6,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::{
     router, storage as http_storage, tmp, AppState, BatchSubmission, HttpError, SharedState,
 };
 use crate::config::Config;
+use crate::finalize;
 use crate::storage::Storage;
 
 /// Entry point called from `main` after the config has been validated.
@@ -37,25 +39,28 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     let storage = Storage::open(&config.storage.data_dir, traces_dir.clone())
         .map_err(|source| HttpError::Storage { source })?;
 
-    // Build the bounded ingest channel and spawn the decoder task.
-    // The decoder reads each committed batch file from disk, parses
-    // it via `wire::parse_batch`, logs the decoded counts, and
-    // invokes `Storage::record_batch` to persist the trace row +
-    // per-trace dict. Aggregation of calls into the `nodes` tree
-    // is a subsequent capability — this slice creates the tables
-    // but leaves them empty.
+    // Build the bounded ingest channel and spawn both the decoder
+    // task and the idle-finalize loop. They share the same `Storage`
+    // through `Arc<AsyncMutex<Storage>>` — rusqlite::Connection is
+    // !Send, so we keep AD-1's single-task storage invariant by
+    // serialising access through the mutex. Contention is negligible
+    // at the documented load (decoder is ≤ms per batch, finalize fires
+    // at most once per `tick_seconds`).
     //
     // When axum's serve future ends, the router and AppState are
     // dropped, the sender goes out of scope, `recv()` returns
-    // `None`, and the task exits cleanly without explicit
-    // shutdown plumbing.
+    // `None`, the decoder task exits, and the finalize task is
+    // cancelled by the runtime shutdown. No explicit shutdown
+    // plumbing is needed for either.
     //
     // The decode + SQL writes run on the tokio runtime without
     // `spawn_blocking` — ~10 ms per batch is acceptable on the
     // async path. Revisit if profiling shows runtime starvation.
     let queue_capacity = config.server.queue_capacity as usize;
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<BatchSubmission>(queue_capacity);
-    let mut decoder_storage = storage;
+    let storage = Arc::new(AsyncMutex::new(storage));
+    let storage_for_decoder = storage.clone();
+    let storage_for_finalize = storage.clone();
     tokio::spawn(async move {
         while let Some(item) = batch_rx.recv().await {
             // INV-2 unaffected: `trace_key` is not a secret (it's
@@ -68,7 +73,14 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as i64)
                             .unwrap_or(0);
-                        match decoder_storage.record_batch(&item, &batch, received_at_ns) {
+                        let result = {
+                            // Scoped lock — released before the next
+                            // `recv().await`, which is the only point
+                            // the finalize loop can make progress.
+                            let mut s = storage_for_decoder.lock().await;
+                            s.record_batch(&item, &batch, received_at_ns)
+                        };
+                        match result {
                             Ok(outcome) => {
                                 println!(
                                     "decoded batch path={} trace_key={} dict={} calls={} nodes={} pending={} anomalies={}",
@@ -113,6 +125,15 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
             }
         }
     });
+
+    // Idle-finalize loop. Lives alongside the decoder task and shares
+    // `Storage` through the same `Arc<AsyncMutex<...>>`. Defaults
+    // from §7.3: tick every 5s, finalize traces idle for ≥ 30s.
+    tokio::spawn(finalize::run(
+        storage_for_finalize,
+        config.finalize.idle_seconds,
+        config.finalize.tick_seconds,
+    ));
 
     let listener = TcpListener::bind(addr)
         .await

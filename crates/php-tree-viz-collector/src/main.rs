@@ -10,6 +10,7 @@
 //! - `3` — HTTP / bind error.
 
 mod config;
+mod finalize;
 mod http;
 mod storage;
 mod tracekey;

@@ -29,7 +29,12 @@ impl TraceKey {
         &self.0
     }
 
-    #[cfg(test)]
+    /// Wrap a string that the caller already knows is a valid 32-hex
+    /// trace-key stem (e.g. the result of
+    /// `SELECT trace_key FROM traces`). No validation is performed;
+    /// production call sites only consume keys that were previously
+    /// produced by `from_meta` (and persisted into a column that
+    /// only accepts what `from_meta` emits). Tests use this freely.
     pub(crate) fn from_raw(s: impl Into<String>) -> Self {
         Self(s.into())
     }
