@@ -930,21 +930,27 @@ fn valid_v1_body_returns_200_and_lands_at_canonical_path() {
 
     let traces_dir = data_dir.join("traces");
     std::thread::sleep(Duration::from_millis(100));
-    let dirs: Vec<_> = std::fs::read_dir(&traces_dir)
+    // Filter for the raw msgpack directory only — `traces/` now
+    // also holds the per-trace SQLite, its `-wal`, and its `-shm`
+    // sidecars (added by storage-sqlite). The durable-ingest
+    // contract is about the `.raw` directory; that's what we
+    // assert on here.
+    let raw_dirs: Vec<_> = std::fs::read_dir(&traces_dir)
         .unwrap()
         .filter_map(Result::ok)
         .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.ends_with(".raw"))
+        })
         .collect();
     assert_eq!(
-        dirs.len(),
+        raw_dirs.len(),
         1,
-        "expected exactly one trace dir under traces/, got {dirs:?}"
+        "expected exactly one .raw trace dir under traces/, got {raw_dirs:?}"
     );
-    let trace_raw = &dirs[0];
-    assert!(trace_raw
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|s| s.ends_with(".raw")));
+    let trace_raw = &raw_dirs[0];
 
     let batches: Vec<_> = std::fs::read_dir(trace_raw)
         .unwrap()
