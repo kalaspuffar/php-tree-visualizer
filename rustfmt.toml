@@ -1,0 +1,4 @@
+# Intentionally empty: the project follows rustfmt defaults per
+# SPECIFICATION.md ("Follow the Rust API Guidelines and standard
+# formatting (rustfmt defaults)"). Any future deviation is a conscious
+# decision recorded here.
