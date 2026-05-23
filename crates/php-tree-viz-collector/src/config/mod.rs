@@ -81,12 +81,22 @@ impl Default for Finalize {
 pub struct Retention {
     #[serde(default = "defaults::tick_minutes")]
     pub tick_minutes: u32,
+    /// Test-only override that, when present, overrides
+    /// `tick_minutes` for the purpose of computing the retention
+    /// loop's tick interval. Production configs leave this unset
+    /// (so the loop ticks every `tick_minutes` minutes); the
+    /// integration suite sets it to `1` so a test can observe the
+    /// sweeper inside a few seconds. Documented intentionally
+    /// absent from `etc/collector.toml.example`.
+    #[serde(default)]
+    pub tick_seconds: Option<u32>,
 }
 
 impl Default for Retention {
     fn default() -> Self {
         Self {
             tick_minutes: defaults::tick_minutes(),
+            tick_seconds: None,
         }
     }
 }
@@ -251,6 +261,12 @@ impl Retention {
             return Err(ConfigError::bad_value(
                 "retention.tick_minutes",
                 "must be greater than zero",
+            ));
+        }
+        if matches!(self.tick_seconds, Some(0)) {
+            return Err(ConfigError::bad_value(
+                "retention.tick_seconds",
+                "must be greater than zero when set (omit to use tick_minutes)",
             ));
         }
         Ok(())
@@ -627,6 +643,69 @@ retention_days = 30
         let toml = replace_field(&full_toml(), "tick_minutes", "0");
         let err = parse(&toml).expect_err("zero tick_minutes must fail");
         assert!(format!("{err}").contains("retention.tick_minutes"));
+    }
+
+    #[test]
+    fn retention_tick_seconds_defaults_to_none() {
+        let cfg = parse(&full_toml()).expect("full config should validate");
+        assert_eq!(
+            cfg.retention.tick_seconds, None,
+            "tick_seconds is a test-only override; absent by default"
+        );
+    }
+
+    #[test]
+    fn retention_tick_seconds_can_be_set_explicitly() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[retention]
+tick_minutes = 60
+tick_seconds = 2
+"#
+        );
+        let cfg = parse(&toml).expect("explicit tick_seconds must validate");
+        assert_eq!(cfg.retention.tick_minutes, 60);
+        assert_eq!(cfg.retention.tick_seconds, Some(2));
+    }
+
+    #[test]
+    fn zero_retention_tick_seconds_is_rejected() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[retention]
+tick_minutes = 60
+tick_seconds = 0
+"#
+        );
+        let err = parse(&toml).expect_err("zero tick_seconds must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("retention.tick_seconds"), "{msg}");
     }
 
     #[test]

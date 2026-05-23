@@ -64,6 +64,42 @@ tick_seconds = 1
     path
 }
 
+/// Write a config with aggressive retention timings: a caller-chosen
+/// `retention_days`, `[retention] tick_seconds = 1`, and (so a slow
+/// retention tick doesn't get raced by an unwanted finalize tick)
+/// `[finalize] idle_seconds = 1, tick_seconds = 1`. Used by the
+/// retention integration tests so the wait for `swept retention …`
+/// is bounded by ~2 s + jitter instead of the hour-default tick.
+fn write_config_with_fast_retention(dir: &Path, bind: &str, retention_days: u32) -> PathBuf {
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let body = format!(
+        r#"[server]
+bind = "{bind}"
+
+[auth]
+token = "{TOKEN}"
+session_salt = "{SALT}"
+
+[storage]
+data_dir = "{}"
+retention_days = {retention_days}
+
+[finalize]
+idle_seconds = 1
+tick_seconds = 1
+
+[retention]
+tick_minutes = 60
+tick_seconds = 1
+"#,
+        data_dir.display(),
+    );
+    let path = dir.join("collector.toml");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
 /// Like `write_config` but lets a test override the `data_dir` or
 /// the body-size cap. `data_dir` is *not* created automatically when
 /// overridden (so tests can exercise the failure path).
@@ -2852,4 +2888,145 @@ fn three_synthetic_traces_finalize_independently() {
         )
         .unwrap();
     assert_eq!(n_finalized, 3);
+}
+
+// ---- retention-sweeper ----
+
+/// Current `CLOCK_REALTIME` in nanoseconds — same source the collector
+/// uses for the retention cutoff. Used by the retention tests to
+/// pin a batch's `meta.start_time` well past the cutoff.
+fn now_realtime_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+const ONE_DAY_NS: i64 = 86_400 * 1_000_000_000;
+
+#[test]
+fn retention_sweeper_removes_expired_trace_files_and_row() {
+    let dir = unique_tempdir("retention_basic");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_retention(&dir, "127.0.0.1:0", 1);
+    let collector = Collector::spawn(&path);
+
+    // Two days ago = comfortably past the 1-day cutoff.
+    let start_time = now_realtime_ns() - 2 * ONE_DAY_NS;
+    let body = build_test_batch_with_chain("ret-basic", 1, start_time);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    // Wait for the decoder to commit the trace, then for the sweeper
+    // to remove it.
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout("swept retention", Duration::from_secs(5));
+
+    let trace_key = synth_trace_key("ret-basic", 1, start_time);
+    let sqlite_path = data_dir.join("traces").join(format!("{trace_key}.sqlite"));
+    assert!(!sqlite_path.exists(), "per-trace SQLite must be gone");
+
+    let n_rows: i64 = open_index_db_ro(&data_dir)
+        .query_row("SELECT COUNT(*) FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_rows, 0, "index row must be gone");
+}
+
+#[test]
+fn retention_sweeper_logs_summary_line_with_freed_bytes() {
+    let dir = unique_tempdir("retention_log");
+    let path = write_config_with_fast_retention(&dir, "127.0.0.1:0", 1);
+    let collector = Collector::spawn(&path);
+
+    let start_time = now_realtime_ns() - 2 * ONE_DAY_NS;
+    let body = build_test_batch_with_chain("ret-log", 1, start_time);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    let stdout = collector.wait_for_stdout("swept retention", Duration::from_secs(5));
+
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("swept retention"))
+        .expect("swept retention line must be present");
+    assert!(
+        line.contains("removed_traces=1"),
+        "expected removed_traces=1 in: {line}"
+    );
+    // Parse `freed_bytes=<N>` and assert N > 0 (the per-trace SQLite
+    // is always at least a few KB after `record_batch`).
+    let freed: u64 = line
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("freed_bytes="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse freed_bytes from: {line}"));
+    assert!(freed > 0, "freed_bytes must be > 0, got {freed}");
+}
+
+#[test]
+fn retention_sweeper_silent_when_nothing_expired() {
+    // Generous retention window — a freshly-ingested batch shouldn't
+    // be touched. Sleep through a few ticks and assert no
+    // `swept retention` line appeared.
+    let dir = unique_tempdir("retention_silent");
+    let path = write_config_with_fast_retention(&dir, "127.0.0.1:0", 30);
+    let collector = Collector::spawn(&path);
+
+    // A "current" trace — start_time only one ms ago.
+    let start_time = now_realtime_ns() - 1_000_000;
+    let body = build_test_batch_with_chain("ret-silent", 1, start_time);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    // Let the retention loop tick a few times (tick_seconds = 1).
+    std::thread::sleep(Duration::from_secs(3));
+
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    assert!(
+        !stdout.contains("swept retention"),
+        "fresh trace must not trigger a sweep; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn retention_sweeper_does_not_disturb_fresh_traces() {
+    let dir = unique_tempdir("retention_mixed");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_retention(&dir, "127.0.0.1:0", 1);
+    let collector = Collector::spawn(&path);
+
+    // Expired batch.
+    let expired_start = now_realtime_ns() - 2 * ONE_DAY_NS;
+    let body_a = build_test_batch_with_chain("ret-old", 1, expired_start);
+    let (status, _) = send_raw(&collector.bound, &ingest_request(&collector.bound, &body_a));
+    assert_eq!(status, 200);
+
+    // Fresh batch (different host so it gets its own trace_key).
+    let fresh_start = now_realtime_ns() - 1_000_000;
+    let body_b = build_test_batch_with_chain("ret-new", 2, fresh_start);
+    let (status, _) = send_raw(&collector.bound, &ingest_request(&collector.bound, &body_b));
+    assert_eq!(status, 200);
+
+    // Wait for both decodes, then for the retention summary that
+    // covers the expired one.
+    wait_until(
+        &collector,
+        |stdout| count_matches(stdout, "decoded batch") >= 2,
+        Duration::from_secs(5),
+    );
+    collector.wait_for_stdout("swept retention", Duration::from_secs(5));
+
+    // The fresh trace must still be present; the expired one gone.
+    let (n_rows, sole_key): (i64, String) = open_index_db_ro(&data_dir)
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(trace_key), '') FROM traces",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(n_rows, 1, "exactly one trace should survive");
+    let fresh_key = synth_trace_key("ret-new", 2, fresh_start);
+    assert_eq!(sole_key, fresh_key, "the surviving trace is the fresh one");
 }

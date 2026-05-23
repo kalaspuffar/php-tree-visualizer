@@ -13,6 +13,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::finalize;
+use crate::retention;
 use crate::storage::Storage;
 
 /// Entry point called from `main` after the config has been validated.
@@ -61,6 +62,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     let storage = Arc::new(AsyncMutex::new(storage));
     let storage_for_decoder = storage.clone();
     let storage_for_finalize = storage.clone();
+    let storage_for_retention = storage.clone();
     tokio::spawn(async move {
         while let Some(item) = batch_rx.recv().await {
             // INV-2 unaffected: `trace_key` is not a secret (it's
@@ -133,6 +135,23 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         storage_for_finalize,
         config.finalize.idle_seconds,
         config.finalize.tick_seconds,
+    ));
+
+    // Retention sweeper. Same shared `Storage`; ticks once per
+    // `retention.tick_minutes` in production. The test-only
+    // `tick_seconds` override (Option<u32>) wins when present,
+    // letting integration tests drive the loop on a sub-minute
+    // cadence. Default §7.3 tick is 60 minutes; effective tick is
+    // in seconds for the loop body's tokio interval.
+    let retention_tick_seconds: u64 = config
+        .retention
+        .tick_seconds
+        .map(u64::from)
+        .unwrap_or_else(|| u64::from(config.retention.tick_minutes) * 60);
+    tokio::spawn(retention::run(
+        storage_for_retention,
+        config.storage.retention_days,
+        retention_tick_seconds,
     ));
 
     let listener = TcpListener::bind(addr)
