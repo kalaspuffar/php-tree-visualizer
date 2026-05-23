@@ -58,6 +58,12 @@ const SYNTHETIC_ROOT_NODE_ID: i64 = 1;
 /// a typo in `'unresloved_fn'` can't slip past the type system.
 const KIND_UNRESOLVED_FN: &str = "unresolved_fn";
 const KIND_INVERTED_TIME: &str = "inverted_time";
+/// DQ-2: a pending row was never resolved by the time the trace
+/// finalized. Written by `storage::Storage::finalize_trace`; never by
+/// the in-batch aggregation path (which only emits the two kinds
+/// above). Pinned here so the literal lives in one place; the
+/// helper that does the actual INSERT is below.
+pub(super) const KIND_PENDING_PARENT_AT_FINALIZE: &str = "pending_parent_at_finalize";
 
 /// Counters surfaced to the caller for the `decoded batch`
 /// log line and the tests.
@@ -524,6 +530,39 @@ fn insert_inverted_time_anomaly(
             context: "insert inverted_time anomaly",
             source: e,
         })?;
+    Ok(())
+}
+
+/// DQ-2 anomaly insert. Called by `Storage::finalize_trace` for every
+/// row left in `pending_calls` at finalize time — the row's parent's
+/// Call record never reached the collector, so the Call never folded
+/// into a node and `node_id` is NULL. `detail` carries the orphan
+/// `parent_call_id` so the operator can see which wire-level parent
+/// went missing.
+pub(super) fn insert_pending_parent_at_finalize_anomaly(
+    tx: &Transaction,
+    call_id: u32,
+    parent_call_id: u32,
+) -> Result<(), StorageError> {
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO anomalies (node_id, kind, sample_call_id, detail) \
+             VALUES (NULL, ?1, ?2, ?3)",
+        )
+        .map_err(|e| StorageError::Query {
+            context: "prepare pending_parent_at_finalize anomaly insert",
+            source: e,
+        })?;
+    let detail = format!("parent_call_id={parent_call_id}");
+    stmt.execute(params![
+        KIND_PENDING_PARENT_AT_FINALIZE,
+        call_id as i64,
+        detail,
+    ])
+    .map_err(|e| StorageError::Query {
+        context: "insert pending_parent_at_finalize anomaly",
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -1206,6 +1245,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ---- DQ-2 helper ----
+
+    #[test]
+    fn dq2_anomaly_helper_writes_expected_row() {
+        let conn = fresh_trace_db();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_pending_parent_at_finalize_anomaly(&tx, 42, 999).unwrap();
+        tx.commit().unwrap();
+
+        let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
+            .query_row(
+                "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(node_id, None);
+        assert_eq!(kind, KIND_PENDING_PARENT_AT_FINALIZE);
+        assert_eq!(kind, "pending_parent_at_finalize");
+        assert_eq!(sample_call_id, 42);
+        assert_eq!(detail, "parent_call_id=999");
     }
 
     #[test]

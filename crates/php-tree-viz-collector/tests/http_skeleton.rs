@@ -34,6 +34,36 @@ fn write_config(dir: &Path, bind: &str) -> PathBuf {
     write_config_with_overrides(dir, bind, dir.join("data").to_str().unwrap(), None)
 }
 
+/// Write a config with aggressive idle-finalize timings: `idle_seconds =
+/// 1, tick_seconds = 1`. Used by the finalize integration tests so the
+/// wait for "finalized trace …" is bounded by ~2 s + jitter instead of
+/// the 30 s default. Every other setting matches `write_config`.
+fn write_config_with_fast_finalize(dir: &Path, bind: &str) -> PathBuf {
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let body = format!(
+        r#"[server]
+bind = "{bind}"
+
+[auth]
+token = "{TOKEN}"
+session_salt = "{SALT}"
+
+[storage]
+data_dir = "{}"
+retention_days = 30
+
+[finalize]
+idle_seconds = 1
+tick_seconds = 1
+"#,
+        data_dir.display(),
+    );
+    let path = dir.join("collector.toml");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
 /// Like `write_config` but lets a test override the `data_dir` or
 /// the body-size cap. `data_dir` is *not* created automatically when
 /// overridden (so tests can exercise the failure path).
@@ -1140,6 +1170,88 @@ fn build_test_batch_with_inverted_time(host: &str, pid: u64, start_time: i64) ->
             t_in: 500,
             t_out: 400, // inverted on purpose
             cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        }],
+    })
+    .unwrap()
+}
+
+/// Build a tiny MessagePack batch with one Call whose `parent` is a
+/// `call_id` (999) that no batch will ever produce — the canonical
+/// DQ-2 shape. The Call's `fn_id` (7) IS in `dict`, so it doesn't
+/// hit the DQ-1 path; it lands in `pending_calls` and stays there
+/// until `finalize_trace` drains it into a `pending_parent_at_finalize`
+/// anomaly.
+fn build_test_batch_with_orphan_pending(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct TestMeta<'a> {
+        schema_version: u32,
+        trace_id: &'a str,
+        host: &'a str,
+        pid: u64,
+        start_time: i64,
+        sapi: &'a str,
+        uri_or_script: &'a str,
+        dropped_records: u64,
+    }
+    #[derive(Serialize)]
+    struct TestDictEntry<'a> {
+        fn_id: u32,
+        fqn: &'a str,
+        file: &'a str,
+        line: u32,
+        kind: u8,
+    }
+    #[derive(Serialize)]
+    struct TestCall {
+        call_id: u32,
+        parent: u32,
+        #[serde(rename = "fn")]
+        fn_id: u32,
+        depth: u32,
+        t_in: i64,
+        t_out: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+        mem_in: i64,
+        mem_out: i64,
+        abnormal_exit: bool,
+    }
+    #[derive(Serialize)]
+    struct TestBatch<'a> {
+        meta: TestMeta<'a>,
+        dict: Vec<TestDictEntry<'a>>,
+        calls: Vec<TestCall>,
+    }
+    rmp_serde::to_vec_named(&TestBatch {
+        meta: TestMeta {
+            schema_version: 1,
+            trace_id: ALL_ZERO_TRACE_ID,
+            host,
+            pid,
+            start_time,
+            sapi: "cli",
+            uri_or_script: "/tmp/dq2.php",
+            dropped_records: 0,
+        },
+        dict: vec![TestDictEntry {
+            fn_id: 7,
+            fqn: "ns\\orphan_child",
+            file: "/tmp/dq2.php",
+            line: 1,
+            kind: 0,
+        }],
+        calls: vec![TestCall {
+            call_id: 42,
+            parent: 999, // parent never arrives → pending → DQ-2 at finalize
+            fn_id: 7,
+            depth: 2,
+            t_in: 0,
+            t_out: 100,
+            cpu_u: 0, // every Call has zero CPU → cpu_snapshot_available=0
             cpu_s: 0,
             mem_in: 0,
             mem_out: 0,
@@ -2415,4 +2527,329 @@ fn trace_meta_mirrors_the_index_row_e2e() {
     assert_eq!(mhost, host);
     assert_eq!(mpid, pid);
     assert_eq!(mstate, "active");
+}
+
+// ---- idle-finalize ----
+
+/// Count how many times the substring appears in `haystack`. Used by
+/// the multi-trace finalize test to wait until N `finalized trace …`
+/// lines have been emitted.
+fn count_matches(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// Block until `predicate` returns true against fresh stdout, or panic
+/// with a diagnostic dump once `timeout` elapses. Used when the test
+/// needs to wait for *N* occurrences of a substring rather than just
+/// one.
+fn wait_until<P: Fn(&str) -> bool>(collector: &Collector, predicate: P, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stdout = collector.stdout_so_far.lock().unwrap().clone();
+        if predicate(&stdout) {
+            return;
+        }
+        if Instant::now() > deadline {
+            let stderr = collector.stderr_so_far.lock().unwrap().clone();
+            panic!("timed out after {timeout:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn idle_finalize_marks_active_trace_as_finalized() {
+    let dir = unique_tempdir("idle_finalize_basic");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_chain("finalize-basic", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+
+    let state: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT state FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "finalized");
+}
+
+#[test]
+fn idle_finalize_writes_dq2_anomaly_for_pending_parent() {
+    let dir = unique_tempdir("idle_finalize_dq2");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_orphan_pending("dq2-host", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+
+    let n_pending: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_pending, 0, "pending_calls drained at finalize");
+
+    let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
+        .query_row(
+            "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(node_id, None);
+    assert_eq!(kind, "pending_parent_at_finalize");
+    assert_eq!(sample_call_id, 42);
+    assert_eq!(detail, "parent_call_id=999");
+
+    let anomaly_count: i64 = open_index_db_ro(&data_dir)
+        .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(anomaly_count, 1);
+}
+
+#[test]
+fn idle_finalize_log_line_carries_pending_dq2_and_cpu_fields() {
+    let dir = unique_tempdir("idle_finalize_log");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_orphan_pending("dq2-log", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    let stdout = collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("finalized trace"))
+        .expect("finalized trace line must be present");
+    assert!(
+        line.contains("pending_dq2=1"),
+        "expected pending_dq2=1 in: {line}"
+    );
+    // The orphan Call never folded into a node, so no node exists
+    // with non-zero CPU → cpu_snapshot_available=0.
+    assert!(
+        line.contains("cpu_snapshot_available=0"),
+        "expected cpu_snapshot_available=0 in: {line}"
+    );
+}
+
+#[test]
+fn idle_finalize_sets_cpu_snapshot_available_to_0_for_zero_cpu_trace() {
+    let dir = unique_tempdir("idle_finalize_cpu_off");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // build_test_batch_with_inverted_time has cpu_u=0, cpu_s=0 on its
+    // only Call, but it DOES fold into a node (with total_wall=0). So
+    // the trace has one user node with zero CPU → cpu_snapshot_available
+    // should be 0.
+    let body = build_test_batch_with_inverted_time("cpu-off-trace", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+
+    let (cpu_index, trace_key): (i64, String) = open_index_db_ro(&data_dir)
+        .query_row(
+            "SELECT cpu_snapshot_available, trace_key FROM traces",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(cpu_index, 0);
+
+    let cpu_meta: i64 = open_trace_db_ro(&data_dir, &trace_key)
+        .query_row("SELECT cpu_snapshot_available FROM trace_meta", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(cpu_meta, 0);
+}
+
+#[test]
+fn late_batch_after_finalize_reactivates_state_e2e() {
+    let dir = unique_tempdir("late_batch_reactivate");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // Batch A.
+    let body_a = build_test_batch_with_chain("late-host", 7, 7);
+    let req_a = ingest_request(&collector.bound, &body_a);
+    let (status, _) = send_raw(&collector.bound, &req_a);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+
+    let state_after_a: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT state FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state_after_a, "finalized");
+
+    // Batch B for the same trace (same host/pid/start_time → same
+    // synthesized TraceKey).
+    let body_b = build_test_batch_with_chain("late-host", 7, 7);
+    let req_b = ingest_request(&collector.bound, &body_b);
+    let (status, _) = send_raw(&collector.bound, &req_b);
+    assert_eq!(status, 200);
+
+    // Wait for the second `decoded batch …` line. The first batch
+    // already produced one, so we wait for the count to reach 2.
+    wait_until(
+        &collector,
+        |stdout| count_matches(stdout, "decoded batch") >= 2,
+        Duration::from_secs(5),
+    );
+
+    let (state_after_b, batch_count): (String, i64) = open_index_db_ro(&data_dir)
+        .query_row("SELECT state, batch_count FROM traces", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state_after_b, "active", "late batch reactivates the trace");
+    assert_eq!(batch_count, 2);
+
+    // trace_meta mirrors the index.
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let mirror_state: String = open_trace_db_ro(&data_dir, &trace_key)
+        .query_row("SELECT state FROM trace_meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mirror_state, "active");
+}
+
+#[test]
+fn idle_finalize_does_not_finalize_traces_inside_threshold() {
+    // Build a config with idle_seconds=60 and tick_seconds=1 — ticks
+    // run, but the trace is too fresh to be finalized.
+    let dir = unique_tempdir("idle_finalize_threshold");
+    let data_dir = dir.join("data");
+    let auto_data = dir.join("data");
+    std::fs::create_dir_all(&auto_data).unwrap();
+    let body = format!(
+        r#"[server]
+bind = "127.0.0.1:0"
+
+[auth]
+token = "{TOKEN}"
+session_salt = "{SALT}"
+
+[storage]
+data_dir = "{}"
+retention_days = 30
+
+[finalize]
+idle_seconds = 60
+tick_seconds = 1
+"#,
+        auto_data.display(),
+    );
+    let path = dir.join("collector.toml");
+    std::fs::write(&path, body).unwrap();
+    let collector = Collector::spawn(&path);
+
+    let req = ingest_request(
+        &collector.bound,
+        &build_test_batch_with_chain("threshold-host", 1, 1),
+    );
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+
+    // Wait long enough for several finalize ticks, then assert state
+    // is still active and no finalize line was emitted.
+    std::thread::sleep(Duration::from_secs(3));
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    assert!(
+        !stdout.contains("finalized trace"),
+        "trace inside threshold must not be finalized; stdout:\n{stdout}"
+    );
+
+    let state: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT state FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "active");
+}
+
+#[test]
+fn idle_finalize_log_is_silent_when_nothing_idle() {
+    let dir = unique_tempdir("idle_finalize_quiet");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // No batches sent. Wait through several finalize ticks.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    assert!(
+        !stdout.contains("finalized trace"),
+        "quiet collector must not emit finalize lines; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn three_synthetic_traces_finalize_independently() {
+    // Acceptance against §10.2 / S-1: "After replaying the three
+    // handover workloads, `index.sqlite` has 3 rows with `state =
+    // 'finalized'`". The captured handover fixtures are mid-trace
+    // snapshots (per `COMMENTS.md`) and only batch-0001 of one of the
+    // three workloads is included as an embedded fixture in this
+    // crate today. We replicate the *acceptance* (three distinct
+    // traces all finalize cleanly) with three synthetic batches built
+    // from `build_test_batch_with_chain` — different (host, pid,
+    // start_time) → different synthesized TraceKey → three rows in
+    // `index.sqlite.traces`. Adding the literal handover replay is
+    // tracked as a follow-up: it requires copying the remaining 8
+    // .msgpack files into `tests/fixtures/`.
+    let dir = unique_tempdir("three_traces");
+    let data_dir = dir.join("data");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    for (host, pid, start) in [
+        ("trace-one", 1, 100),
+        ("trace-two", 2, 200),
+        ("trace-three", 3, 300),
+    ] {
+        let req = ingest_request(
+            &collector.bound,
+            &build_test_batch_with_chain(host, pid, start),
+        );
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200);
+    }
+    wait_until(
+        &collector,
+        |stdout| count_matches(stdout, "decoded batch") >= 3,
+        Duration::from_secs(5),
+    );
+    wait_until(
+        &collector,
+        |stdout| count_matches(stdout, "finalized trace") >= 3,
+        Duration::from_secs(5),
+    );
+
+    let n_finalized: i64 = open_index_db_ro(&data_dir)
+        .query_row(
+            "SELECT COUNT(*) FROM traces WHERE state = 'finalized'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n_finalized, 3);
 }

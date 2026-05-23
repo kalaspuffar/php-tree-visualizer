@@ -22,6 +22,24 @@ pub use error::StorageError;
 
 pub(crate) use aggregate::AggregateOutcome;
 
+/// Counters surfaced by `Storage::finalize_trace`. The finalize loop
+/// reads these to write its `finalized trace …` log line; tests read
+/// them to assert the per-trace DQ-2 count and the trace's
+/// `cpu_snapshot_available` outcome.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FinalizeOutcome {
+    /// Rows inserted into `anomalies` with
+    /// `kind = 'pending_parent_at_finalize'` during this finalize
+    /// pass. Equals the number of rows that were in `pending_calls`
+    /// at finalize time.
+    pub pending_dq2: u32,
+    /// `false` when every non-root `nodes` row in this trace has
+    /// `total_cpu_u_ns + total_cpu_s_ns == 0` (the extension was
+    /// configured with `cpu_snapshot_mode = off`, or every Call was
+    /// sub-µs). Drives the UI's "CPU unavailable" mode per F-6.9.
+    pub cpu_snapshot_available: bool,
+}
+
 use crate::http::BatchSubmission;
 use crate::tracekey::TraceKey;
 use crate::wire;
@@ -212,6 +230,14 @@ impl Storage {
         Ok(outcome)
     }
 
+    /// Test-only: does the per-trace connection cache currently hold
+    /// an entry for `key`? Used to assert the LRU eviction on
+    /// `finalize_trace`.
+    #[cfg(test)]
+    pub(crate) fn has_cached_trace_conn(&self, key: &TraceKey) -> bool {
+        self.trace_conns.contains_key(key)
+    }
+
     fn ensure_trace_conn(&mut self, key: &TraceKey) -> Result<&mut Connection, StorageError> {
         if !self.trace_conns.contains_key(key) {
             let path = self.traces_dir.join(format!("{}.sqlite", key.as_str()));
@@ -223,6 +249,216 @@ impl Storage {
             .get_mut(key)
             .expect("just inserted; lookup must succeed"))
     }
+
+    /// List every `'active'` trace whose `last_batch_at_ns` precedes
+    /// `cutoff_ns`. Used by the idle-finalize loop; backed by the
+    /// covering index `idx_traces_state_lastbatch` (per
+    /// `SPECIFICATION.md` §4.2). Returns owned `TraceKey`s so the
+    /// caller can then drive `finalize_trace` without holding the
+    /// statement's cursor across the per-trace work.
+    pub fn list_idle_active_traces(
+        &mut self,
+        cutoff_ns: i64,
+    ) -> Result<Vec<TraceKey>, StorageError> {
+        let mut stmt = self
+            .index_conn
+            .prepare_cached(
+                "SELECT trace_key FROM traces \
+                 WHERE state = 'active' AND last_batch_at_ns < ?1",
+            )
+            .map_err(|e| StorageError::Query {
+                context: "prepare list_idle_active_traces",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![cutoff_ns], |row| row.get::<_, String>(0))
+            .map_err(|e| StorageError::Query {
+                context: "query list_idle_active_traces",
+                source: e,
+            })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|e| StorageError::Query {
+                context: "iterate list_idle_active_traces",
+                source: e,
+            })?;
+            keys.push(TraceKey::from_raw(&raw));
+        }
+        Ok(keys)
+    }
+
+    /// Close a trace's lifecycle: drain `pending_calls` into DQ-2
+    /// anomalies, compute `cpu_snapshot_available`, flip
+    /// `state = 'finalized'` in both databases, and evict the
+    /// per-trace connection from the cache.
+    ///
+    /// Per-trace transaction commits before the index transaction
+    /// — same ordering as `record_batch`. The index can never be
+    /// "ahead of" the per-trace DB; the failure window is just
+    /// "per-trace committed but index didn't", which a retry on the
+    /// next tick reconciles idempotently (DQ-2 rows aren't
+    /// re-inserted because `pending_calls` is already empty).
+    ///
+    /// `now_ns` is accepted for forward compatibility (e.g. recording
+    /// a finalize timestamp later) but is unused in this slice.
+    pub fn finalize_trace(
+        &mut self,
+        key: &TraceKey,
+        _now_ns: i64,
+    ) -> Result<FinalizeOutcome, StorageError> {
+        let trace_conn = self.ensure_trace_conn(key)?;
+        let tx = trace_conn.transaction().map_err(|e| StorageError::Query {
+            context: "finalize trace begin",
+            source: e,
+        })?;
+
+        // ---- DQ-2 inserts + pending drain ----
+        let pending = collect_pending_rows(&tx)?;
+        let pending_dq2 = pending.len() as u32;
+        for (call_id, parent_call_id) in &pending {
+            aggregate::insert_pending_parent_at_finalize_anomaly(
+                &tx,
+                *call_id as u32,
+                *parent_call_id as u32,
+            )?;
+        }
+        // Bulk wipe — cheaper than per-row DELETE and we just turned
+        // every row above into an anomaly. The transaction makes
+        // this either-both-or-neither with the inserts.
+        tx.execute("DELETE FROM pending_calls", [])
+            .map_err(|e| StorageError::Query {
+                context: "drain pending_calls at finalize",
+                source: e,
+            })?;
+
+        // ---- cpu_snapshot_available ----
+        let cpu_available = compute_cpu_snapshot_available(&tx)?;
+
+        // ---- anomaly_count: take the absolute per-trace row count
+        //      (post-insert) so the index UPDATE below reconciles
+        //      rather than accumulates. This makes finalize_trace
+        //      idempotent under crash-then-retry: a second invocation
+        //      sees `pending_calls` already empty, inserts zero new
+        //      anomaly rows, and overwrites `traces.anomaly_count`
+        //      with the same (already-correct) value. Additive
+        //      arithmetic would have left the index counter
+        //      underreporting after a crash between the per-trace
+        //      and index commits.
+        let absolute_anomaly_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |row| row.get(0))
+            .map_err(|e| StorageError::Query {
+                context: "query absolute anomaly_count at finalize",
+                source: e,
+            })?;
+
+        // ---- flip per-trace state ----
+        tx.execute(
+            "UPDATE trace_meta SET state = 'finalized', cpu_snapshot_available = ?1",
+            params![i64::from(cpu_available)],
+        )
+        .map_err(|e| StorageError::Query {
+            context: "update trace_meta state at finalize",
+            source: e,
+        })?;
+
+        tx.commit().map_err(|e| StorageError::Query {
+            context: "finalize trace commit",
+            source: e,
+        })?;
+
+        // ---- index.sqlite: separate transaction, runs second so a
+        //      crash in between leaves the per-trace DB carrying the
+        //      durable record. Idempotent retry on next tick.
+        let tx = self
+            .index_conn
+            .transaction()
+            .map_err(|e| StorageError::Query {
+                context: "finalize index begin",
+                source: e,
+            })?;
+        tx.execute(
+            "UPDATE traces \
+             SET state = 'finalized', \
+                 anomaly_count = ?1, \
+                 cpu_snapshot_available = ?2 \
+             WHERE trace_key = ?3",
+            params![
+                absolute_anomaly_count,
+                i64::from(cpu_available),
+                key.as_str(),
+            ],
+        )
+        .map_err(|e| StorageError::Query {
+            context: "update traces row at finalize",
+            source: e,
+        })?;
+        tx.commit().map_err(|e| StorageError::Query {
+            context: "finalize index commit",
+            source: e,
+        })?;
+
+        // Per `SPECIFICATION.md` §3.1: "Per-trace SQLite connections
+        // are cached in an LRU keyed by `TraceKey`. The LRU evicts on
+        // idle-finalize …". The cache is a plain HashMap today; the
+        // retention slice will turn it into a real LRU with the
+        // configured cap.
+        self.trace_conns.remove(key);
+
+        Ok(FinalizeOutcome {
+            pending_dq2,
+            cpu_snapshot_available: cpu_available,
+        })
+    }
+}
+
+/// Pull every `(call_id, parent_call_id)` pair out of `pending_calls`
+/// into an owned Vec, so the statement's cursor is dropped before the
+/// caller mutates the table. Used by `Storage::finalize_trace`.
+fn collect_pending_rows(tx: &Connection) -> Result<Vec<(i64, i64)>, StorageError> {
+    let mut stmt = tx
+        .prepare_cached("SELECT call_id, parent_call_id FROM pending_calls")
+        .map_err(|e| StorageError::Query {
+            context: "prepare collect_pending_rows",
+            source: e,
+        })?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| StorageError::Query {
+            context: "query collect_pending_rows",
+            source: e,
+        })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| StorageError::Query {
+            context: "iterate collect_pending_rows",
+            source: e,
+        })?);
+    }
+    Ok(out)
+}
+
+/// `cpu_snapshot_available` per `SPECIFICATION.md` §4.2: `false` when
+/// every non-root `nodes` row has `total_cpu_u_ns + total_cpu_s_ns
+/// == 0`. The synthetic root (`node_id = 1`) is excluded because its
+/// counters stay at zero by design. An empty trace (no user nodes)
+/// reports `false` — there is nothing to suggest CPU data was
+/// available.
+fn compute_cpu_snapshot_available(tx: &Connection) -> Result<bool, StorageError> {
+    let any_cpu: i64 = tx
+        .query_row(
+            "SELECT CASE \
+                WHEN COALESCE(SUM(total_cpu_u_ns) + SUM(total_cpu_s_ns), 0) > 0 \
+                THEN 1 ELSE 0 \
+              END \
+              FROM nodes WHERE node_id != 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Query {
+            context: "query cpu_snapshot_available",
+            source: e,
+        })?;
+    Ok(any_cpu != 0)
 }
 
 /// Open a SQLite file, apply pragmas, run the schema-version
@@ -302,7 +538,12 @@ ON CONFLICT(trace_key) DO UPDATE SET
   total_wall_ns     = traces.total_wall_ns + excluded.total_wall_ns,
   last_batch_at_ns  = excluded.last_batch_at_ns,
   dropped_records   = excluded.dropped_records,
-  anomaly_count     = traces.anomaly_count + excluded.anomaly_count
+  anomaly_count     = traces.anomaly_count + excluded.anomaly_count,
+  -- A batch for a previously-finalized trace flips it back to active.
+  -- The per-trace `trace_meta` mirror is INSERT OR REPLACE'd to
+  -- 'active' on the same code path, keeping the two databases in
+  -- agreement. Per `SPECIFICATION.md` DR-3.
+  state             = 'active'
 ";
 
 const MIRROR_TRACE_META_SQL: &str = "
@@ -725,5 +966,446 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n_per_trace2, 6);
+    }
+
+    // ---- finalize_trace ----
+
+    /// Build a Call with explicit CPU values. The default `call()`
+    /// helper above zeroes them out, which is the wrong shape for the
+    /// CPU-available finalize test.
+    fn call_with_cpu(
+        call_id: u32,
+        parent: u32,
+        fn_id: u32,
+        wall: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+    ) -> Call {
+        Call {
+            call_id,
+            parent,
+            fn_id,
+            depth: 0,
+            t_in: 0,
+            t_out: wall,
+            cpu_u,
+            cpu_s,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        }
+    }
+
+    #[test]
+    fn finalize_trace_drains_pending_into_dq2_anomalies() {
+        let dir = unique_dir("finalize_dq2");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("11111111111111111111111111111111");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        // A child whose parent (call_id=999) never arrives → goes
+        // to pending_calls and stays there.
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(42, 999, 7, 100)],
+            meta("orphan-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert_eq!(outcome.pending_dq2, 1);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 0, "pending_calls drained at finalize");
+
+        let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
+            .query_row(
+                "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(node_id, None);
+        assert_eq!(kind, "pending_parent_at_finalize");
+        assert_eq!(sample_call_id, 42);
+        assert_eq!(detail, "parent_call_id=999");
+    }
+
+    #[test]
+    fn finalize_trace_cpu_unavailable_when_all_cpu_zero() {
+        let dir = unique_dir("finalize_cpu_off");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("22222222222222222222222222222222");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(1, 0, 7, 100)], // cpu_u=0, cpu_s=0
+            meta("cpu-off-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert!(!outcome.cpu_snapshot_available);
+
+        // Mirrored in both databases.
+        let cpu_index: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT cpu_snapshot_available FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpu_index, 0);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let cpu_meta: i64 = conn
+            .query_row("SELECT cpu_snapshot_available FROM trace_meta", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cpu_meta, 0);
+    }
+
+    #[test]
+    fn finalize_trace_cpu_available_when_any_call_has_cpu() {
+        let dir = unique_dir("finalize_cpu_on");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("33333333333333333333333333333333");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call_with_cpu(1, 0, 7, 100, 50, 10)],
+            meta("cpu-on-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert!(outcome.cpu_snapshot_available);
+
+        let cpu_index: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT cpu_snapshot_available FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpu_index, 1);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let cpu_meta: i64 = conn
+            .query_row("SELECT cpu_snapshot_available FROM trace_meta", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cpu_meta, 1);
+    }
+
+    #[test]
+    fn finalize_trace_flips_state_in_both_databases() {
+        let dir = unique_dir("finalize_state");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("55555555555555555555555555555555");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(1, 0, 7, 100)],
+            meta("state-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        // Sanity: state starts as 'active'.
+        let state_before: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_before, "active");
+
+        storage.finalize_trace(&key, 2_000).unwrap();
+
+        let state_after: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_after, "finalized");
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let state_meta: String = conn
+            .query_row("SELECT state FROM trace_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state_meta, "finalized");
+    }
+
+    #[test]
+    fn finalize_trace_evicts_per_trace_connection() {
+        let dir = unique_dir("finalize_evict");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("66666666666666666666666666666666");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(1, 0, 7, 100)],
+            meta("evict-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+        assert!(
+            storage.has_cached_trace_conn(&key),
+            "record_batch caches the per-trace conn"
+        );
+
+        storage.finalize_trace(&key, 2_000).unwrap();
+        assert!(
+            !storage.has_cached_trace_conn(&key),
+            "finalize_trace evicts the per-trace conn"
+        );
+    }
+
+    #[test]
+    fn finalize_trace_anomaly_count_reflects_dq2() {
+        let dir = unique_dir("finalize_anom_count");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("77777777777777777777777777777777");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        // Build a batch with mixed anomalies + pending:
+        //   - 1 DQ-1 (missing fn_id=99)
+        //   - 1 DQ-3 (inverted time on fn_id=7)
+        //   - 2 orphan children (cross-batch parent never seen)
+        //   - 1 normal Call
+        let inverted = Call {
+            call_id: 100,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 500,
+            t_out: 400,
+            cpu_u: 0,
+            cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        };
+        let b = batch_with(
+            vec![dict_entry(7, "ok")],
+            vec![
+                call(10, 0, 99, 100),  // DQ-1
+                inverted,              // DQ-3 at fn=7
+                call(20, 999, 7, 100), // orphan → pending
+                call(21, 999, 7, 100), // orphan → pending
+                call(30, 0, 7, 100),   // normal at fn=7
+            ],
+            meta("mix-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        // After record_batch: 2 anomalies (DQ-1 + DQ-3), 2 pending.
+        let n_index_before: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT anomaly_count FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_index_before, 2);
+
+        // Finalize adds 2 DQ-2 rows → 4 total in per-trace.
+        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert_eq!(outcome.pending_dq2, 2);
+
+        let n_index_after: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT anomaly_count FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_index_after, 4);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let n_per_trace: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_per_trace, 4);
+    }
+
+    #[test]
+    fn late_batch_after_finalize_reactivates_state() {
+        let dir = unique_dir("late_batch");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("88888888888888888888888888888888");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b1 = batch_with(
+            vec![dict_entry(7, "f")],
+            vec![call(1, 0, 7, 100)],
+            meta("late-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b1, 1_000).unwrap();
+        storage.finalize_trace(&key, 2_000).unwrap();
+
+        // Confirm finalize landed.
+        let s: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s, "finalized");
+
+        // Late batch for the same trace.
+        let b2 = batch_with(vec![], vec![call(2, 0, 7, 50)], meta("late-host", 1, 1));
+        storage.record_batch(&sub, &b2, 5_000).unwrap();
+
+        let (state, batch_count, total_wall): (String, i64, i64) = storage
+            .index_conn
+            .query_row(
+                "SELECT state, batch_count, total_wall_ns FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "active", "late batch reactivates traces.state");
+        assert_eq!(batch_count, 2, "batch_count accumulates across the gap");
+        assert_eq!(total_wall, 150);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let state_meta: String = conn
+            .query_row("SELECT state FROM trace_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            state_meta, "active",
+            "trace_meta mirror flips back to active too"
+        );
+    }
+
+    #[test]
+    fn finalize_trace_is_idempotent_under_retry() {
+        // Simulate the partial-commit window: the first finalize's
+        // per-trace transaction committed (pending drained, DQ-2
+        // anomalies inserted, trace_meta.state='finalized'), but the
+        // index update is lost. A second call must NOT duplicate
+        // anomaly rows, and must bring the index DB into agreement.
+        let dir = unique_dir("finalize_idempotent");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("99999999999999999999999999999999");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "ok")],
+            vec![
+                call(20, 999, 7, 100), // orphan → pending
+                call(21, 999, 7, 100), // orphan → pending
+            ],
+            meta("retry-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        // First finalize: lands DQ-2 + commits both databases.
+        storage.finalize_trace(&key, 2_000).unwrap();
+
+        // Roll the index back to make it look like the index update
+        // never committed (simulating the crash window).
+        storage
+            .index_conn
+            .execute(
+                "UPDATE traces SET state = 'active', anomaly_count = 0, \
+                 cpu_snapshot_available = 1 WHERE trace_key = ?1",
+                params![key.as_str()],
+            )
+            .unwrap();
+
+        // The per-trace DB still shows the first attempt's work.
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let ro = Connection::open(&trace_path).unwrap();
+        let n_anom_before_retry: i64 = ro
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom_before_retry, 2, "first attempt landed 2 DQ-2 rows");
+
+        // Retry. pending_calls is already empty, so no new DQ-2 rows
+        // should be written. The retry should reconcile the index.
+        let outcome = storage.finalize_trace(&key, 3_000).unwrap();
+        assert_eq!(outcome.pending_dq2, 0, "no new DQ-2 inserts on retry");
+
+        let n_anom_after_retry: i64 = ro
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom_after_retry, 2, "retry must not duplicate DQ-2 rows");
+
+        let (state, anomaly_count): (String, i64) = storage
+            .index_conn
+            .query_row(
+                "SELECT state, anomaly_count FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "finalized", "retry flips state to finalized");
+        assert_eq!(
+            anomaly_count, 2,
+            "retry reconciles anomaly_count to the per-trace COUNT(*)"
+        );
+    }
+
+    #[test]
+    fn list_idle_active_traces_returns_expected_keys() {
+        let dir = unique_dir("list_idle");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+
+        // Three traces with last_batch_at_ns = 100, 200, 300.
+        let mut make = |hex: &str, host: &str, ts: i64| {
+            let key = TraceKey::from_raw(hex);
+            let sub = dummy_submission(&key, &dir.join("traces"));
+            let b = batch_with(
+                vec![dict_entry(7, "f")],
+                vec![call(1, 0, 7, 10)],
+                meta(host, 1, 1),
+            );
+            storage.record_batch(&sub, &b, ts).unwrap();
+            key
+        };
+        let k1 = make("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01", "h1", 100);
+        let k2 = make("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02", "h2", 200);
+        let _k3 = make("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa03", "h3", 300);
+
+        // Cutoff at 250 → k1 and k2 idle, k3 not.
+        let idle = storage.list_idle_active_traces(250).unwrap();
+        let idle_strs: Vec<&str> = idle.iter().map(|k| k.as_str()).collect();
+        assert_eq!(idle_strs.len(), 2);
+        assert!(idle_strs.contains(&k1.as_str()));
+        assert!(idle_strs.contains(&k2.as_str()));
+
+        // After finalising k1, the next call returns only k2.
+        storage.finalize_trace(&k1, 250).unwrap();
+        let idle = storage.list_idle_active_traces(250).unwrap();
+        let idle_strs: Vec<&str> = idle.iter().map(|k| k.as_str()).collect();
+        assert_eq!(idle_strs, vec![k2.as_str()]);
     }
 }
