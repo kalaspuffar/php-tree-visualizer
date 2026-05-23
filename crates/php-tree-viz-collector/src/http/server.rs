@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use super::{router, AppState, HttpError, SharedState};
+use super::{router, tmp, AppState, HttpError, SharedState};
 use crate::config::Config;
 
 /// Entry point called from `main` after the config has been validated.
@@ -20,6 +20,10 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         .bind
         .parse()
         .expect("bind validated by Config::validate; parse cannot fail here");
+
+    // Prepare the tmp directory *before* binding so any I/O failure
+    // here exits with status 3 before any client could connect.
+    let tmp_dir = tmp::ensure_clean_tmp_dir(&config.storage.data_dir)?;
 
     let listener = TcpListener::bind(addr)
         .await
@@ -39,6 +43,8 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
 
     let state: SharedState = Arc::new(AppState {
         expected_token: config.auth.token.clone(),
+        max_body_bytes: config.server.max_body_bytes,
+        tmp_dir,
     });
 
     let app = router::build(state).into_make_service_with_connect_info::<SocketAddr>();
