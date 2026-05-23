@@ -1,0 +1,25 @@
+# /etc/php-tree-viz/collector.toml
+
+[server]
+bind = "127.0.0.1:8088"
+max_body_bytes = 67108864          # 64 MiB
+queue_capacity = 256
+
+[auth]
+token = "REPLACE_ME"               # base64url, ≥32 bytes
+session_salt = "REPLACE_ME_TOO"    # base64url, ≥32 bytes, distinct from token
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[finalize]
+idle_seconds = 30                  # trace marked finalized after this much silence
+tick_seconds = 5
+
+[retention]
+tick_minutes = 60
+
+[log]
+level = "info"
+format = "json"                    # or "text"
