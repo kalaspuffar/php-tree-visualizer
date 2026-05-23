@@ -27,24 +27,55 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     let tmp_dir = tmp::ensure_clean_tmp_dir(&config.storage.data_dir)?;
     let traces_dir = storage::ensure_traces_dir(&config.storage.data_dir)?;
 
-    // Build the bounded ingest channel and spawn the placeholder
-    // receiver. The receiver currently drops every item after one
-    // log line; the future decoder slice replaces its body with
-    // `wire::decode + storage`. When axum's serve future ends, the
+    // Build the bounded ingest channel and spawn the decoder task.
+    // The decoder reads each committed batch file from disk, parses
+    // it via `wire::parse_batch`, and logs the decoded counts.
+    // Storage / aggregation are not in this slice — the `Batch` is
+    // dropped after logging. When axum's serve future ends, the
     // router and AppState are dropped, the sender goes out of
     // scope, and `recv()` returns `None` — the task exits cleanly
     // without explicit shutdown plumbing.
+    //
+    // The decode runs on the tokio runtime without `spawn_blocking`
+    // — ~10 ms for a 10K-call batch is acceptable on the async
+    // path. Revisit if profiling shows runtime starvation.
     let queue_capacity = config.server.queue_capacity as usize;
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<BatchSubmission>(queue_capacity);
     tokio::spawn(async move {
         while let Some(item) = batch_rx.recv().await {
-            // INV-2 unaffected: trace_key is not a secret (it's the
-            // on-disk path stem).
-            println!(
-                "dequeued batch path={} trace_key={}",
-                item.path.display(),
-                item.trace_key,
-            );
+            // INV-2 unaffected: `trace_key` is not a secret (it's
+            // the on-disk path stem); the decoder never sees
+            // header content.
+            match tokio::fs::read(&item.path).await {
+                Ok(bytes) => match crate::wire::parse_batch(&bytes) {
+                    Ok(batch) => {
+                        println!(
+                            "decoded batch path={} trace_key={} dict={} calls={}",
+                            item.path.display(),
+                            item.trace_key,
+                            batch.dict.len(),
+                            batch.calls.len(),
+                        );
+                        // The `Batch` is dropped here. Storage /
+                        // aggregation slices will replace this
+                        // drop with writes to per-trace SQLite.
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "decoder: parse failed: {err} path={} trace_key={}",
+                            item.path.display(),
+                            item.trace_key,
+                        );
+                    }
+                },
+                Err(err) => {
+                    eprintln!(
+                        "decoder: read failed: {err} path={} trace_key={}",
+                        item.path.display(),
+                        item.trace_key,
+                    );
+                }
+            }
         }
     });
 
