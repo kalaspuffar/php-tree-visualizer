@@ -14,16 +14,21 @@
 # or, for both proxies in one go:
 #   bash tools/validate-proxy-configs.sh
 #
-# The script generates a temporary, substituted copy and
-# runs `nginx -t -c <that-copy> -p /etc/nginx`. The
-# `-p /etc/nginx` is needed because etc/nginx-example.conf
-# uses `include fastcgi_params;` (a relative include that
-# nginx resolves against the prefix). On Debian/Ubuntu the
-# nginx-light package ships fastcgi_params at
-# /etc/nginx/fastcgi_params. This wrapper's own pid/log/
-# access paths are absolute under /tmp/ so they're
-# unaffected by the prefix. Expected output: "test is
-# successful" with exit 0.
+# The script generates a temporary copy of this wrapper
+# inside a fresh tempdir (`mktemp -d`), substitutes
+# __REPO_ROOT__ in it, copies /etc/nginx/fastcgi_params
+# into the same tempdir, and runs
+#   nginx -t -c <tempdir>/nginx.conf -p <tempdir>
+# The colocated fastcgi_params is needed because
+# etc/nginx-example.conf uses `include fastcgi_params;` —
+# a relative include nginx resolves against the directory
+# containing the configuration file under test, regardless
+# of what `-p` is passed. Bundling them in one tempdir
+# makes the relative resolution succeed without depending
+# on the host's /etc/nginx layout.
+# This wrapper's own pid/log/access paths are absolute
+# under /tmp/ so they don't depend on the prefix.
+# Expected output: "test is successful" with exit 0.
 #
 # Why this exists: etc/nginx-example.conf is a server-block
 # fragment (location blocks only, no surrounding

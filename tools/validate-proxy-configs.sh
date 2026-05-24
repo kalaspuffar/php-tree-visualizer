@@ -74,17 +74,23 @@ REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 APACHE_TEMPLATE="$REPO_ROOT/etc/apache-validate.conf.in"
 NGINX_TEMPLATE="$REPO_ROOT/etc/nginx-validate.conf.in"
 
-# ---- Tempfile bookkeeping -------------------------------------------
+# ---- Tempfile / tempdir bookkeeping ---------------------------------
 #
-# Each generated wrapper gets pushed onto TMPFILES; a single EXIT trap
-# unlinks them on script exit (success or failure). The trap fires
-# regardless of how the script ends.
+# Generated wrappers and nginx's helper tempdir get pushed onto
+# TMPFILES / TMPDIRS; a single EXIT trap cleans them up on script
+# exit (success or failure). The trap fires regardless of how the
+# script ends.
 
 TMPFILES=()
+TMPDIRS=()
 cleanup_tmpfiles() {
     local f
     for f in "${TMPFILES[@]:-}"; do
         [ -n "$f" ] && rm -f "$f"
+    done
+    local d
+    for d in "${TMPDIRS[@]:-}"; do
+        [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
     done
 }
 trap cleanup_tmpfiles EXIT
@@ -98,6 +104,28 @@ generate_wrapper() {
     TMPFILES+=("$out")
     sed "s|__REPO_ROOT__|${REPO_ROOT}|g" "$template" > "$out"
     printf '%s' "$out"
+}
+
+generate_nginx_wrapper_dir() {
+    # nginx resolves the relative `include fastcgi_params;` directive
+    # in etc/nginx-example.conf against a base directory that, in
+    # practice, ends up being the directory containing the -c file
+    # (the -p flag is supposed to set this but is overridden in
+    # current nginx versions). We can't change the example fragment
+    # — operators rely on `include fastcgi_params;` being relative
+    # because that's the canonical Debian/Ubuntu shape. So we put
+    # both the wrapper AND fastcgi_params in the same tempdir, and
+    # nginx finds the include next to the wrapper.
+    local out_dir
+    out_dir="$(mktemp -d --suffix=.phptv-nginx-validate)"
+    TMPDIRS+=("$out_dir")
+    sed "s|__REPO_ROOT__|${REPO_ROOT}|g" "$NGINX_TEMPLATE" > "$out_dir/nginx.conf"
+    if [ -f /etc/nginx/fastcgi_params ]; then
+        cp /etc/nginx/fastcgi_params "$out_dir/fastcgi_params"
+    else
+        echo "warning: /etc/nginx/fastcgi_params not present — nginx -t will fail on the relative include" >&2
+    fi
+    printf '%s' "$out_dir"
 }
 
 # ---- Individual configtests -----------------------------------------
@@ -159,18 +187,17 @@ run_nginx_configtest() {
         echo "error: nginx not on PATH — install nginx-light (apt-get install nginx-light)" >&2
         return 1
     fi
-    local wrapper
-    wrapper="$(generate_wrapper "$NGINX_TEMPLATE" nginx)"
+    local nginx_dir
+    nginx_dir="$(generate_nginx_wrapper_dir)"
+    local wrapper="$nginx_dir/nginx.conf"
 
-    # `-p /etc/nginx` so relative includes inside etc/nginx-example.conf
-    # (specifically `include fastcgi_params;`) resolve against the
-    # standard Debian/Ubuntu nginx prefix where fastcgi_params ships
-    # with the nginx-light package. The wrapper's own pid/log/access
-    # paths are absolute under /tmp/ so they're unaffected by the
-    # prefix.
-    echo ">>> running nginx -t -c ${wrapper} -p /etc/nginx" >&2
+    # `-p <tempdir>` is the prefix nginx uses for relative paths;
+    # the wrapper file and a copy of fastcgi_params both live in
+    # that tempdir, so the example fragment's
+    # `include fastcgi_params;` resolves cleanly.
+    echo ">>> running nginx -t -c ${wrapper} -p ${nginx_dir}" >&2
     local output rc
-    capture_configtest output rc nginx -t -c "$wrapper" -p /etc/nginx
+    capture_configtest output rc nginx -t -c "$wrapper" -p "$nginx_dir"
     echo ">>> nginx -t exited rc=${rc}" >&2
     if [ "$rc" -ne 0 ] || ! grep -q 'test is successful' <<<"$output"; then
         echo "error: nginx -t FAILED against etc/nginx-example.conf" >&2
