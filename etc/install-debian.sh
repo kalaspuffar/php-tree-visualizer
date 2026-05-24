@@ -11,15 +11,20 @@
 # distro-specific, the rest is shape-portable.
 #
 # Usage:
-#   sudo bash etc/install-debian.sh <public-hostname> [data-dir-owner]
+#   sudo bash etc/install-debian.sh <public-hostname> [data-dir-owner] [--proxy=apache|nginx]
 #
 # Arguments:
 #   <public-hostname>    The DNS name the vhost will serve, e.g.
 #                        visualizer.example.org. The vhost's
 #                        ServerName is set from this.
-#   [data-dir-owner]     Optional, defaults to `www-data`. The user
-#                        that will own /etc/php-tree-viz/collector.toml
-#                        and /var/lib/php-tree-viz/.
+#   [data-dir-owner]     Optional positional, defaults to `www-data`.
+#                        The user that will own
+#                        /etc/php-tree-viz/collector.toml and
+#                        /var/lib/php-tree-viz/.
+#   --proxy=<value>      Optional flag, defaults to `apache`. Selects
+#                        which reverse proxy the install deploys.
+#                        Only `apache` and `nginx` are valid; any
+#                        other value is rejected.
 #
 # Idempotency contract (re-running this script on a working install
 # is a no-op):
@@ -30,11 +35,15 @@
 #   - /etc/php-tree-viz/collector.toml is NEVER overwritten if it
 #     exists — re-running preserves the existing token + salt and
 #     does NOT invalidate active sessions.
-#   - The systemd unit and Apache vhost are overwritten from the
+#   - The systemd unit and the proxy vhost are overwritten from the
 #     tracked templates on every run. Hand-edits to either get
 #     reverted with a one-line notice. The tracked files at
-#     etc/php-tree-viz-collector.service.example and
-#     etc/apache-example.conf are the canonical source.
+#     etc/php-tree-viz-collector.service.example,
+#     etc/apache-example.conf, and etc/nginx-example.conf are the
+#     canonical source.
+#   - Switching --proxy values between runs does NOT clean up the
+#     previously-installed proxy; operators tearing down apache to
+#     switch to nginx (or vice versa) do that step manually.
 #   - The smoke test runs unconditionally on every invocation.
 #
 # Exit codes:
@@ -49,18 +58,51 @@ set -euo pipefail
 # ---------------------------------------------------------------------
 
 usage() {
-    echo "usage: sudo bash $0 <public-hostname> [data-dir-owner]" >&2
+    echo "usage: sudo bash $0 <public-hostname> [data-dir-owner] [--proxy=apache|nginx]" >&2
     echo "" >&2
     echo "  <public-hostname>    DNS name served by the vhost (required)" >&2
     echo "  [data-dir-owner]     user owning data + config (default: www-data)" >&2
+    echo "  --proxy=<value>      apache (default) or nginx" >&2
     exit 2
 }
 
-if [ "$#" -lt 1 ] || [ -z "${1-}" ]; then
+# Parse positional args and the optional --proxy= flag. We allow the
+# flag to appear at any position so an operator can write
+# `sudo bash $0 host --proxy=nginx` without remembering whether it
+# comes before or after the optional [data-dir-owner].
+HOSTNAME_ARG=""
+DATA_OWNER="www-data"
+PROXY="apache"
+for arg in "$@"; do
+    case "$arg" in
+        --proxy=apache|--proxy=nginx)
+            PROXY="${arg#--proxy=}"
+            ;;
+        --proxy=*)
+            echo "error: unrecognised --proxy value '${arg#--proxy=}' (must be apache or nginx)" >&2
+            usage
+            ;;
+        --*)
+            echo "error: unrecognised flag '$arg'" >&2
+            usage
+            ;;
+        *)
+            if [ -z "$HOSTNAME_ARG" ]; then
+                HOSTNAME_ARG="$arg"
+            elif [ "$DATA_OWNER" = "www-data" ]; then
+                # The default got set above; this is the operator's
+                # explicit override.
+                DATA_OWNER="$arg"
+            else
+                echo "error: unexpected positional argument '$arg'" >&2
+                usage
+            fi
+            ;;
+    esac
+done
+if [ -z "$HOSTNAME_ARG" ]; then
     usage
 fi
-HOSTNAME_ARG="$1"
-DATA_OWNER="${2-www-data}"
 
 # Resolve repo root from the script's location (the script lives in
 # etc/, so the repo is one level up).
@@ -74,7 +116,14 @@ CONFIG_FILE="$CONFIG_DIR/collector.toml"
 DATA_DIR="/var/lib/php-tree-viz"
 WEBROOT="/var/www/php-tree-viz"
 UNIT_PATH="/etc/systemd/system/php-tree-viz-collector.service"
-VHOST_PATH="/etc/apache2/sites-available/${HOSTNAME_ARG}.conf"
+# VHOST_PATH is per-proxy: Apache uses a .conf suffix under
+# sites-available; nginx uses bare filename. The dispatch is here so
+# the file path is named once and referenced by both branches below.
+if [ "$PROXY" = "apache" ]; then
+    VHOST_PATH="/etc/apache2/sites-available/${HOSTNAME_ARG}.conf"
+else
+    VHOST_PATH="/etc/nginx/sites-available/${HOSTNAME_ARG}"
+fi
 
 step() { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
@@ -104,10 +153,15 @@ mktemp_tracked() {
 export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 
-step "Installing apt packages"
+step "Installing apt packages (--proxy=$PROXY)"
 apt-get update -qq
+# Shared packages plus the chosen proxy. apache2 and nginx-light are
+# mutually exclusive in the script's runtime, but apt happily holds
+# both if a previous install left the other behind — operators
+# switching proxies clean that up manually.
+PROXY_PKG=$([ "$PROXY" = "apache" ] && echo apache2 || echo nginx-light)
 apt-get install -y -qq \
-    apache2 \
+    "$PROXY_PKG" \
     php8.4-fpm \
     php8.4-sqlite3 \
     libclang-dev \
@@ -115,13 +169,20 @@ apt-get install -y -qq \
     openssl
 
 # ---------------------------------------------------------------------
-# 2. Apache modules + global PHP-FPM handler
+# 2. Proxy-specific module / conf setup + global PHP-FPM handler
 # ---------------------------------------------------------------------
 
-step "Enabling Apache modules and the global PHP-FPM conf"
-a2enmod -q proxy proxy_fcgi proxy_http rewrite headers setenvif
-a2enconf -q php8.4-fpm
-systemctl reload apache2
+if [ "$PROXY" = "apache" ]; then
+    step "Enabling Apache modules and the global PHP-FPM conf"
+    a2enmod -q proxy proxy_fcgi proxy_http rewrite headers setenvif
+    a2enconf -q php8.4-fpm
+    systemctl reload apache2
+else
+    step "nginx selected — no a2enmod equivalent; nginx-light has every directive baked in"
+    # PHP-FPM serves /api/*.php directly; nginx talks to the FPM
+    # socket via fastcgi_pass in the vhost (see etc/nginx-example.conf).
+    # Nothing global to enable here.
+fi
 systemctl reload php8.4-fpm
 
 # ---------------------------------------------------------------------
@@ -212,32 +273,56 @@ systemctl daemon-reload
 systemctl enable --now php-tree-viz-collector
 
 # ---------------------------------------------------------------------
-# 7. Apache vhost
+# 7. Reverse-proxy vhost (apache OR nginx)
 # ---------------------------------------------------------------------
 
-step "Installing the Apache vhost at $VHOST_PATH"
+step "Installing the $PROXY vhost at $VHOST_PATH"
 # Generate the new vhost in a temp file first so we can cmp against
 # the deployed one and only print the "overwriting" notice when the
 # operator has hand-edited it.
 NEW_VHOST="$(mktemp_tracked)"
-{
-    echo "# Generated by install-debian.sh for $HOSTNAME_ARG."
-    echo "# Source: etc/apache-example.conf in the php-tree-visualizer repo."
-    echo "<VirtualHost *:80>"
-    echo "    ServerName $HOSTNAME_ARG"
-    echo ""
-    sed 's/^/    /' "$REPO_ROOT/etc/apache-example.conf"
-    echo "</VirtualHost>"
-} > "$NEW_VHOST"
+if [ "$PROXY" = "apache" ]; then
+    {
+        echo "# Generated by install-debian.sh for $HOSTNAME_ARG (apache)."
+        echo "# Source: etc/apache-example.conf in the php-tree-visualizer repo."
+        echo "<VirtualHost *:80>"
+        echo "    ServerName $HOSTNAME_ARG"
+        echo ""
+        sed 's/^/    /' "$REPO_ROOT/etc/apache-example.conf"
+        echo "</VirtualHost>"
+    } > "$NEW_VHOST"
+else
+    {
+        echo "# Generated by install-debian.sh for $HOSTNAME_ARG (nginx)."
+        echo "# Source: etc/nginx-example.conf in the php-tree-visualizer repo."
+        echo "server {"
+        echo "    listen 80;"
+        echo "    server_name $HOSTNAME_ARG;"
+        echo "    root /var/www/php-tree-viz;"
+        echo ""
+        sed 's/^/    /' "$REPO_ROOT/etc/nginx-example.conf"
+        echo "}"
+    } > "$NEW_VHOST"
+fi
 if [ -f "$VHOST_PATH" ] && ! cmp -s "$NEW_VHOST" "$VHOST_PATH"; then
-    note "overwriting hand-edited vhost (the tracked apache-example.conf is source of truth)"
+    note "overwriting hand-edited vhost (the tracked $PROXY-example.conf is source of truth)"
 fi
 install -o root -g root -m 0644 "$NEW_VHOST" "$VHOST_PATH"
 
-a2dissite -q 000-default >/dev/null 2>&1 || true
-a2ensite -q "$HOSTNAME_ARG"
-apache2ctl configtest 2>&1 | tail -1
-systemctl reload apache2
+if [ "$PROXY" = "apache" ]; then
+    a2dissite -q 000-default >/dev/null 2>&1 || true
+    a2ensite -q "$HOSTNAME_ARG"
+    apache2ctl configtest 2>&1 | tail -1
+    systemctl reload apache2
+else
+    # Debian's nginx-light ships a `sites-enabled/default` symlink to
+    # `sites-available/default`. Remove it so our vhost owns :80
+    # without competing with the placeholder welcome page.
+    rm -f /etc/nginx/sites-enabled/default
+    ln -snf "$VHOST_PATH" "/etc/nginx/sites-enabled/${HOSTNAME_ARG}"
+    nginx -t
+    systemctl reload nginx
+fi
 
 # ---------------------------------------------------------------------
 # 8. Smoke test
@@ -247,7 +332,11 @@ step "Smoke test — POST probe, wait for finalize, list traces"
 
 # Verify both services are active.
 systemctl is-active --quiet php-tree-viz-collector || fail "collector is not active"
-systemctl is-active --quiet apache2 || fail "apache2 is not active"
+if [ "$PROXY" = "apache" ]; then
+    systemctl is-active --quiet apache2 || fail "apache2 is not active"
+else
+    systemctl is-active --quiet nginx || fail "nginx is not active"
+fi
 
 # Read the bearer token from the config (group-readable via www-data;
 # this script runs as root so it can read regardless).
@@ -300,8 +389,13 @@ echo "  - browse http://${HOSTNAME_ARG}/viz/login.html"
 echo "  - sign in with the token from $CONFIG_FILE"
 echo "  - point your php-analyze extension at http://127.0.0.1:8088/ingest/v1"
 echo "    (or via the public vhost at http://${HOSTNAME_ARG}/ingest/v1)"
-echo "  - for TLS: sudo apt-get install -y certbot python3-certbot-apache &&"
-echo "             sudo certbot --apache -d ${HOSTNAME_ARG}"
+if [ "$PROXY" = "apache" ]; then
+    echo "  - for TLS: sudo apt-get install -y certbot python3-certbot-apache &&"
+    echo "             sudo certbot --apache -d ${HOSTNAME_ARG}"
+else
+    echo "  - for TLS: sudo apt-get install -y certbot python3-certbot-nginx &&"
+    echo "             sudo certbot --nginx -d ${HOSTNAME_ARG}"
+fi
 
 exit 0
 
