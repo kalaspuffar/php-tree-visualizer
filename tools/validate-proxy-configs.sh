@@ -84,6 +84,13 @@ NGINX_TEMPLATE="$REPO_ROOT/etc/nginx-validate.conf.in"
 TMPFILES=()
 TMPDIRS=()
 cleanup_tmpfiles() {
+    # Snapshot the exit code BEFORE doing anything else — `set +e`
+    # below would otherwise let later commands stomp $? before we
+    # have a chance to record it. Disable set -e for the body so a
+    # surprise rm/test failure can't turn a clean run into a 1.
+    local entry_rc=$?
+    set +e
+    echo ">>> trap firing, captured exit rc=${entry_rc}" >&2
     local f
     for f in "${TMPFILES[@]:-}"; do
         [ -n "$f" ] && rm -f "$f"
@@ -92,6 +99,11 @@ cleanup_tmpfiles() {
     for d in "${TMPDIRS[@]:-}"; do
         [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
     done
+    echo ">>> trap done, exiting with rc=${entry_rc}" >&2
+    # Re-exit with the snapshotted code. Without this, certain
+    # bash versions let the trap's own last-command rc override
+    # what the main body returned.
+    exit "$entry_rc"
 }
 trap cleanup_tmpfiles EXIT
 
@@ -211,8 +223,16 @@ run_nginx_configtest() {
 
 # ---- Dispatch --------------------------------------------------------
 
+# Run with set +e so a failed configtest goes to the diagnostic
+# block (it already does — but suspending set -e here makes the
+# control flow explicit and prevents future surprises where set
+# -e + && interactions silently abort the script).
+set +e
 case "$PROXY" in
     apache) run_apache_configtest ;;
     nginx)  run_nginx_configtest ;;
     both)   run_apache_configtest && run_nginx_configtest ;;
 esac
+final_rc=$?
+echo ">>> main body done, final_rc=${final_rc}" >&2
+exit "$final_rc"
