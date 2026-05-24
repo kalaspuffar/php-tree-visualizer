@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!--
+    Content-Security-Policy: tight by design (no inline scripts, no
+    inline styles, no remote anything). Mirrored at the proxy header
+    layer when the operator wants belt+suspenders.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+
+  <title>PHP Tree Visualizer — Sign in</title>
+  <link rel="stylesheet" href="/viz/assets/styles.css">
+</head>
+<body class="login-page">
+
+  <main>
+    <section class="card login-card" aria-labelledby="login-title">
+
+      <h1 id="login-title" class="display login-title">PHP Tree Visualizer</h1>
+
+      <div id="login-banner" class="banner banner--danger login-banner" role="alert" hidden>
+        <svg class="banner__icon" aria-hidden="true">
+          <use href="/viz/assets/icons.svg#icon-alert-circle"/>
+        </svg>
+        <span id="login-banner-text"></span>
+      </div>
+
+      <form id="login-form" novalidate>
+        <label for="login-token" class="micro login-label">Access token</label>
+        <input
+          id="login-token"
+          name="token"
+          type="password"
+          autocomplete="current-password"
+          required
+          autofocus
+          placeholder="paste your token"
+          class="login-input"
+        >
+        <button id="login-submit" type="submit" class="button login-submit body-strong">
+          <svg id="login-submit-icon" class="icon" aria-hidden="true" hidden>
+            <use href="/viz/assets/icons.svg#icon-loader"/>
+          </svg>
+          <span id="login-submit-label">Sign in</span>
+        </button>
+      </form>
+
+      <p class="small login-hint">
+        This profiler is for the local team only. Ask the operator for the token.
+      </p>
+
+    </section>
+  </main>
+
+  <script type="module" src="/viz/js/login.js"></script>
+</body>
+</html>
