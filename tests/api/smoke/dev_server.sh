@@ -132,6 +132,10 @@ cat <<EOF
 │   a real call tree. Clicking that row lands on the           │
 │   trace-detail view; the other two 404 (no per-trace file). │
 │                                                              │
+│   Detail page supports: click column headers / dropdown to   │
+│   sort; type in the search box (or press /) to find rows;   │
+│   ↓↑→← / Home/End / PgUp/PgDn for keyboard navigation.       │
+│                                                              │
 │   Press Ctrl-C to shut down + clean up the temp fixture.     │
 │                                                              │
 ╰──────────────────────────────────────────────────────────────╯

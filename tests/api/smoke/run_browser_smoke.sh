@@ -128,7 +128,7 @@ grep -q 'id="icon-search"' "$TMP/icons.svg" || fail "icons.svg doesn't contain i
 ok "icons.svg serves as image/svg+xml with the documented symbols"
 
 # 4-5) every JS module + the trace-detail HTML page serve.
-for path in /viz/js/login.js /viz/js/list.js /viz/js/api-client.js /viz/js/time.js /viz/js/debounce.js /viz/js/detail.js /viz/js/virtualizer.js /viz/js/tree-row.js; do
+for path in /viz/js/login.js /viz/js/list.js /viz/js/api-client.js /viz/js/time.js /viz/js/debounce.js /viz/js/detail.js /viz/js/virtualizer.js /viz/js/tree-row.js /viz/js/search.js /viz/js/tooltip.js /viz/js/keyboard.js; do
     S=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$path")
     [[ "$S" == "200" ]] || fail "$path status $S"
 done
@@ -141,7 +141,10 @@ grep -q 'Content-Security-Policy'   "$TRACE_HTML"  || fail "no CSP meta on trace
 grep -q '<script type="module"'      "$TRACE_HTML"  || fail "no module script on trace.html"
 grep -q 'role="tree"'                "$TRACE_HTML"  || fail "no role=tree container on trace.html"
 grep -q 'class="column-header"'      "$TRACE_HTML"  || fail "no column header on trace.html"
-ok "trace.html serves with CSP + module script + tree container"
+grep -q 'id="tree-search-input"'     "$TRACE_HTML"  || fail "no search input on trace.html"
+grep -q 'id="sort-trigger"'          "$TRACE_HTML"  || fail "no sort trigger on trace.html"
+grep -q "style-src-attr 'unsafe-inline'" "$TRACE_HTML" || fail "CSP missing style-src-attr"
+ok "trace.html serves with CSP + module script + tree container + search + sort"
 
 # 6) login the API.
 LOGIN_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
