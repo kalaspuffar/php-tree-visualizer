@@ -10,16 +10,6 @@
 # /etc/systemd/system/. The `etc/install-debian.sh` script handles
 # the copy + enable; manual operators do it themselves.
 #
-# --- Type=simple, not Type=notify ---
-#
-# SPECIFICATION.md §3.6 specifies `Type=notify`, but the collector
-# binary does not currently call `sd_notify(READY=1)` after binding
-# its listener. A `Type=notify` unit would time out waiting for the
-# notification, then fail. A future follow-up change
-# (`collector-sd-notify`) will add the sd_notify call to the binary
-# and this unit can flip to `Type=notify` then. Until then,
-# `Type=simple` works.
-#
 # --- UMask=0007 ---
 #
 # SQLite WAL mode requires shared readers (the PHP API runs as the
@@ -28,7 +18,9 @@
 # blocks the PHP API. `UMask=0007` makes the collector create files
 # at 0660 instead. The data dir under /var/lib/php-tree-viz/ should
 # be 2770 (setgid) so new files inherit the www-data group; the
-# install script sets that.
+# install script sets that. See SPECIFICATION.md §3.5 for the full
+# perm model — UMask=0007 here is co-owned with the file modes
+# documented there.
 #
 # --- ExecStart is unquoted ---
 #
@@ -45,7 +37,12 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# Requires the collector binary to implement sd_notify(READY=1) —
+# see the `collector-http` capability's "signals systemd readiness"
+# requirement. The binary sends READY=1 once its listener is bound;
+# systemd flips the unit's state from `activating` to `active` at
+# that point.
+Type=notify
 User=www-data
 Group=www-data
 UMask=0007

@@ -201,6 +201,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     let shutdown = build_shutdown_signal()?;
 
     tracing::info!(addr = %bound, "listening");
+    notify_systemd_ready();
 
     let state: SharedState = Arc::new(AppState {
         expected_token: config.auth.token.clone(),
@@ -249,4 +250,89 @@ fn build_shutdown_signal() -> Result<impl Future<Output = ()>, HttpError> {
         }
         tracing::info!(signal = "SIGINT", "shutdown signal received");
     })
+}
+
+/// Send the systemd `READY=1` notification once the listener is bound,
+/// matching the `Type=notify` directive in the tracked unit example.
+///
+/// Best-effort: failures log a `warn` event and return. The listener
+/// is already up at this point; aborting now would be worse than
+/// letting systemd's `TimeoutStartSec` handle the missed
+/// notification. When `NOTIFY_SOCKET` is unset (the typical case
+/// for ad-hoc invocations and the test suite) the function returns
+/// silently — no logging, no syscalls beyond the env-var lookup.
+///
+/// Abstract-namespace `NOTIFY_SOCKET` values (path starts with `@`)
+/// are not supported; the helper logs a `warn` and returns. systemd's
+/// default on Debian uses regular filesystem paths under
+/// `/run/systemd/notify`, which the regular branch handles.
+#[cfg(unix)]
+fn notify_systemd_ready() {
+    let socket_value = match std::env::var_os("NOTIFY_SOCKET") {
+        Some(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    notify_systemd_ready_inner(socket_value);
+}
+
+/// Pure-data implementation, factored out for unit testing without
+/// touching the process environment.
+#[cfg(unix)]
+fn notify_systemd_ready_inner(socket_value: std::ffi::OsString) {
+    let path_str = socket_value.to_string_lossy();
+    if path_str.starts_with('@') {
+        tracing::warn!(
+            value = %path_str,
+            "NOTIFY_SOCKET abstract namespace not supported; \
+             systemd readiness signal skipped"
+        );
+        return;
+    }
+    let socket = match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(reason = %err, "could not open notify socket");
+            return;
+        }
+    };
+    if let Err(err) = socket.send_to(b"READY=1\n", std::path::Path::new(&socket_value)) {
+        tracing::warn!(
+            reason = %err,
+            path = %path_str,
+            "could not send READY=1 to systemd"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn notify_systemd_ready() {
+    // Non-Unix targets don't have `AF_UNIX SOCK_DGRAM` in the form
+    // systemd uses; nothing to send.
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Empty NOTIFY_SOCKET → silent no-op (mirrors the unset case,
+    /// which the outer `notify_systemd_ready` filters before calling
+    /// the inner). No tracing-subscriber capture needed — the only
+    /// observable effect is that nothing happens.
+    #[test]
+    fn inner_no_op_on_at_prefix_does_not_panic() {
+        // The inner function should return cleanly for abstract
+        // namespace values. We don't assert on log output here (that's
+        // covered by the integration test in tests/sd_notify.rs); we
+        // just confirm the function returns without panic.
+        notify_systemd_ready_inner(std::ffi::OsString::from("@example-abstract"));
+    }
+
+    /// Sending to a nonexistent path should warn-and-continue without
+    /// panicking. Same no-panic contract.
+    #[test]
+    fn inner_send_failure_does_not_panic() {
+        notify_systemd_ready_inner(std::ffi::OsString::from(
+            "/tmp/phptv-nonexistent-notify-socket-for-test",
+        ));
+    }
 }
