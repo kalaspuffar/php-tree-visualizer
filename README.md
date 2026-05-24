@@ -60,10 +60,12 @@ On a freshly-imaged Debian 13 box, every step in the rest of this Quickstart is 
 ```bash
 git clone https://github.com/kalaspuffar/php-tree-visualizer.git
 cd php-tree-visualizer
-sudo bash etc/install-debian.sh <your-hostname>
+sudo bash etc/install-debian.sh <your-hostname>                  # Apache (default)
+# or
+sudo bash etc/install-debian.sh <your-hostname> --proxy=nginx    # nginx
 ```
 
-The script installs apt packages, enables Apache modules, builds the collector, deploys the config + systemd unit + vhost, starts everything, and runs a smoke test that POSTs a probe batch and confirms it lands in `/api/traces`. Re-running on a working install is a no-op — secrets are preserved, packages are skipped, the vhost is overwritten from the tracked template.
+The script installs apt packages, builds the collector, deploys the config + systemd unit + reverse-proxy vhost, starts everything, and runs a smoke test that POSTs a probe batch and confirms it lands in `/api/traces`. The reverse proxy is `apache` by default; pass `--proxy=nginx` to install nginx instead. Re-running on a working install is a no-op — secrets are preserved, packages are skipped, the vhost is overwritten from the tracked template.
 
 The script is Debian-13-only; the hand-curated steps below describe what it does, in case you're on a different distro or want to understand the deployment shape before you trust the script.
 
@@ -140,14 +142,14 @@ The example config defaults to `log.format = "json"` — the [Expected output](#
 
 ### 5. Front it with Apache or nginx
 
-The collector binds to localhost only. The web stack (PHP API + static frontend) sits behind your existing reverse proxy. Paste the snippet that matches your proxy into the vhost that already fronts PHP-FPM:
+The collector binds to localhost only. The web stack (PHP API + static frontend) sits behind your existing reverse proxy. Pick whichever you already run (or apt-install fresh):
 
 - Apache: [`etc/apache-example.conf`](./etc/apache-example.conf)
 - nginx: [`etc/nginx-example.conf`](./etc/nginx-example.conf)
 
-Both snippets map `/api/*` to the PHP files in [`api/`](./api/) and `/viz/*` to the static frontend in [`viz/`](./viz/). They also refuse `/api/internal/*` (those are PHP includes, never HTTP-reachable). The Apache snippet additionally proxies `/ingest/v1` to the collector on `127.0.0.1:8088` and redirects `/` to `/viz/login.html`.
+Both snippets cover the same routes: `/` redirects to `/viz/login.html`; `/api/*` rewrites to the PHP handlers in [`api/`](./api/); `/api/internal/*` is denied (those are PHP includes, never HTTP-reachable); `/viz/*` serves the static frontend in [`viz/`](./viz/) with `X-Content-Type-Options` + `Referrer-Policy`; `/ingest/v1` reverse-proxies to the collector on `127.0.0.1:8088`. The snippets are *fragments* — paste them inside an existing vhost on your machine, or let `etc/install-debian.sh` wrap them into a complete vhost for you.
 
-For Apache, enable the full set of modules the snippet uses **before** you reload — note that `a2enmod proxy_fcgi` does NOT auto-enable `proxy` or `proxy_http`; you have to name them all:
+**For Apache**, enable the full set of modules the snippet uses **before** you reload — note that `a2enmod proxy_fcgi` does NOT auto-enable `proxy` or `proxy_http`; you have to name them all:
 
 ```bash
 sudo a2enmod proxy proxy_fcgi proxy_http rewrite headers
@@ -155,13 +157,19 @@ sudo a2enconf php8.4-fpm
 sudo systemctl reload apache2
 ```
 
-A few more things worth checking before reloading:
+**For nginx**, apt-installing `nginx-light` is sufficient — every directive the snippet uses ships in the base package. There is no `a2enmod` equivalent step; just paste the snippet and reload:
+
+```bash
+sudo systemctl reload nginx
+```
+
+A few more things worth checking before reloading either proxy:
 
 - **`pdo_sqlite` MUST be loaded in the PHP-FPM build** that handles `/api/*.php`. On Debian this is `php8.4-sqlite3` (named in the Prerequisites apt one-liner above). Verify with `php-fpm8.4 -m | grep pdo_sqlite` — if it returns nothing, the API will 500 on every `/api/*` request.
-- **If you symlink `/var/www/<your-site>/{api,viz}` to this repo's `api/` and `viz/` directories** (rather than copying them), Apache 2.4 requires `Options +FollowSymLinks` inside the relevant `<Directory>` block. The example snippet explains this in its leading comments.
-- **If the symlink target sits inside your home directory** (`/home/$USER/...`), make sure `www-data` can traverse it. Debian's default `/home/$USER` is mode `0700`; widen it to `0701` (`chmod o+x /home/$USER`) or move the files into a www-data-readable path. Mode `0701` keeps your files private from other users while letting daemons enter to follow symlinks.
+- **If you symlink `/var/www/<your-site>/{api,viz}` to this repo's `api/` and `viz/` directories** (rather than copying them), Apache 2.4 requires `Options +FollowSymLinks` inside the relevant `<Directory>` block. The Apache example snippet explains this in its leading comments. nginx follows symlinks by default — no extra directive needed.
+- **If the symlink target sits inside your home directory** (`/home/$USER/...`), make sure `www-data` can traverse it. Debian's default `/home/$USER` is mode `0700`; widen it to `0701` (`chmod o+x /home/$USER`) or move the files into a www-data-readable path. Mode `0701` keeps your files private from other users while letting daemons enter to follow symlinks. (Same constraint applies to both proxies — it's a filesystem-perm issue, not a proxy-config one.)
 
-Reload the reverse proxy after editing the config (the `systemctl reload apache2` above does it).
+Reload the reverse proxy after editing the config (the `systemctl reload …` above does it).
 
 ### 6. Send a probe batch
 
