@@ -74,11 +74,17 @@ document.addEventListener("DOMContentLoaded", () => {
     els.metadataStrip    = $("metadata-strip");
     els.bannerZone       = $("banner-zone");
     els.errorBanner      = $("error-banner");
-    els.emptyState       = $("empty-state");
     els.treeWrapper      = $("tree-wrapper");
     els.treeViewport     = $("tree-viewport");
     els.treeSpacer       = $("tree-spacer");
     els.treeRows         = $("tree-rows");
+    els.treeEmpty        = $("tree-empty");
+    els.treeEmptyTitle   = els.treeEmpty
+        ? els.treeEmpty.querySelector(".tree-empty__title")
+        : null;
+    els.treeEmptyBody    = els.treeEmpty
+        ? els.treeEmpty.querySelector(".tree-empty__body")
+        : null;
     els.copyModal        = $("copy-modal");
     els.copyModalInput   = $("copy-modal-input");
     els.copyModalClose   = $("copy-modal-close");
@@ -860,17 +866,26 @@ function closeCopyModal() {
 
 // ---- Empty + error states (6a) -----------------------------------
 
+// Renders an inline empty-state message inside the tree zone — a
+// small text-only block below the column header, replacing the
+// loading skeleton (or the populated tree, in the no-rows path).
+// The header chrome (breadcrumb, search bar, sort dropdown, column
+// header) stays visible so the page feels continuous; only the
+// scrollable viewport is swapped for the message.
+//
+// Defaults match the "Trace not found" 404 case. Callers pass
+// explicit title + body for other paths (e.g., "No calls recorded.").
 function showEmptyState(title, body) {
-    els.treeWrapper.hidden = true;
-    els.emptyState.hidden = false;
-    if (title) {
-        const titleEl = els.emptyState.querySelector(".empty-state__title");
-        if (titleEl) titleEl.textContent = title;
+    if (!els.treeEmpty) return;
+    if (els.treeEmptyTitle) {
+        els.treeEmptyTitle.textContent = title || "Trace not found.";
     }
-    if (body) {
-        const bodyEl = els.emptyState.querySelector(".empty-state__body");
-        if (bodyEl) bodyEl.textContent = body;
+    if (els.treeEmptyBody) {
+        els.treeEmptyBody.textContent =
+            body || "It may have been pruned. Default retention is 30 days.";
     }
+    els.treeViewport.hidden = true;
+    els.treeEmpty.hidden = false;
 }
 
 function showErrorBanner(message) {

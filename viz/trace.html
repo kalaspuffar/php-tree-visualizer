@@ -44,22 +44,6 @@
   <main class="trace-body">
     <div id="error-banner" class="banner banner--danger" hidden></div>
 
-    <div id="empty-state" class="empty-state" hidden>
-      <svg class="empty-state__illustration" viewBox="0 0 96 96" fill="none"
-           stroke="currentColor" stroke-width="2"
-           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M14 48a18 18 0 1 1 36 0"/>
-        <path d="M48 30v18l8 4"/>
-        <path d="m60 60 22 22"/>
-        <path d="M68 60h14v14"/>
-      </svg>
-      <h2 class="h2 empty-state__title">Trace not found.</h2>
-      <p class="body empty-state__body">
-        It may have been pruned. Default retention is 30 days.
-      </p>
-      <a href="/viz/index.html" class="button button--text">← Back to traces</a>
-    </div>
-
     <div id="tree-wrapper" class="tree-wrapper">
 
       <div class="tree-search" role="search">
@@ -164,6 +148,16 @@
             <div class="skeleton-row__block" style="width: 35%"></div>
           </li>
         </ul>
+      </div>
+
+      <!-- Inline empty state. Sibling of tree-viewport; detail.js
+           swaps the two (one visible at a time) on client-side key
+           validation failure or an API 404. See the
+           frontend-trace-detail-core capability's "404 renders the
+           Trace not found empty state" requirement. -->
+      <div id="tree-empty" class="tree-empty" hidden>
+        <p class="tree-empty__title"></p>
+        <p class="tree-empty__body"></p>
       </div>
     </div>
 
