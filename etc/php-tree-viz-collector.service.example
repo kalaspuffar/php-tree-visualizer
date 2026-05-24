@@ -1,0 +1,65 @@
+# /etc/php-tree-viz-collector.service.example
+#
+# Working systemd unit shape for the collector. Copy this file to
+#   /etc/systemd/system/php-tree-viz-collector.service
+# then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now php-tree-viz-collector
+#
+# This file is the example. The operator's deployed file is at
+# /etc/systemd/system/. The `etc/install-debian.sh` script handles
+# the copy + enable; manual operators do it themselves.
+#
+# --- Type=simple, not Type=notify ---
+#
+# SPECIFICATION.md §3.6 specifies `Type=notify`, but the collector
+# binary does not currently call `sd_notify(READY=1)` after binding
+# its listener. A `Type=notify` unit would time out waiting for the
+# notification, then fail. A future follow-up change
+# (`collector-sd-notify`) will add the sd_notify call to the binary
+# and this unit can flip to `Type=notify` then. Until then,
+# `Type=simple` works.
+#
+# --- UMask=0007 ---
+#
+# SQLite WAL mode requires shared readers (the PHP API runs as the
+# same `www-data` group) to update the `*-shm` file. Files written
+# at the default umask 0022 are mode 0644 (no group-write), which
+# blocks the PHP API. `UMask=0007` makes the collector create files
+# at 0660 instead. The data dir under /var/lib/php-tree-viz/ should
+# be 2770 (setgid) so new files inherit the www-data group; the
+# install script sets that.
+#
+# --- ExecStart is unquoted ---
+#
+# systemd parses POSIX-shell-style quoting in ExecStart. Quoting the
+# whole command (`ExecStart='/usr/local/bin/foo --arg'`) makes
+# systemd look for a literal executable whose name contains a space.
+# Leave the line unquoted; systemd splits on the whitespace between
+# the path and `--config`.
+
+[Unit]
+Description=PHP-analyze profiling tree collector
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+UMask=0007
+ExecStart=/usr/local/bin/php-tree-viz-collector --config /etc/php-tree-viz/collector.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening (per SPECIFICATION.md §3.6).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/php-tree-viz
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
