@@ -880,17 +880,19 @@ Three governing rules:
 ### 3.5 Filesystem layout
 
 ```
-/var/lib/php-tree-viz/        owned by collector user (e.g., phptv:phptv 0750)
-├── index.sqlite              0640
-├── index.sqlite-wal          (managed by SQLite)
-├── index.sqlite-shm          (managed by SQLite)
-├── traces/
-│   └── <trace_key>.sqlite    0640 — created by collector, read by PHP
-│   └── <trace_key>.raw/      0750 — raw batches, append-only during ingest
+/var/lib/php-tree-viz/        owned by collector user (e.g., phptv:phptv 2770)
+├── index.sqlite              0660
+├── index.sqlite-wal          0660 (managed by SQLite)
+├── index.sqlite-shm          0660 (managed by SQLite)
+├── traces/                   2770 — setgid; new files inherit the group
+│   └── <trace_key>.sqlite    0660 — created by collector, read+written by PHP
+│   └── <trace_key>.sqlite-wal 0660 (managed by SQLite)
+│   └── <trace_key>.sqlite-shm 0660 (managed by SQLite)
+│   └── <trace_key>.raw/      2770 — raw batches, append-only during ingest
 │       ├── batch-0001.msgpack
 │       ├── batch-0002.msgpack
 │       └── ...
-└── tmp/                      0700 — in-flight uploads; cleaned at startup
+└── tmp/                      2770 — in-flight uploads; cleaned at startup
 
 /etc/php-tree-viz/
 └── collector.toml            0640 — root:phptv ownership; contains the bearer token
@@ -899,14 +901,38 @@ Three governing rules:
 └── collector.log             (or journald, depending on systemd unit)
 ```
 
-**Group `phptv` membership:**
+**Why `0660` and `2770`, not `0640` and `0750`:** SQLite operates in
+WAL mode and **every concurrent connection** — including read-only
+opens by the PHP API — has to update the `*-shm` file to maintain
+the wal-index reader counter. "Read-only via the group bit" perms
+(`0640`) cause the API to fail with `SQLITE_READONLY: attempt to
+write a readonly database` on any per-trace endpoint. The data
+directory is therefore mode `2770` (setgid so new files inherit the
+shared group), the collector runs with `UMask=0007` (see § 3.6), and
+files inside the directory land at `0660` — group-readable AND
+group-writable. World access stays denied. The bearer-token gate
+at the HTTP edge is the access boundary, not the file mode bits.
 
-- `phptv` (the collector user) — owns and writes everything under `/var/lib/php-tree-viz/`.
-- `www-data` (or whatever PHP-FPM runs as) — added to `phptv` group; reads (only) via the 0640 mode bits.
+**Shared-group membership:**
+
+- The collector user (canonically `phptv` for a dedicated-user
+  production deployment, or `www-data` for the single-user
+  convention the `etc/install-debian.sh` script uses) — owns and
+  writes everything under `/var/lib/php-tree-viz/`.
+- The PHP-FPM user (typically `www-data`) — a member of the shared
+  group; reads AND writes within the data directory via the `0660`
+  / `2770` mode bits. The "writes" are only the SQLite-WAL state
+  updates SQLite makes on every reader connection; the PHP API
+  code itself never explicitly issues writes (INV-8).
 
 **Acceptance criteria:**
 
-- AC-3.5.1 — `www-data` can `SELECT` from `index.sqlite` and from `traces/*.sqlite`. It cannot create files in `/var/lib/php-tree-viz/`.
+- AC-3.5.1 — `www-data` can `SELECT` from `index.sqlite` and from
+  `traces/*.sqlite`. The access boundary protecting the data is the
+  loopback-only HTTP gate plus the data directory's shared-group
+  membership, not the file mode bits. SQLite's WAL-mode reader-counter
+  update on the `*-shm` file is the only write the PHP API user
+  performs on the data dir.
 - AC-3.5.2 — `<trace_key>.raw/` filenames sort lexicographically by arrival order (4-digit zero-padded counter rolls over at 9999 with a documented behavior — see § 4.4.2).
 
 ### 3.6 systemd unit
@@ -923,6 +949,10 @@ StartLimitBurst=5
 Type=notify
 User=phptv
 Group=phptv
+# Files written by the collector land at 0660 so shared-group readers
+# (the PHP API) can update SQLite WAL/SHM. Co-owned with § 3.5's
+# file modes — any change here MUST also update § 3.5.
+UMask=0007
 ExecStart=/usr/local/bin/php-tree-viz-collector --config /etc/php-tree-viz/collector.toml
 Restart=on-failure
 RestartSec=5
