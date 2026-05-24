@@ -12,6 +12,11 @@ session_salt = "REPLACE_ME_TOO"    # base64url, ≥32 bytes, distinct from token
 [storage]
 data_dir = "/var/lib/php-tree-viz"
 retention_days = 30
+# disk_capacity_bytes = 53687091200 # 50 GiB — reference denominator
+                                    # for the disk-usage gauge's
+                                    # `over_threshold` field. Omit to
+                                    # leave the threshold disabled
+                                    # (the gauge still reports usage).
 
 [finalize]
 idle_seconds = 30                  # trace marked finalized after this much silence
@@ -23,3 +28,10 @@ tick_minutes = 60
 [log]
 level = "info"
 format = "json"                    # or "text"
+
+[observability]
+disk_usage_tick_seconds = 3600     # one hour
+disk_usage_warn_pct = 80           # 1..=100; gauge emits at warn level
+                                   # when data_dir_bytes is at or above
+                                   # this percentage of disk_capacity_bytes
+                                   # (no-op when disk_capacity_bytes is unset)

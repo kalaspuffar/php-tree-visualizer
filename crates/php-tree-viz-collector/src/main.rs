@@ -1,33 +1,29 @@
 //! The collector binary.
 //!
-//! Load the TOML config, then bind an HTTP listener and serve until
-//! SIGTERM / SIGINT. Exit codes:
+//! Load the TOML config, install the tracing subscriber, then bind an
+//! HTTP listener and serve until SIGTERM / SIGINT. Exit codes:
 //!
 //! - `0` — clean shutdown.
 //! - `1` — reserved for the Rust panic default.
 //! - `2` — configuration problem (bad CLI args, file unreadable,
 //!   parse error, validation failure).
-//! - `3` — HTTP / bind error.
-
-mod config;
-mod finalize;
-mod http;
-mod retention;
-mod storage;
-mod tracekey;
-mod wire;
+//! - `3` — HTTP / bind / storage / subscriber-install error.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use crate::config::{load_from_path, Config, ConfigError};
+use php_tree_viz_collector::config::{load_from_path, ConfigError};
+use php_tree_viz_collector::{http, observability};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let path = match parse_args(&args) {
         Ok(p) => p,
         Err(err) => {
+            // Pre-subscriber: write straight to stderr. The
+            // subscriber isn't installed yet, so we can't route
+            // through tracing.
             eprintln!("config error: {err}");
             return ExitCode::from(2);
         }
@@ -39,7 +35,27 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    print_startup_summary(&path, &cfg);
+
+    // Install the subscriber before anything that could log.
+    // Subscriber-install failure exits status 3 with a single stderr
+    // line — same family as bind / storage failures.
+    if let Err(err) = observability::install_subscriber(&cfg.log) {
+        eprintln!("observability error: {err}");
+        return ExitCode::from(3);
+    }
+
+    tracing::info!(
+        target: "config",
+        path = %path.display(),
+        bind = %cfg.server.bind,
+        data_dir = %cfg.storage.data_dir.display(),
+        retention_days = cfg.storage.retention_days,
+        queue_capacity = cfg.server.queue_capacity,
+        max_body_bytes = cfg.server.max_body_bytes,
+        log_level = %cfg.log.level,
+        log_format = %cfg.log.format,
+        "configuration loaded"
+    );
 
     // Build a multi-thread runtime; bring axum up; serve until signal.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -48,7 +64,7 @@ fn main() -> ExitCode {
     {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("http error: could not start tokio runtime: {err}");
+            tracing::error!(reason = %err, "could not start tokio runtime");
             return ExitCode::from(3);
         }
     };
@@ -56,29 +72,10 @@ fn main() -> ExitCode {
     match runtime.block_on(http::run(Arc::new(cfg))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("http error: {err}");
+            tracing::error!(reason = %err, "http server failed");
             ExitCode::from(3)
         }
     }
-}
-
-fn print_startup_summary(path: &std::path::Path, cfg: &Config) {
-    // Same redacted summary as before — secrets pass through their
-    // Display impls (`***`). This is the operator's startup banner.
-    println!(
-        "loaded config from {}: bind={} data_dir={} retention={}d \
-         queue_capacity={} max_body_bytes={} log={}/{} token={} salt={}",
-        path.display(),
-        cfg.server.bind,
-        cfg.storage.data_dir.display(),
-        cfg.storage.retention_days,
-        cfg.server.queue_capacity,
-        cfg.server.max_body_bytes,
-        cfg.log.level,
-        cfg.log.format,
-        cfg.auth.token,
-        cfg.auth.session_salt,
-    );
 }
 
 /// Hand-rolled CLI parser. Recognises exactly one flag: `--config

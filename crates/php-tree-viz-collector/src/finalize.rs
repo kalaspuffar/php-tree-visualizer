@@ -56,25 +56,28 @@ async fn run_one_tick(storage: &Mutex<Storage>, idle_nanos: i64) {
             // The query failed before any per-trace work happened.
             // Log and yield — the next tick retries; nothing is left
             // half-done.
-            eprintln!("finalize: list query failed: {err}");
+            tracing::warn!(reason = %err, "finalize list query failed");
             return;
         }
     };
     for key in idle {
         match storage.finalize_trace(&key, now_ns) {
             Ok(outcome) => {
-                println!(
-                    "finalized trace trace_key={} pending_dq2={} cpu_snapshot_available={}",
-                    key,
-                    outcome.pending_dq2,
-                    i64::from(outcome.cpu_snapshot_available),
+                tracing::info!(
+                    trace_key = %key,
+                    pending_dq2 = outcome.pending_dq2,
+                    cpu_snapshot_available = outcome.cpu_snapshot_available,
+                    "trace finalized"
                 );
             }
             Err(err) => {
                 // One trace's failure doesn't kill the loop or the
-                // tick. Surface it on stderr and move on to the
-                // next idle trace.
-                eprintln!("finalize: {err} trace_key={key}");
+                // tick. Surface it and move on to the next idle trace.
+                tracing::warn!(
+                    reason = %err,
+                    trace_key = %key,
+                    "finalize failure"
+                );
             }
         }
     }

@@ -17,6 +17,28 @@ const TOKEN: &str = "PHPTVTESTTOKEN1234567890ABCDEFGH1234567890";
 const SALT: &str = "PHPTVTESTSALT0987654321ZYXWVUTSR0987654321";
 const MEDIA_TYPE: &str = "application/vnd.php-analyze.v1+msgpack";
 
+/// Find the value of a `field=value` pair in a tracing-subscriber
+/// text-mode log line. The fmt layer emits field values via their
+/// `Display` impl with no quoting, so the value extends from `=` to
+/// the next whitespace (or end of line). Returns `None` if the field
+/// isn't present.
+fn extract_field(line: &str, field: &str) -> Option<String> {
+    let needle = format!(" {field}=");
+    let pos = line.find(&needle)?;
+    let value_start = pos + needle.len();
+    let tail = &line[value_start..];
+    let value_end = tail.find(|c: char| c.is_whitespace()).unwrap_or(tail.len());
+    Some(tail[..value_end].to_owned())
+}
+
+/// Substring constants for the new structured event messages.
+/// Update here, not at call sites — every test that synchronises on
+/// a particular collector event uses one of these.
+const EVENT_BATCH_ACCEPTED: &str = "batch accepted";
+const EVENT_TRACE_FINALIZED: &str = "trace finalized";
+const EVENT_RETENTION_SWEPT: &str = "retention swept";
+const EVENT_CONFIG_LOADED: &str = "configuration loaded";
+
 fn unique_tempdir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -33,6 +55,14 @@ fn unique_tempdir(label: &str) -> PathBuf {
 fn write_config(dir: &Path, bind: &str) -> PathBuf {
     write_config_with_overrides(dir, bind, dir.join("data").to_str().unwrap(), None)
 }
+
+/// Test configs use `[log] format = "text"` so the subprocess stdout
+/// is human-grep-able. The structured fields land as ` field=value`
+/// pairs (no quoting unless the formatter inserts it), which lets
+/// the harness's substring assertions and `addr=` extraction stay
+/// straightforward. Production defaults to `format = "json"`; the
+/// subscriber install honours both.
+const TEXT_LOG_SECTION: &str = "\n[log]\nformat = \"text\"\n";
 
 /// Write a config with aggressive idle-finalize timings: `idle_seconds =
 /// 1, tick_seconds = 1`. Used by the finalize integration tests so the
@@ -56,7 +86,7 @@ retention_days = 30
 [finalize]
 idle_seconds = 1
 tick_seconds = 1
-"#,
+{TEXT_LOG_SECTION}"#,
         data_dir.display(),
     );
     let path = dir.join("collector.toml");
@@ -92,7 +122,7 @@ tick_seconds = 1
 [retention]
 tick_minutes = 60
 tick_seconds = 1
-"#,
+{TEXT_LOG_SECTION}"#,
         data_dir.display(),
     );
     let path = dir.join("collector.toml");
@@ -131,7 +161,7 @@ session_salt = "{SALT}"
 [storage]
 data_dir = "{data_dir}"
 retention_days = 30
-"#
+{TEXT_LOG_SECTION}"#
     );
     let path = dir.join("collector.toml");
     std::fs::write(&path, body).unwrap();
@@ -180,45 +210,15 @@ impl Collector {
             });
         }
 
-        // Read stdout up to the "listening on" line synchronously so
-        // we know the bind succeeded and can learn the port. After
-        // that, hand the rest off to a background drainer.
-        let mut reader = BufReader::new(stdout);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let bound = loop {
-            if Instant::now() > deadline {
-                let captured_err = stderr_buf.lock().unwrap().clone();
-                let captured_out = stdout_buf.lock().unwrap().clone();
-                let _ = child.kill();
-                panic!(
-                    "binary did not announce 'listening on …' within 10s\nstdout so far:\n{captured_out}\nstderr so far:\n{captured_err}",
-                );
-            }
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    // Process exited before announcing — surface stderr.
-                    let captured_err = stderr_buf.lock().unwrap().clone();
-                    let captured_out = stdout_buf.lock().unwrap().clone();
-                    let _ = child.wait();
-                    panic!(
-                        "binary exited before announcing\nstdout:\n{captured_out}\nstderr:\n{captured_err}",
-                    );
-                }
-                Ok(_) => {
-                    stdout_buf.lock().unwrap().push_str(&line);
-                    if let Some(rest) = line.trim().strip_prefix("listening on ") {
-                        break rest.to_owned();
-                    }
-                }
-                Err(e) => panic!("could not read stdout: {e}"),
-            }
-        };
-
-        // Drain the remainder of stdout in the background.
+        // Drain stdout in a background thread (same shape as the
+        // stderr drainer above). The "wait for listening" loop below
+        // polls the captured buffer with a deadline — that way a
+        // subprocess that emits "listening" in an unexpected format
+        // can't wedge us on a blocking `read_line`.
         {
             let buf = stdout_buf.clone();
             std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
                 loop {
                     line.clear();
@@ -229,6 +229,38 @@ impl Collector {
                 }
             });
         }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let bound = loop {
+            // Has the binary already announced?
+            let snapshot = stdout_buf.lock().unwrap().clone();
+            // Tracing-subscriber text layer emits lines shaped like
+            //   `<ts>  INFO target: listening addr=127.0.0.1:43210`
+            // We accept the first line with the `listening` event
+            // *and* an `addr=` field.
+            if let Some(addr) = snapshot
+                .lines()
+                .find(|l| l.contains("listening"))
+                .and_then(|l| extract_field(l, "addr"))
+            {
+                break addr;
+            }
+            if Instant::now() > deadline {
+                let captured_err = stderr_buf.lock().unwrap().clone();
+                let _ = child.kill();
+                panic!(
+                    "binary did not announce a `listening` event with an `addr=` field within 10s\nstdout so far:\n{snapshot}\nstderr so far:\n{captured_err}",
+                );
+            }
+            // Has the binary already exited?
+            if let Ok(Some(status)) = child.try_wait() {
+                let captured_err = stderr_buf.lock().unwrap().clone();
+                panic!(
+                    "binary exited (status {status:?}) before announcing\nstdout:\n{snapshot}\nstderr:\n{captured_err}",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
 
         Self {
             child: Some(child),
@@ -588,24 +620,29 @@ fn startup_banner_is_a_redacted_summary_line() {
     let collector = Collector::spawn(&path);
 
     // Give the binary a beat to flush its banner; the `Collector`
-    // already saw `listening on …`, but `loaded config from …` is the
-    // line *before* it.
+    // already saw the `listening` event, but `configuration loaded`
+    // is the event emitted just before it.
     std::thread::sleep(Duration::from_millis(50));
     let stdout = collector.stdout_so_far.lock().unwrap().clone();
 
     assert!(
-        stdout.contains("loaded config from"),
-        "missing 'loaded config from' in stdout: {stdout:?}"
+        stdout.contains(EVENT_CONFIG_LOADED),
+        "missing '{EVENT_CONFIG_LOADED}' in stdout: {stdout:?}"
     );
-    assert!(
-        stdout.contains("token=***"),
-        "missing redaction marker in stdout: {stdout:?}"
-    );
+    // The new configuration-loaded event omits the token and salt
+    // fields entirely — INV-2 is enforced by exclusion rather than
+    // redaction. The previous summary line carried `token=***`; the
+    // new event has nothing in that field-shape at all.
     assert!(
         !stdout.contains(TOKEN),
         "banner leaked the token: {stdout:?}"
     );
     assert!(!stdout.contains(SALT), "banner leaked the salt: {stdout:?}");
+    // The configured path *must* appear in the event's `path` field.
+    assert!(
+        stdout.contains(&path.display().to_string()),
+        "banner missing the configuration path: {stdout:?}"
+    );
 }
 
 /// `etc/collector.toml.example` is embedded at compile time so the
@@ -628,7 +665,12 @@ fn example_config_file_loads_and_server_binds() {
         .replace("REPLACE_ME_TOO", &salt)
         .replace("REPLACE_ME", &token)
         .replace("127.0.0.1:8088", "127.0.0.1:0")
-        .replace("/var/lib/php-tree-viz", data_dir.to_str().unwrap());
+        .replace("/var/lib/php-tree-viz", data_dir.to_str().unwrap())
+        // The example pins `format = "json"` for production. The
+        // test harness extracts the bound address from the
+        // `listening` event's `addr=` field, which is the
+        // text-format shape — so swap to text here.
+        .replace(r#"format = "json""#, r#"format = "text""#);
 
     let path = dir.join("collector.toml");
     std::fs::write(&path, body).unwrap();
@@ -833,13 +875,31 @@ fn tmp_dir_creation_failure_exits_3() {
         .output()
         .expect("spawn failed");
     assert_eq!(out.status.code(), Some(3), "expected http exit code 3");
+    // The tmp-dir failure surfaces *after* the subscriber is
+    // installed, so the error event lands on stdout via tracing's
+    // fmt layer. (Pre-subscriber failures still go to stderr —
+    // those are tested in cli.rs.)
+    let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains(blocker.to_str().unwrap()),
-        "stderr: {stderr:?}"
+        stdout.contains(blocker.to_str().unwrap()),
+        "stdout should name the unreachable path; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stderr.contains("tmp"), "stderr should name tmp: {stderr:?}");
-    assert_eq!(stderr.lines().count(), 1);
+    assert!(
+        stdout.contains("tmp"),
+        "stdout should mention tmp; stdout:\n{stdout}"
+    );
+    // The failing event itself is one line — we don't assert on
+    // total line count because the `configuration loaded` info
+    // event also fires before the failure.
+    assert!(
+        stdout
+            .lines()
+            .filter(|l| l.contains("http server failed"))
+            .count()
+            == 1,
+        "expected exactly one `http server failed` event; stdout:\n{stdout}"
+    );
 }
 
 // `log_line_includes_body_bytes_for_within_cap_request` was
@@ -1620,7 +1680,7 @@ session_salt = "{SALT}"
 [storage]
 data_dir = "{data_dir}"
 retention_days = 30
-"#,
+{TEXT_LOG_SECTION}"#,
         data_dir = data_dir.display(),
     );
     let path = dir.join("collector.toml");
@@ -1726,36 +1786,37 @@ fn decoder_logs_error_and_continues_after_malformed_batch() {
     std::thread::sleep(Duration::from_millis(250));
 
     let stdout = collector.stdout_so_far.lock().unwrap().clone();
-    let stderr = collector.stderr_so_far.lock().unwrap().clone();
 
-    // Stderr should mention the parse failure with the broken
-    // trace's key.
+    // The tracing subscriber routes every event — info or warn — to
+    // stdout. The decoder-failure event ("decoder failure") lands
+    // there alongside the batch-accepted events. (Pre-subscriber
+    // `eprintln!`s are the only thing that ever reaches stderr.)
     let broken_key = synth_trace_key("host-broken", 11, 1_111_111);
     assert!(
-        stderr
+        stdout
             .lines()
-            .any(|l| l.starts_with("decoder: parse failed") && l.contains(&broken_key)),
-        "expected a `decoder: parse failed` stderr line for the broken trace; \
-         stderr was:\n{stderr}",
+            .any(|l| l.contains("decoder failure") && l.contains(&broken_key)),
+        "expected a `decoder failure` event for the broken trace; \
+         stdout was:\n{stdout}",
     );
 
-    // Stdout should have a `decoded batch` line for the second
+    // Stdout should have a `batch accepted` line for the second
     // (well-formed) request, proving the decoder kept running.
     let good_key = synth_trace_key("host-good", 12, 2_222_222);
     assert!(
         stdout
             .lines()
-            .any(|l| l.starts_with("decoded batch") && l.contains(&good_key)),
-        "expected a `decoded batch` line for the good trace after the broken one; \
+            .any(|l| l.contains(EVENT_BATCH_ACCEPTED) && l.contains(&good_key)),
+        "expected a `batch accepted` line for the good trace after the broken one; \
          stdout was:\n{stdout}",
     );
 
-    // And no `decoded batch` line for the broken trace.
+    // And no `batch accepted` line for the broken trace.
     assert!(
         !stdout
             .lines()
-            .any(|l| l.starts_with("decoded batch") && l.contains(&broken_key)),
-        "decoded line for the broken trace shouldn't exist; stdout: {stdout}",
+            .any(|l| l.contains(EVENT_BATCH_ACCEPTED) && l.contains(&broken_key)),
+        "batch accepted line for the broken trace shouldn't exist; stdout: {stdout}",
     );
 }
 
@@ -1785,16 +1846,24 @@ fn successful_request_is_logged_as_decoded_by_the_receiver() {
     let expected_field = format!("trace_key={key}");
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("decoded batch") && l.contains(&expected_field))
+        .find(|l| l.contains(EVENT_BATCH_ACCEPTED) && l.contains(&expected_field))
         .unwrap_or_else(|| {
             panic!("no matching decoded line for {expected_field} in stdout: {stdout:?}")
         });
-    assert!(line.contains(".raw/batch-0001.msgpack"));
+    // The new `batch accepted` event no longer carries a `path`
+    // field (the raw path is implementation detail of where the
+    // commit lands; the operator-visible identity is `trace_key`).
     // `build_test_batch` ships `dict = []` and `calls = []`, so the
-    // log line should show counts of 0 for both. This anchors the
-    // test against the format, not against a specific workload.
-    assert!(line.contains("dict=0"), "missing dict=0 in: {line}");
-    assert!(line.contains("calls=0"), "missing calls=0 in: {line}");
+    // event should show counts of 0 for both. The structured field
+    // names are `dict_entries` and `call_count` (per F-1.10).
+    assert!(
+        line.contains("dict_entries=0"),
+        "missing dict_entries=0 in: {line}"
+    );
+    assert!(
+        line.contains("call_count=0"),
+        "missing call_count=0 in: {line}"
+    );
 }
 
 #[test]
@@ -1965,7 +2034,7 @@ fn valid_v1_body_records_a_trace_row() {
     assert_eq!(status, 200);
 
     // Let the decoder finish writing.
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let conn = open_index_db_ro(&data_dir);
     let (trace_key, batch_count, call_count, state): (String, i64, i64, String) = conn
@@ -2002,7 +2071,7 @@ fn consecutive_same_trace_batches_increment_counters_in_index() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let stdout = collector.stdout_so_far.lock().unwrap().clone();
-        let count = stdout.matches("decoded batch").count();
+        let count = stdout.matches(EVENT_BATCH_ACCEPTED).count();
         if count >= 3 {
             break;
         }
@@ -2038,7 +2107,7 @@ fn per_trace_sqlite_has_dict_after_first_batch() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     // Discover the trace key from the index DB (depends on fixture meta).
     let trace_key: String = open_index_db_ro(&data_dir)
@@ -2081,7 +2150,7 @@ fn well_formed_fixture_produces_no_anomalies() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2110,7 +2179,7 @@ fn dq1_batch_writes_unresolved_fn_anomaly_e2e() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2145,7 +2214,7 @@ fn dq1_no_longer_emits_stderr_line() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let stderr = collector.stderr_so_far.lock().unwrap().clone();
     assert!(
@@ -2164,12 +2233,12 @@ fn decoded_batch_log_carries_anomalies_field() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    let stdout = collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    let stdout = collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("decoded batch"))
-        .expect("decoded batch line must be present");
+        .find(|l| l.contains(EVENT_BATCH_ACCEPTED))
+        .expect("batch accepted event must be present");
     assert!(
         line.contains("anomalies=1"),
         "expected anomalies=1 in: {line}"
@@ -2187,7 +2256,7 @@ fn dq3_e2e_anomaly_attaches_to_resulting_node() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2241,7 +2310,7 @@ fn anomaly_count_on_traces_row_mirrors_per_trace_anomalies_e2e() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let stdout = collector.stdout_so_far.lock().unwrap().clone();
-        if stdout.matches("decoded batch").count() >= 2 {
+        if stdout.matches(EVENT_BATCH_ACCEPTED).count() >= 2 {
             break;
         }
         if Instant::now() > deadline {
@@ -2290,7 +2359,7 @@ fn consecutive_batches_with_anomalies_accumulate_the_counter() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let stdout = collector.stdout_so_far.lock().unwrap().clone();
-        if stdout.matches("decoded batch").count() >= 2 {
+        if stdout.matches(EVENT_BATCH_ACCEPTED).count() >= 2 {
             break;
         }
         if Instant::now() > deadline {
@@ -2330,7 +2399,7 @@ fn aggregated_nodes_populate_after_a_batch() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2391,7 +2460,7 @@ fn synthetic_root_exists_post_aggregation() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2429,7 +2498,7 @@ fn call_to_node_populates_e2e() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2451,11 +2520,11 @@ fn decoded_batch_log_carries_nodes_and_pending_fields() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    let stdout = collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    let stdout = collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("decoded batch"))
+        .find(|l| l.contains(EVENT_BATCH_ACCEPTED))
         .unwrap_or_else(|| panic!("no decoded batch line in stdout: {stdout:?}"));
     assert!(line.contains("nodes="), "missing nodes= field in: {line}");
     assert!(
@@ -2481,7 +2550,7 @@ fn per_trace_dict_is_idempotent_across_batches_e2e() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let stdout = collector.stdout_so_far.lock().unwrap().clone();
-        if stdout.matches("decoded batch").count() >= 2 {
+        if stdout.matches(EVENT_BATCH_ACCEPTED).count() >= 2 {
             break;
         }
         if Instant::now() > deadline {
@@ -2514,7 +2583,7 @@ fn pragma_user_version_is_1_on_both_dbs() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let index_conn = open_index_db_ro(&data_dir);
     let v: i64 = index_conn
@@ -2542,7 +2611,7 @@ fn trace_meta_mirrors_the_index_row_e2e() {
     let req = ingest_request(&collector.bound, FIXTURE_FLAT_CALLS_1);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     let index_conn = open_index_db_ro(&data_dir);
     let (key, host, pid): (String, String, i64) = index_conn
@@ -2604,8 +2673,8 @@ fn idle_finalize_marks_active_trace_as_finalized() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
-    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
 
     let state: String = open_index_db_ro(&data_dir)
         .query_row("SELECT state FROM traces", [], |r| r.get(0))
@@ -2624,8 +2693,8 @@ fn idle_finalize_writes_dq2_anomaly_for_pending_parent() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
-    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
 
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
@@ -2665,21 +2734,22 @@ fn idle_finalize_log_line_carries_pending_dq2_and_cpu_fields() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    let stdout = collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+    let stdout = collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
 
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("finalized trace"))
-        .expect("finalized trace line must be present");
+        .find(|l| l.contains(EVENT_TRACE_FINALIZED))
+        .expect("trace finalized event must be present");
     assert!(
         line.contains("pending_dq2=1"),
         "expected pending_dq2=1 in: {line}"
     );
     // The orphan Call never folded into a node, so no node exists
-    // with non-zero CPU → cpu_snapshot_available=0.
+    // with non-zero CPU → cpu_snapshot_available=false. (Tracing's
+    // fmt layer renders booleans as `true`/`false`.)
     assert!(
-        line.contains("cpu_snapshot_available=0"),
-        "expected cpu_snapshot_available=0 in: {line}"
+        line.contains("cpu_snapshot_available=false"),
+        "expected cpu_snapshot_available=false in: {line}"
     );
 }
 
@@ -2698,7 +2768,7 @@ fn idle_finalize_sets_cpu_snapshot_available_to_0_for_zero_cpu_trace() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
 
     let (cpu_index, trace_key): (i64, String) = open_index_db_ro(&data_dir)
         .query_row(
@@ -2729,7 +2799,7 @@ fn late_batch_after_finalize_reactivates_state_e2e() {
     let req_a = ingest_request(&collector.bound, &body_a);
     let (status, _) = send_raw(&collector.bound, &req_a);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("finalized trace", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
 
     let state_after_a: String = open_index_db_ro(&data_dir)
         .query_row("SELECT state FROM traces", [], |r| r.get(0))
@@ -2747,7 +2817,7 @@ fn late_batch_after_finalize_reactivates_state_e2e() {
     // already produced one, so we wait for the count to reach 2.
     wait_until(
         &collector,
-        |stdout| count_matches(stdout, "decoded batch") >= 2,
+        |stdout| count_matches(stdout, EVENT_BATCH_ACCEPTED) >= 2,
         Duration::from_secs(5),
     );
 
@@ -2792,7 +2862,7 @@ retention_days = 30
 [finalize]
 idle_seconds = 60
 tick_seconds = 1
-"#,
+{TEXT_LOG_SECTION}"#,
         auto_data.display(),
     );
     let path = dir.join("collector.toml");
@@ -2805,14 +2875,14 @@ tick_seconds = 1
     );
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     // Wait long enough for several finalize ticks, then assert state
     // is still active and no finalize line was emitted.
     std::thread::sleep(Duration::from_secs(3));
     let stdout = collector.stdout_so_far.lock().unwrap().clone();
     assert!(
-        !stdout.contains("finalized trace"),
+        !stdout.contains(EVENT_TRACE_FINALIZED),
         "trace inside threshold must not be finalized; stdout:\n{stdout}"
     );
 
@@ -2833,7 +2903,7 @@ fn idle_finalize_log_is_silent_when_nothing_idle() {
 
     let stdout = collector.stdout_so_far.lock().unwrap().clone();
     assert!(
-        !stdout.contains("finalized trace"),
+        !stdout.contains(EVENT_TRACE_FINALIZED),
         "quiet collector must not emit finalize lines; stdout:\n{stdout}"
     );
 }
@@ -2871,12 +2941,12 @@ fn three_synthetic_traces_finalize_independently() {
     }
     wait_until(
         &collector,
-        |stdout| count_matches(stdout, "decoded batch") >= 3,
+        |stdout| count_matches(stdout, EVENT_BATCH_ACCEPTED) >= 3,
         Duration::from_secs(5),
     );
     wait_until(
         &collector,
-        |stdout| count_matches(stdout, "finalized trace") >= 3,
+        |stdout| count_matches(stdout, EVENT_TRACE_FINALIZED) >= 3,
         Duration::from_secs(5),
     );
 
@@ -2919,8 +2989,8 @@ fn retention_sweeper_removes_expired_trace_files_and_row() {
     assert_eq!(status, 200);
     // Wait for the decoder to commit the trace, then for the sweeper
     // to remove it.
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
-    collector.wait_for_stdout("swept retention", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_RETENTION_SWEPT, Duration::from_secs(5));
 
     let trace_key = synth_trace_key("ret-basic", 1, start_time);
     let sqlite_path = data_dir.join("traces").join(format!("{trace_key}.sqlite"));
@@ -2943,12 +3013,12 @@ fn retention_sweeper_logs_summary_line_with_freed_bytes() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    let stdout = collector.wait_for_stdout("swept retention", Duration::from_secs(5));
+    let stdout = collector.wait_for_stdout(EVENT_RETENTION_SWEPT, Duration::from_secs(5));
 
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("swept retention"))
-        .expect("swept retention line must be present");
+        .find(|l| l.contains(EVENT_RETENTION_SWEPT))
+        .expect("retention swept event must be present");
     assert!(
         line.contains("removed_traces=1"),
         "expected removed_traces=1 in: {line}"
@@ -2978,14 +3048,14 @@ fn retention_sweeper_silent_when_nothing_expired() {
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    collector.wait_for_stdout("decoded batch", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
     // Let the retention loop tick a few times (tick_seconds = 1).
     std::thread::sleep(Duration::from_secs(3));
 
     let stdout = collector.stdout_so_far.lock().unwrap().clone();
     assert!(
-        !stdout.contains("swept retention"),
+        !stdout.contains(EVENT_RETENTION_SWEPT),
         "fresh trace must not trigger a sweep; stdout:\n{stdout}"
     );
 }
@@ -3013,10 +3083,10 @@ fn retention_sweeper_does_not_disturb_fresh_traces() {
     // covers the expired one.
     wait_until(
         &collector,
-        |stdout| count_matches(stdout, "decoded batch") >= 2,
+        |stdout| count_matches(stdout, EVENT_BATCH_ACCEPTED) >= 2,
         Duration::from_secs(5),
     );
-    collector.wait_for_stdout("swept retention", Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_RETENTION_SWEPT, Duration::from_secs(5));
 
     // The fresh trace must still be present; the expired one gone.
     let (n_rows, sole_key): (i64, String) = open_index_db_ro(&data_dir)
