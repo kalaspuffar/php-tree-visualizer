@@ -1,20 +1,20 @@
 name: CI
 
-# Runs the same three checks I run locally before every commit:
+# Two parallel jobs gate every PR and every push to `main`:
 #
-#   cargo fmt --all -- --check
-#   cargo clippy --all-targets --all-features -- -D warnings
-#   cargo test  --all-targets --all-features
+#   rust:  cargo fmt --all -- --check
+#          cargo clippy --all-targets --all-features -- -D warnings
+#          cargo test  --all-targets --all-features
 #
-# All three already gate every change locally; this workflow puts
-# the same gate in front of every PR and every push to `main` so
-# nothing slips in on a contributor's "I forgot to run cargo test"
-# day.
+#   php:   php tests/api/run.php
+#          (the API test harness — unit + integration, ~300 assertions)
 #
-# The toolchain is pinned via `rust-toolchain.toml` (stable +
-# rustfmt + clippy components). `rustup show` honours that file on
-# first invocation, so we don't need to call `actions-rs/toolchain`
-# or hard-code a version here.
+# Both already run locally before every commit; CI is the safety net
+# for "I forgot to run the suite" days.
+#
+# The Rust toolchain is pinned via `rust-toolchain.toml`. The PHP
+# version is pinned here in the workflow (kept aligned with the
+# operator's dev host per SPECIFICATION.md §7.1).
 
 on:
   push:
@@ -35,6 +35,9 @@ concurrency:
 
 jobs:
   check:
+    # Display name unchanged from the pre-PHP era so any branch
+    # protection rule that requires this status check by name still
+    # matches. The new PHP job below is additive.
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -62,3 +65,36 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets --all-features
+
+  php:
+    name: php — api tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        # 8.4 matches the operator's dev host; pdo_sqlite + sqlite3
+        # are required per SPECIFICATION.md §7.1 / D-3. The action
+        # caches PHP + extensions so warm runs are sub-30 s.
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: pdo_sqlite, sqlite3
+          coverage: none
+          tools: none
+
+      - name: Confirm pdo_sqlite is loaded
+        # Fail fast with a clear message if the extension didn't
+        # install, rather than letting the first PDO open throw a
+        # cryptic "Driver not found" mid-test. The value is quoted
+        # because the inline `?:` would otherwise look like a YAML
+        # mapping to the parser.
+        run: 'php -r "exit(extension_loaded(''pdo_sqlite'') ? 0 : 1);"'
+
+      - name: Run the API test suite
+        # Discovers tests/api/**/*_test.php, runs each in a child
+        # process, prints pass/fail, exits non-zero on any failure.
+        run: php -d error_reporting=E_ALL -d display_errors=stderr tests/api/run.php
