@@ -1,20 +1,26 @@
 name: CI
 
-# Two parallel jobs gate every PR and every push to `main`:
+# Three parallel jobs gate every PR and every push to `main`:
 #
-#   rust:  cargo fmt --all -- --check
-#          cargo clippy --all-targets --all-features -- -D warnings
-#          cargo test  --all-targets --all-features
+#   rust:     cargo fmt --all -- --check
+#             cargo clippy --all-targets --all-features -- -D warnings
+#             cargo test  --all-targets --all-features
 #
-#   php:   php tests/api/run.php
-#          (the API test harness — unit + integration, ~300 assertions)
+#   php:      php tests/api/run.php
+#             (the API test harness — unit + integration, ~600
+#             assertions across Phases 3 + 4)
 #
-# Both already run locally before every commit; CI is the safety net
-# for "I forgot to run the suite" days.
+#   frontend: node tests/frontend/run.js
+#             (Node-based unit tests for the framework-free JS
+#             modules under viz/js/)
+#
+# All three already run locally before every commit; CI is the
+# safety net for "I forgot to run the suite" days.
 #
 # The Rust toolchain is pinned via `rust-toolchain.toml`. The PHP
-# version is pinned here in the workflow (kept aligned with the
-# operator's dev host per SPECIFICATION.md §7.1).
+# and Node versions are pinned here in the workflow (PHP aligned
+# with the operator's dev host per SPECIFICATION.md §7.1; Node at
+# the current LTS line).
 
 on:
   push:
@@ -98,3 +104,25 @@ jobs:
         # Discovers tests/api/**/*_test.php, runs each in a child
         # process, prints pass/fail, exits non-zero on any failure.
         run: php -d error_reporting=E_ALL -d display_errors=stderr tests/api/run.php
+
+  frontend:
+    name: frontend — js tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        # Node 22 is the current LTS line; native ES modules + the
+        # global `fetch`/`Response` we use in tests.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run the frontend test suite
+        # Discovers tests/frontend/**/*_test.js, runs each in a
+        # child Node process, prints pass/fail, exits non-zero on
+        # any failure.
+        run: node tests/frontend/run.js
