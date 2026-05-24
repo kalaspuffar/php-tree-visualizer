@@ -1,0 +1,629 @@
+/*
+ * php-tree-visualizer — design system + login/list page styles.
+ *
+ * Sections (matches design.md D-11):
+ *   1. Tokens (§3.3.5.1-9) — :root custom properties.
+ *   2. Base — *, html, body, focus-visible, prefers-* media.
+ *   3. Typography utilities — .display, .h1, .body, etc.
+ *   4. Layout primitives — .card, .chip, .banner, .button.
+ *   5. Page: login.
+ *   6. Page: list.
+ *
+ * Phase 6 will add a section 7+ for the call-tree row.
+ */
+
+
+/* ============================================================
+ * 1. Tokens (SPECIFICATION.md §3.3.5)
+ * ============================================================ */
+
+:root {
+  /* Surfaces */
+  --bg:            #0E1116;
+  --surface:       #161B23;
+  --surface-2:     #1E2530;
+  --surface-3:     #28303D;
+  --border:        #2A3340;
+  --border-strong: #3B475A;
+
+  /* Foregrounds */
+  --fg:           #E6E8EB;
+  --fg-muted:     #98A2B3;
+  --fg-subtle:    #5C6675;
+  --fg-on-accent: #06212A;
+
+  /* Brand / interactive */
+  --accent:        #22D3EE;
+  --accent-strong: #06B6D4;
+  --accent-bg:     #164E5E;
+
+  /* Semantic */
+  --success:    #34D399;
+  --warn:       #FBBF24;
+  --warn-bg:    #3B2E0F;
+  --danger:     #F87171;
+  --danger-bg:  #3F1B1F;
+  --info:       #60A5FA;
+  --info-bg:    #1E2A3F;
+
+  /* Hot-path gradient (reserved for Phase 6's heatmap math). */
+  --hot-0:      #0E7490;
+  --hot-1:      #0891B2;
+  --hot-2:      #22D3EE;
+  --hot-3:      #67E8F9;
+
+  /* Focus ring */
+  --focus:      #22D3EE;
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter,
+               system-ui, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono",
+               Menlo, Consolas, monospace;
+
+  /* Spacing scale */
+  --s-1:  4px;
+  --s-2:  8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+
+  /* Motion durations (§3.3.5.5) */
+  --motion-chevron:        120ms;
+  --motion-hover:          100ms;
+  --motion-row-appear:      80ms;
+  --motion-banner:         160ms;
+  --motion-skeleton:      1500ms;
+  --motion-pulse:         1600ms;
+  --motion-loader:        1000ms;
+
+  /* Z-index layers (§3.3.5.9) */
+  --z-base:      0;
+  --z-sticky:   10;
+  --z-banner:   20;
+  --z-overlay: 100;
+}
+
+
+/* ============================================================
+ * 2. Base
+ * ============================================================ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* SPECIFICATION.md §3.3.5.7 — visible on every focusable element. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-radius: inherit;
+}
+
+/* SPECIFICATION.md §3.3.5.5 — strip every animation/transition
+ * for reduced-motion users. Page-level animations declare
+ * themselves below; this is the global escape hatch. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+
+/* ============================================================
+ * 3. Typography utilities (§3.3.5.2)
+ * ============================================================ */
+
+.display {
+  font-size: 24px;
+  line-height: 1.25;
+  font-weight: 600;
+}
+
+.h1 {
+  font-size: 20px;
+  line-height: 1.3;
+  font-weight: 600;
+}
+
+.h2 {
+  font-size: 17px;
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+.body {
+  font-size: 14px;
+  line-height: 1.45;
+  font-weight: 400;
+}
+
+.body-strong {
+  font-size: 14px;
+  line-height: 1.45;
+  font-weight: 500;
+}
+
+.small {
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 400;
+}
+
+.micro {
+  font-size: 11px;
+  line-height: 1.35;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+
+/* ============================================================
+ * 4. Layout primitives
+ * ============================================================ */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: var(--s-6);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  height: 22px;
+  padding: 0 var(--s-2);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--fg);
+}
+
+.chip--warn   { background: var(--warn-bg);   color: var(--warn); }
+.chip--danger { background: var(--danger-bg); color: var(--danger); }
+.chip--success{ background: var(--accent-bg); color: var(--accent); }
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 40px;
+  padding: 0 var(--s-3);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.banner--danger { background: var(--danger-bg); color: var(--danger); }
+.banner--warn   { background: var(--warn-bg);   color: var(--warn); }
+.banner--info   { background: var(--info-bg);   color: var(--info); }
+
+.banner__icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  min-height: 32px;
+  padding: 0 var(--s-3);
+  background: var(--accent);
+  color: var(--fg-on-accent);
+  border: none;
+  border-radius: 6px;
+  font: 500 14px/1 var(--font-sans);
+  cursor: pointer;
+  transition: background var(--motion-hover) ease-out;
+}
+
+.button:hover:not([disabled]) {
+  background: var(--accent-strong);
+}
+
+.button[disabled] {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.button--text {
+  background: transparent;
+  color: var(--accent);
+  min-height: auto;
+  padding: var(--s-1) var(--s-2);
+}
+
+.button--text:hover { background: var(--surface-2); }
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  color: var(--fg-muted);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color var(--motion-hover) ease-out,
+              background var(--motion-hover) ease-out;
+}
+
+.icon-button:hover { color: var(--fg); background: var(--surface-2); }
+
+.icon { width: 16px; height: 16px; flex-shrink: 0; }
+.icon--lg { width: 20px; height: 20px; }
+
+
+/* ============================================================
+ * 5. Page: login (§3.3.6.1)
+ * ============================================================ */
+
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+
+.login-card {
+  width: 360px;
+  padding: var(--s-6);
+}
+
+.login-title {
+  margin: 0 0 var(--s-5) 0;
+  color: var(--fg);
+}
+
+.login-label {
+  display: block;
+  margin: 0 0 var(--s-1) 0;
+  color: var(--fg-muted);
+}
+
+.login-input {
+  width: 100%;
+  height: 44px;
+  margin-bottom: var(--s-4);
+  padding: 0 var(--s-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+.login-input::placeholder { color: var(--fg-subtle); }
+.login-input[readonly]    { opacity: 0.7; }
+
+.login-submit {
+  width: 100%;
+  height: 44px;
+  margin-bottom: var(--s-5);
+  border-radius: 6px;
+}
+
+.login-hint {
+  margin: 0;
+  color: var(--fg-subtle);
+  line-height: 1.4;
+}
+
+.login-banner {
+  margin: 0 0 var(--s-4) 0;
+}
+
+
+/* ============================================================
+ * 6. Page: list (§3.3.6.2)
+ * ============================================================ */
+
+.list-page {
+  max-width: 1024px;
+  margin: 0 auto;
+  padding: var(--s-5) var(--s-5);
+}
+
+@media (min-width: 1280px) {
+  .list-page { padding-left: var(--s-7); padding-right: var(--s-7); }
+}
+
+.traces-header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-4) 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.traces-title {
+  margin: 0;
+  color: var(--fg);
+}
+
+.traces-title__separator { color: var(--fg-subtle); }
+.traces-title__count     { color: var(--fg-muted); font-weight: 400; }
+
+.filter {
+  position: relative;
+  width: 320px;
+}
+
+.filter__icon {
+  position: absolute;
+  top: 50%;
+  left: var(--s-2);
+  transform: translateY(-50%);
+  color: var(--fg-muted);
+  pointer-events: none;
+}
+
+.filter__input {
+  width: 100%;
+  height: 36px;
+  padding: 0 var(--s-6) 0 var(--s-6);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.filter__input::placeholder { color: var(--fg-subtle); }
+
+.filter__clear {
+  position: absolute;
+  top: 50%;
+  right: var(--s-1);
+  transform: translateY(-50%);
+}
+
+/* Progress strip while a filter request is in flight. */
+.filter__progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transform-origin: left center;
+  pointer-events: none;
+}
+
+.filter--loading .filter__progress {
+  opacity: 1;
+  animation: phptv-progress 1500ms linear infinite;
+}
+
+@keyframes phptv-progress {
+  0%   { transform: scaleX(0); }
+  50%  { transform: scaleX(0.6); }
+  100% { transform: scaleX(1); }
+}
+
+.traces-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: var(--s-4) 0 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.trace-row {
+  display: grid;
+  grid-template-columns: var(--s-4) 1fr auto;
+  align-items: center;
+  gap: var(--s-3);
+  height: 64px;
+  padding: 0 var(--s-3);
+  background: var(--surface);
+  color: inherit;
+  border-radius: 6px;
+  text-decoration: none;
+  transition: background var(--motion-hover) ease-out;
+}
+
+.trace-row:hover { background: var(--surface-2); cursor: pointer; }
+
+.trace-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--accent-bg);
+}
+
+.trace-row__state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.trace-row--active .trace-row__state-dot {
+  background: var(--warn);
+  animation: phptv-pulse var(--motion-pulse) ease-in-out infinite;
+}
+
+@keyframes phptv-pulse {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%      { transform: scale(1.4); opacity: 0.5; }
+}
+
+.trace-row__main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.trace-row__uri {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-row__sub {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-row__metrics {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  text-align: right;
+}
+
+.trace-row__calls {
+  color: var(--fg);
+}
+
+.trace-row__wall-and-state {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--fg-muted);
+}
+
+.trace-row__state-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 var(--s-2);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.trace-row--active .trace-row__state-chip {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.trace-row--finalized .trace-row__state-chip {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.list-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 48px;
+  padding: 0 var(--s-3);
+  color: var(--fg-muted);
+}
+
+/* Skeleton row pattern (§3.3.9). */
+.skeleton-row {
+  height: 64px;
+  padding: 0 var(--s-3);
+  border-radius: 6px;
+  background: var(--surface);
+  display: grid;
+  grid-template-columns: var(--s-4) 1fr 160px;
+  align-items: center;
+  gap: var(--s-3);
+}
+
+.skeleton-row__block {
+  background: var(--surface-2);
+  border-radius: 4px;
+  height: 12px;
+  position: relative;
+  overflow: hidden;
+}
+
+.skeleton-row__block--lg { height: 16px; }
+
+.skeleton-row__block::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.04) 50%,
+    transparent 100%
+  );
+  animation: phptv-shimmer var(--motion-skeleton) linear infinite;
+}
+
+@keyframes phptv-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-7) var(--s-5);
+  text-align: center;
+  color: var(--fg-muted);
+}
+
+.empty-state__title { color: var(--fg); margin: 0; }
+.empty-state__body  { max-width: 480px; margin: 0; }
+
+/* The illustration is a simple 96x96 stroked SVG; the .empty-state
+ * container handles sizing. */
+.empty-state__illustration {
+  width: 96px;
+  height: 96px;
+  color: var(--fg-subtle);
+}
+
+.list-error {
+  margin: var(--s-3) 0;
+}

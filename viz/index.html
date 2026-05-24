@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+
+  <title>PHP Tree Visualizer — Traces</title>
+  <link rel="stylesheet" href="/viz/assets/styles.css">
+</head>
+<body>
+
+  <div class="list-page">
+
+    <header class="traces-header">
+      <h1 id="traces-title" class="display traces-title">Traces</h1>
+
+      <div id="filter" class="filter">
+        <svg class="icon filter__icon" aria-hidden="true">
+          <use href="/viz/assets/icons.svg#icon-search"/>
+        </svg>
+        <input
+          id="filter-input"
+          type="search"
+          class="filter__input"
+          placeholder="filter by URI or script"
+          aria-label="Filter traces by URI or script"
+          autocomplete="off"
+          spellcheck="false"
+        >
+        <button id="filter-clear" type="button"
+                class="icon-button filter__clear"
+                aria-label="Clear filter" hidden>
+          <svg class="icon" aria-hidden="true">
+            <use href="/viz/assets/icons.svg#icon-x"/>
+          </svg>
+        </button>
+        <div class="filter__progress" aria-hidden="true"></div>
+      </div>
+    </header>
+
+    <main>
+      <div id="list-error" hidden></div>
+
+      <!--
+        Pre-rendered skeleton rows so first paint shows them without
+        JS work. list.js replaces this container's contents on every
+        fetch result.
+      -->
+      <ul id="rows" class="traces-list">
+        <li class="skeleton-row">
+          <div></div>
+          <div>
+            <div class="skeleton-row__block skeleton-row__block--lg" style="width: 65%"></div>
+            <div class="skeleton-row__block" style="width: 40%; margin-top: 6px"></div>
+          </div>
+          <div class="skeleton-row__block" style="width: 80px"></div>
+        </li>
+        <li class="skeleton-row">
+          <div></div>
+          <div>
+            <div class="skeleton-row__block skeleton-row__block--lg" style="width: 70%"></div>
+            <div class="skeleton-row__block" style="width: 45%; margin-top: 6px"></div>
+          </div>
+          <div class="skeleton-row__block" style="width: 80px"></div>
+        </li>
+        <li class="skeleton-row">
+          <div></div>
+          <div>
+            <div class="skeleton-row__block skeleton-row__block--lg" style="width: 55%"></div>
+            <div class="skeleton-row__block" style="width: 35%; margin-top: 6px"></div>
+          </div>
+          <div class="skeleton-row__block" style="width: 80px"></div>
+        </li>
+        <li class="skeleton-row">
+          <div></div>
+          <div>
+            <div class="skeleton-row__block skeleton-row__block--lg" style="width: 60%"></div>
+            <div class="skeleton-row__block" style="width: 50%; margin-top: 6px"></div>
+          </div>
+          <div class="skeleton-row__block" style="width: 80px"></div>
+        </li>
+        <li class="skeleton-row">
+          <div></div>
+          <div>
+            <div class="skeleton-row__block skeleton-row__block--lg" style="width: 50%"></div>
+            <div class="skeleton-row__block" style="width: 30%; margin-top: 6px"></div>
+          </div>
+          <div class="skeleton-row__block" style="width: 80px"></div>
+        </li>
+      </ul>
+
+      <div id="list-footer" class="list-footer" hidden></div>
+
+    </main>
+  </div>
+
+  <script type="module" src="/viz/js/list.js"></script>
+</body>
+</html>
