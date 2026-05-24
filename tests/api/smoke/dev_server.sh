@@ -128,9 +128,9 @@ cat <<EOF
 │   Token to paste:    $TOKEN
 │                                                              │
 │   Three traces in the list; the second one ("run-tests.php") │
-│   has a per-trace SQLite file so Phase 4 endpoints return    │
-│   real data. (Clicking a row still 404s — Phase 6 hasn't     │
-│   landed yet.)                                               │
+│   has a per-trace SQLite file so the detail page renders     │
+│   a real call tree. Clicking that row lands on the           │
+│   trace-detail view; the other two 404 (no per-trace file). │
 │                                                              │
 │   Press Ctrl-C to shut down + clean up the temp fixture.     │
 │                                                              │

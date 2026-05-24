@@ -58,7 +58,8 @@ idle_seconds = 30
 tick_seconds = 5
 EOF
 
-# Build the fixture index.sqlite.
+# Build the fixture index.sqlite + a per-trace file for the second
+# trace so the detail page has real data to render.
 php -r '
 require "tests/api/fixtures/make_index_sqlite.php";
 make_index_sqlite($argv[1], [
@@ -67,6 +68,22 @@ make_index_sqlite($argv[1], [
     ["trace_key" => str_repeat("3", 32), "uri_or_script" => "/srv/app/cron/run-nightly.php", "start_time_ns" => 1700000002000000000, "state" => "active"],
 ]);
 ' "$DATA_DIR/index.sqlite"
+
+php -r '
+require "tests/api/fixtures/make_trace_sqlite.php";
+$key = str_repeat("2", 32);
+make_trace_sqlite(
+    $argv[1] . "/traces/$key.sqlite",
+    ["trace_key" => $key, "uri_or_script" => "/srv/app/bin/run-tests.php"],
+    [1 => ["fqn" => "main"], 2 => ["fqn" => "helper"]],
+    [
+        ["node_id" => 2, "parent_node_id" => 1, "fn_id" => 1, "depth" => 1,
+         "total_wall_ns" => 800, "call_count" => 1],
+        ["node_id" => 3, "parent_node_id" => 2, "fn_id" => 2, "depth" => 2,
+         "total_wall_ns" => 400, "call_count" => 3],
+    ]
+);
+' "$DATA_DIR"
 
 PORT="$(php -r '$s = stream_socket_server("tcp://127.0.0.1:0"); $n = stream_socket_get_name($s, false); echo (int) substr($n, strrpos($n, ":") + 1); fclose($s);')"
 
@@ -110,12 +127,21 @@ H=$(curl -sS -o "$TMP/icons.svg" -w '%{content_type}' "http://127.0.0.1:$PORT/vi
 grep -q 'id="icon-search"' "$TMP/icons.svg" || fail "icons.svg doesn't contain icon-search symbol"
 ok "icons.svg serves as image/svg+xml with the documented symbols"
 
-# 4-5) login.js and list.js serve.
-for path in /viz/js/login.js /viz/js/list.js /viz/js/api-client.js /viz/js/time.js /viz/js/debounce.js; do
+# 4-5) every JS module + the trace-detail HTML page serve.
+for path in /viz/js/login.js /viz/js/list.js /viz/js/api-client.js /viz/js/time.js /viz/js/debounce.js /viz/js/detail.js /viz/js/virtualizer.js /viz/js/tree-row.js; do
     S=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$path")
     [[ "$S" == "200" ]] || fail "$path status $S"
 done
 ok "all JS modules serve over HTTP"
+
+TRACE_HTML="$TMP/trace.html"
+S=$(curl -sS -o "$TRACE_HTML" -w '%{http_code}' "http://127.0.0.1:$PORT/viz/trace.html")
+[[ "$S" == "200" ]]                                || fail "/viz/trace.html status $S"
+grep -q 'Content-Security-Policy'   "$TRACE_HTML"  || fail "no CSP meta on trace.html"
+grep -q '<script type="module"'      "$TRACE_HTML"  || fail "no module script on trace.html"
+grep -q 'role="tree"'                "$TRACE_HTML"  || fail "no role=tree container on trace.html"
+grep -q 'class="column-header"'      "$TRACE_HTML"  || fail "no column header on trace.html"
+ok "trace.html serves with CSP + module script + tree container"
 
 # 6) login the API.
 LOGIN_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -143,6 +169,24 @@ S=$(curl -sS -o "$LIST_BODY" -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT
 T=$(php -r 'echo json_decode(file_get_contents($argv[1]), true)["total"] ?? "missing";' "$LIST_BODY")
 [[ "$T" == "3" ]] || fail "expected total=3, got $T"
 ok "GET /api/traces (with cookie) → 200 + total=3"
+
+# Phase 6a — exercise the trace-detail endpoints over real HTTP.
+META_KEY=$(printf '2%.0s' {1..32})
+META_BODY="$TMP/meta.json"
+S=$(curl -sS -o "$META_BODY" -w '%{http_code}' -b "$JAR" \
+    "http://127.0.0.1:$PORT/api/traces/$META_KEY")
+[[ "$S" == "200" ]] || fail "metadata status $S"
+ROOT_ID=$(php -r 'echo json_decode(file_get_contents($argv[1]), true)["root_node_id"] ?? "missing";' "$META_BODY")
+[[ "$ROOT_ID" == "1" ]] || fail "metadata root_node_id $ROOT_ID"
+ok "GET /api/traces/{key} → 200 + root_node_id=1"
+
+TREE_BODY="$TMP/tree.json"
+S=$(curl -sS -o "$TREE_BODY" -w '%{http_code}' -b "$JAR" \
+    "http://127.0.0.1:$PORT/api/traces/$META_KEY/tree?depth=2&sort=total_wall_desc")
+[[ "$S" == "200" ]] || fail "tree fetch status $S"
+N=$(php -r 'echo count(json_decode(file_get_contents($argv[1]), true)["nodes"] ?? []);' "$TREE_BODY")
+[[ "$N" == "3" ]] || fail "expected 3 tree nodes (root + 2 levels), got $N"
+ok "GET /api/traces/{key}/tree?depth=2 → 200 + 3 nodes (root + 2 levels)"
 
 # 9) Zero token/salt hits across logs.
 HITS=0
