@@ -26,15 +26,46 @@ See [SPECIFICATION.md §2.1](./SPECIFICATION.md) for the canonical architecture 
 
 ## Prerequisites
 
-- **Rust toolchain** — `stable`, pinned via [`rust-toolchain.toml`](./rust-toolchain.toml). Includes `rustfmt` and `clippy`. The first `cargo build` will install the pinned components via `rustup`.
+- **Rust toolchain via `rustup`** — `stable`, pinned by [`rust-toolchain.toml`](./rust-toolchain.toml). `rustup` itself is **not in apt** on Debian; install it once with the canonical shell installer:
+
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  . "$HOME/.cargo/env"
+  ```
+
+  The first `cargo build` after that picks up the pinned components (`rustfmt`, `clippy`) automatically. The install script (Quick install below) does this for you when `cargo` isn't already on PATH.
 - **PHP 8.1 or newer** with PHP-FPM. The API code uses typed properties and `declare(strict_types=1)`.
+- **`pdo_sqlite` loaded in PHP-FPM.** On Debian this is the `php8.4-sqlite3` apt package — installed alongside `php8.4-fpm` does *not* pull it in. Without it, every `/api/*` request returns `500 internal_error`.
+- **`libclang-dev`** (build-time only). `cargo build` invokes `bindgen` via the `libsqlite3-sys` build script, which needs `libclang.so`. Missing this package makes the initial build fail with a non-obvious bindgen error.
 - **A reverse proxy** — Apache 2.4+ or nginx. Illustrative snippets live at [`etc/apache-example.conf`](./etc/apache-example.conf) and [`etc/nginx-example.conf`](./etc/nginx-example.conf).
 - **The upstream `php-analyze` PHP extension** — installed in the PHP build whose traces you want to see. The extension is in a separate repository: <https://github.com/kalaspuffar/php-analyze>.
 - **Linux x86_64.** The collector and the extension are both tested on Linux; other platforms are not covered.
 
+On a fresh Debian 13 box, this one-liner installs everything in the list above (substitute your distro's package manager as needed):
+
+```bash
+sudo apt-get install -y apache2 php8.4-fpm php8.4-sqlite3 libclang-dev curl openssl
+```
+
+The Rust toolchain itself comes from `rustup`. If you don't have it, install via the rustup script and accept defaults.
+
 ## Quickstart
 
 The steps below take an operator from `git clone` to a finalized trace visible in the UI on a Linux host that already has PHP-FPM and Apache (or nginx) running.
+
+### Quick install (Debian 13)
+
+On a freshly-imaged Debian 13 box, every step in the rest of this Quickstart is bundled into one idempotent script:
+
+```bash
+git clone https://github.com/kalaspuffar/php-tree-visualizer.git
+cd php-tree-visualizer
+sudo bash etc/install-debian.sh <your-hostname>
+```
+
+The script installs apt packages, enables Apache modules, builds the collector, deploys the config + systemd unit + vhost, starts everything, and runs a smoke test that POSTs a probe batch and confirms it lands in `/api/traces`. Re-running on a working install is a no-op — secrets are preserved, packages are skipped, the vhost is overwritten from the tracked template.
+
+The script is Debian-13-only; the hand-curated steps below describe what it does, in case you're on a different distro or want to understand the deployment shape before you trust the script.
 
 ### 1. Clone and build the collector
 
@@ -78,22 +109,34 @@ Mode `0640` means owner-write + group-read — the collector (running as you) ca
 
 The shape of [`etc/collector.toml.example`](./etc/collector.toml.example) mirrors [SPECIFICATION.md §7.3](./SPECIFICATION.md). Pay attention to:
 
-- `[server].bind` — must be a loopback address (`127.0.0.1:<port>` or `[::1]:<port>`). The collector refuses to bind anything else.
+- `[server].bind` — must be a loopback address (`127.0.0.1:<port>` or `[::1]:<port>`). The collector refuses to bind anything else and exits with a clear error on startup. **Why loopback?** The spec ([§3.4 / NF-4.4](./SPECIFICATION.md)) assumes a reverse proxy in front of the collector that terminates TLS and gates the public-internet edge. The collector itself doesn't speak TLS and isn't hardened for direct public exposure; `0.0.0.0` would expose the bearer-token endpoint on every interface, contradicting the threat model. Keep it loopback and let Apache/nginx do the public-facing work.
 - `[auth].token` and `[auth].session_salt` — each at least 32 characters, distinct from each other. Generate with `openssl rand -base64 33 | tr -d +/= | head -c 40`.
 - `[storage].data_dir` — the directory you created in step 2.
 
 ### 4. Run the collector
 
-Set `umask 0007` so the collector creates SQLite files at mode `0660` (group-readable+writable), then start the binary:
+The recommended path is via systemd. A tracked, working unit lives at [`etc/php-tree-viz-collector.service.example`](./etc/php-tree-viz-collector.service.example) — copy it to `/etc/systemd/system/`, reload, enable:
+
+```bash
+sudo install -o root -g root -m 0644 etc/php-tree-viz-collector.service.example \
+    /etc/systemd/system/php-tree-viz-collector.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now php-tree-viz-collector
+sudo systemctl status php-tree-viz-collector
+```
+
+The tracked unit is `Type=simple` (not `Type=notify` like [SPECIFICATION.md §3.6](./SPECIFICATION.md) shows — the binary doesn't call `sd_notify` yet, so the spec's sample would hang on startup and time out; the example unit's top comment explains the deviation). It sets `UMask=0007` so SQLite files land at mode `0660` and the PHP API can read them via the shared `www-data` group.
+
+For ad-hoc verification without systemd, just run the binary in the foreground:
 
 ```bash
 umask 0007
 ./target/release/php-tree-viz-collector --config /etc/php-tree-viz/collector.toml
 ```
 
-The collector emits structured `tracing` events on stdout. The first events tell you the config loaded, the listener bound, and the periodic disk-usage gauge started. See [Expected output](#expected-output) for a sample.
+The collector emits structured `tracing` events on stdout (or journald, via systemd). The first events tell you the config loaded, the listener bound, and the periodic disk-usage gauge started. See [Expected output](#expected-output) for a sample.
 
-For a long-running deployment, run under `systemd` (the spec includes a sample unit at [SPECIFICATION.md §3.6](./SPECIFICATION.md)) so journald captures the stream. Set `UMask=0007` in the service unit's `[Service]` section so the same file modes apply.
+The example config defaults to `log.format = "json"` — the [Expected output](#expected-output) sample below shows that shape. If you'd rather eyeball plain text during initial wiring, flip the value to `"text"` and `sudo systemctl restart php-tree-viz-collector`; the same events come out as `<timestamp>  INFO target: <message> field=value …` lines. The field set is identical between the two formats.
 
 ### 5. Front it with Apache or nginx
 
@@ -102,15 +145,23 @@ The collector binds to localhost only. The web stack (PHP API + static frontend)
 - Apache: [`etc/apache-example.conf`](./etc/apache-example.conf)
 - nginx: [`etc/nginx-example.conf`](./etc/nginx-example.conf)
 
-Both snippets map `/api/*` to the PHP files in [`api/`](./api/) and `/viz/*` to the static frontend in [`viz/`](./viz/). They also refuse `/api/internal/*` (those are PHP includes, never HTTP-reachable).
+Both snippets map `/api/*` to the PHP files in [`api/`](./api/) and `/viz/*` to the static frontend in [`viz/`](./viz/). They also refuse `/api/internal/*` (those are PHP includes, never HTTP-reachable). The Apache snippet additionally proxies `/ingest/v1` to the collector on `127.0.0.1:8088` and redirects `/` to `/viz/login.html`.
 
-A few things worth checking on your reverse proxy before reloading:
+For Apache, enable the full set of modules the snippet uses **before** you reload — note that `a2enmod proxy_fcgi` does NOT auto-enable `proxy` or `proxy_http`; you have to name them all:
 
-- **`pdo_sqlite` MUST be loaded in the PHP-FPM build** that handles `/api/*.php`. On Debian, this is the `php8.x-sqlite3` package — installed for PHP 8.4 on a default install, but not always for 8.3 or older. Verify with `php-fpm8.x -m | grep pdo_sqlite`. The vhost's `<FilesMatch>` socket path is where you select the PHP version.
-- **If you symlink `/var/www/<your-site>/{api,viz}` to this repo's `api/` and `viz/` directories** (rather than copying them), Apache 2.4 requires `Options +FollowSymLinks` inside the `<Directory>` block. The example snippet does not include this — add it if you use symlinks.
+```bash
+sudo a2enmod proxy proxy_fcgi proxy_http rewrite headers
+sudo a2enconf php8.4-fpm
+sudo systemctl reload apache2
+```
+
+A few more things worth checking before reloading:
+
+- **`pdo_sqlite` MUST be loaded in the PHP-FPM build** that handles `/api/*.php`. On Debian this is `php8.4-sqlite3` (named in the Prerequisites apt one-liner above). Verify with `php-fpm8.4 -m | grep pdo_sqlite` — if it returns nothing, the API will 500 on every `/api/*` request.
+- **If you symlink `/var/www/<your-site>/{api,viz}` to this repo's `api/` and `viz/` directories** (rather than copying them), Apache 2.4 requires `Options +FollowSymLinks` inside the relevant `<Directory>` block. The example snippet explains this in its leading comments.
 - **If the symlink target sits inside your home directory** (`/home/$USER/...`), make sure `www-data` can traverse it. Debian's default `/home/$USER` is mode `0700`; widen it to `0701` (`chmod o+x /home/$USER`) or move the files into a www-data-readable path. Mode `0701` keeps your files private from other users while letting daemons enter to follow symlinks.
 
-Reload the reverse proxy after editing the config.
+Reload the reverse proxy after editing the config (the `systemctl reload apache2` above does it).
 
 ### 6. Send a probe batch
 
@@ -142,20 +193,19 @@ Browse to `http://<your-host>/viz/login.html`, sign in with the same bearer toke
 
 ### Expected output
 
-A successful run of steps 4–6 above produces a `tracing` event stream that starts like this. Timestamps, ports, byte counts, PIDs, and trace identifiers vary run-to-run; `<placeholder>` tokens mark the parts that change. The structure (event message, field names, level prefix) is what to verify.
+A successful run of steps 4–6 above produces a `tracing` event stream in the journal. The example config ships `log.format = "json"`, so each event is one JSON object on its own line. Timestamps, byte counts, PIDs, and trace identifiers vary run-to-run; `<placeholder>` tokens mark the parts that change. The structure — event message, field names, level — is what to verify against.
 
-```text
-<timestamp>  INFO config: configuration loaded path=/etc/php-tree-viz/collector.toml bind=127.0.0.1:<port> data_dir=/var/lib/php-tree-viz retention_days=30 queue_capacity=256 max_body_bytes=67108864 log_level=info log_format=text
-<timestamp>  INFO php_tree_viz_collector::http::server: listening addr=127.0.0.1:<port>
-<timestamp>  INFO php_tree_viz_collector::observability::disk_usage: disk usage data_dir_bytes=<N> trace_count=0 threshold_pct=80 over_threshold=false
-<timestamp>  INFO php_tree_viz_collector::http::logging: request method=POST path=/ingest/v1 remote_addr=127.0.0.1:<port> status=200 body_bytes=<N>
-<timestamp>  INFO php_tree_viz_collector::http::server: batch accepted trace_key=<32hex> trace_id=00000000-0000-0000-0000-000000000000 host=<host> pid=<pid> body_bytes=<N> dict_entries=<N> call_count=<N> nodes=<N> pending=<N> anomalies=0
-<timestamp>  INFO php_tree_viz_collector::finalize: trace finalized trace_key=<32hex> pending_dq2=0 cpu_snapshot_available=true
+```json
+{"timestamp":"<timestamp>","level":"INFO","message":"configuration loaded","path":"/etc/php-tree-viz/collector.toml","bind":"127.0.0.1:8088","data_dir":"/var/lib/php-tree-viz","retention_days":30,"queue_capacity":256,"max_body_bytes":67108864,"log_level":"info","log_format":"json","target":"config"}
+{"timestamp":"<timestamp>","level":"INFO","message":"listening","addr":"127.0.0.1:8088","target":"php_tree_viz_collector::http::server"}
+{"timestamp":"<timestamp>","level":"INFO","message":"disk usage","data_dir_bytes":<N>,"trace_count":0,"threshold_pct":80,"over_threshold":false,"target":"php_tree_viz_collector::observability::disk_usage"}
+{"timestamp":"<timestamp>","level":"INFO","message":"batch accepted","trace_key":"<32hex>","trace_id":"00000000-0000-0000-0000-000000000000","host":"<host>","pid":<pid>,"body_bytes":<N>,"dict_entries":<N>,"call_count":<N>,"nodes":<N>,"pending":0,"anomalies":0,"target":"php_tree_viz_collector::http::server"}
+{"timestamp":"<timestamp>","level":"INFO","message":"trace finalized","trace_key":"<32hex>","pending_dq2":0,"cpu_snapshot_available":true,"target":"php_tree_viz_collector::finalize"}
 ```
 
-After 30 s of no further batches, the `trace finalized` event appears for the same `trace_key`. The `disk usage` event repeats once per hour by default — adjust `[observability].disk_usage_tick_seconds` in the config for a snappier cadence during testing.
+View it directly with `sudo journalctl -u php-tree-viz-collector --output cat --no-pager`. Feed it through `jq` to filter — for example, `jq -r 'select(.message == "batch accepted") | .trace_key'` lists every accepted trace's key. The `disk usage` event repeats once per hour by default; adjust `[observability].disk_usage_tick_seconds` in the config for a snappier cadence during testing.
 
-If you ran with `log.format = "json"` (the production default) instead of `"text"`, each line is a JSON object with the same fields flattened to the top level.
+If you prefer the human-readable line layout for an interactive verification, flip `log.format` to `"text"` in `/etc/php-tree-viz/collector.toml` and `sudo systemctl restart php-tree-viz-collector`. The same events come out shaped like `<timestamp>  INFO target: <message> field=value …` on a single line per event — easier to eyeball, harder to filter by program.
 
 If you don't see the `listening` event within a second of starting the binary, look for a `config error:` or `observability error:` line on stderr — those are the only places the collector writes outside of the `tracing` subscriber, and they signal a startup failure.
 
@@ -173,7 +223,10 @@ The signals an operator usually cares about:
 
 Filter level is `log.level` in the config (`trace|debug|info|warn|error`, default `info`). Override at runtime with the `RUST_LOG` environment variable; a malformed `RUST_LOG` falls back to the config level with a `warn` event explaining what happened.
 
-Output format is `log.format` (`text` for the layout shown under [Expected output](#expected-output), `json` for one JSON object per event with all fields flattened — what journald wants).
+Output format is `log.format`. Two shapes:
+
+- **`json`** (the production default; what [Expected output](#expected-output) shows) — one JSON object per event, with every field flattened to the top level. journald reads this natively; `journalctl -u php-tree-viz-collector --output cat` prints one object per line; `jq` filters across them cleanly.
+- **`text`** — `<timestamp>  INFO target: <message> field=value …` on a single line per event. Easier to eyeball, harder to filter by program. Flip `log.format = "text"` in the config and `sudo systemctl restart php-tree-viz-collector` to switch.
 
 ## Project status
 
