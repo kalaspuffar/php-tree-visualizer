@@ -1,26 +1,32 @@
 name: CI
 
-# Three parallel jobs gate every PR and every push to `main`:
+# Four parallel jobs gate every PR and every push to `main`:
 #
-#   rust:     cargo fmt --all -- --check
-#             cargo clippy --all-targets --all-features -- -D warnings
-#             cargo test  --all-targets --all-features
+#   rust:          cargo fmt --all -- --check
+#                  cargo clippy --all-targets --all-features -- -D warnings
+#                  cargo test  --all-targets --all-features
 #
-#   php:      php tests/api/run.php
-#             (the API test harness — unit + integration, ~600
-#             assertions across Phases 3 + 4)
+#   php:           php tests/api/run.php
+#                  (the API test harness — unit + integration, ~600
+#                  assertions across Phases 3 + 4)
 #
-#   frontend: node tests/frontend/run.js
-#             (Node-based unit tests for the framework-free JS
-#             modules under viz/js/)
+#   frontend:      node tests/frontend/run.js
+#                  (Node-based unit tests for the framework-free JS
+#                  modules under viz/js/)
 #
-# All three already run locally before every commit; CI is the
-# safety net for "I forgot to run the suite" days.
+#   proxy-configs: bash tools/validate-proxy-configs.sh
+#                  (apache2ctl -t and nginx -t against the example
+#                  fragments under etc/, via the .in wrappers)
+#
+# All four already run locally before every commit (the proxy
+# configtests via the tools/ script); CI is the safety net for
+# "I forgot to run the suite" days.
 #
 # The Rust toolchain is pinned via `rust-toolchain.toml`. The PHP
 # and Node versions are pinned here in the workflow (PHP aligned
 # with the operator's dev host per SPECIFICATION.md §7.1; Node at
-# the current LTS line).
+# the current LTS line). The proxy-configs job uses whatever
+# `apache2` and `nginx-light` Ubuntu's apt ships on the runner.
 
 on:
   push:
@@ -126,3 +132,31 @@ jobs:
         # child Node process, prints pass/fail, exits non-zero on
         # any failure.
         run: node tests/frontend/run.js
+
+  proxy-configs:
+    name: proxy — apache + nginx configtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install apache2 + nginx-light
+        # Both packages exist in the ubuntu-latest apt repos.
+        # --no-install-recommends keeps the install minimal:
+        # we only need the binaries (`apache2ctl`, `nginx`)
+        # and their core modules for `-t` / `configtest`.
+        # nginx-light matches what etc/install-debian.sh
+        # installs, keeping CI and the operator install
+        # path on the same package.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends apache2 nginx-light
+
+      - name: Validate etc/apache-example.conf and etc/nginx-example.conf
+        # The script generates wrappers from the .in templates
+        # (substituting __REPO_ROOT__) and runs apache2ctl -t
+        # plus nginx -t. Exit non-zero on any failure with the
+        # offending tool's stderr re-emitted for the CI log.
+        run: bash tools/validate-proxy-configs.sh
