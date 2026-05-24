@@ -108,19 +108,39 @@ systemctl reload php8.4-fpm
 # 3. Build + install the collector binary
 # ---------------------------------------------------------------------
 
+# cargo runs as the repo owner (not root) so its target/ dir belongs
+# to the user, not root. Switch to the repo owner if we're root, and
+# always source ~/.cargo/env if it exists so freshly-installed
+# rustup is on PATH for the same script invocation.
+OWNER="$(stat -c '%U' "$REPO_ROOT")"
+# $HOME deliberately left unexpanded — it expands inside the inner
+# shell as the repo owner, not in this outer shell (which may be root).
+# shellcheck disable=SC2016
+CARGO_ENV_SOURCE='[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env";'
+run_as_owner() {
+    if [ "$(id -u)" -eq 0 ] && [ "$OWNER" != "root" ]; then
+        sudo -u "$OWNER" -H bash -c "$CARGO_ENV_SOURCE $1"
+    else
+        bash -c "$CARGO_ENV_SOURCE $1"
+    fi
+}
+
+step "Ensuring rustup + a stable Rust toolchain are installed"
+# rustup is not in apt. Install via the canonical sh.rustup.rs script
+# if it's missing. The toolchain is pinned by the repo's
+# rust-toolchain.toml; we just need rustup itself + the cargo wrapper.
+if ! run_as_owner 'command -v cargo >/dev/null 2>&1'; then
+    note "rustup not found in $OWNER's PATH; installing via sh.rustup.rs"
+    run_as_owner 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
+else
+    note "rustup already present"
+fi
+
 step "Building the collector (cargo build --release)"
 RELEASE_BIN="$REPO_ROOT/target/release/php-tree-viz-collector"
 if [ ! -x "$RELEASE_BIN" ] || [ -n "$(find "$REPO_ROOT/crates" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" -newer "$RELEASE_BIN" -type f -print -quit 2>/dev/null)" ]; then
     note "compiling — this can take several minutes on a fresh box"
-    # cargo runs as the repo owner (not root) so its target/ dir
-    # belongs to the user, not root. Switch to the repo owner if
-    # we're root.
-    OWNER="$(stat -c '%U' "$REPO_ROOT")"
-    if [ "$(id -u)" -eq 0 ] && [ "$OWNER" != "root" ]; then
-        sudo -u "$OWNER" -H bash -c "cd '$REPO_ROOT' && cargo build --release --quiet"
-    else
-        (cd "$REPO_ROOT" && cargo build --release --quiet)
-    fi
+    run_as_owner "cd '$REPO_ROOT' && cargo build --release --quiet"
 else
     note "binary already built and up to date"
 fi

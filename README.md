@@ -26,7 +26,14 @@ See [SPECIFICATION.md §2.1](./SPECIFICATION.md) for the canonical architecture 
 
 ## Prerequisites
 
-- **Rust toolchain** — `stable`, pinned via [`rust-toolchain.toml`](./rust-toolchain.toml). Includes `rustfmt` and `clippy`. The first `cargo build` will install the pinned components via `rustup`.
+- **Rust toolchain via `rustup`** — `stable`, pinned by [`rust-toolchain.toml`](./rust-toolchain.toml). `rustup` itself is **not in apt** on Debian; install it once with the canonical shell installer:
+
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  . "$HOME/.cargo/env"
+  ```
+
+  The first `cargo build` after that picks up the pinned components (`rustfmt`, `clippy`) automatically. The install script (Quick install below) does this for you when `cargo` isn't already on PATH.
 - **PHP 8.1 or newer** with PHP-FPM. The API code uses typed properties and `declare(strict_types=1)`.
 - **`pdo_sqlite` loaded in PHP-FPM.** On Debian this is the `php8.4-sqlite3` apt package — installed alongside `php8.4-fpm` does *not* pull it in. Without it, every `/api/*` request returns `500 internal_error`.
 - **`libclang-dev`** (build-time only). `cargo build` invokes `bindgen` via the `libsqlite3-sys` build script, which needs `libclang.so`. Missing this package makes the initial build fail with a non-obvious bindgen error.
