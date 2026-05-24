@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+
+  <title>PHP Tree Visualizer — Trace</title>
+  <link rel="stylesheet" href="/viz/assets/styles.css">
+</head>
+<body class="trace-page">
+
+  <header class="trace-header">
+    <nav aria-label="Breadcrumb" class="breadcrumb">
+      <a class="breadcrumb__back" href="/viz/index.html">
+        <svg class="icon" aria-hidden="true">
+          <use href="/viz/assets/icons.svg#icon-arrow-left"/>
+        </svg>
+        Traces
+      </a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <h1 id="trace-uri" class="breadcrumb__uri h1" title=""></h1>
+
+      <div class="breadcrumb__key">
+        <span class="micro breadcrumb__key-label">KEY:</span>
+        <span id="trace-key-short" class="code"></span>
+        <button id="copy-key" type="button" class="icon-button"
+                aria-label="Copy full trace key">
+          <svg class="icon" aria-hidden="true">
+            <use href="/viz/assets/icons.svg#icon-copy"/>
+          </svg>
+        </button>
+        <span id="copy-tooltip" class="copy-tooltip" hidden role="status"
+              aria-live="polite">Copied</span>
+      </div>
+    </nav>
+
+    <div id="metadata-strip" class="metadata-strip"></div>
+
+    <div id="banner-zone" class="banner-zone"></div>
+  </header>
+
+  <main class="trace-body">
+    <div id="error-banner" class="banner banner--danger" hidden></div>
+
+    <div id="empty-state" class="empty-state" hidden>
+      <svg class="empty-state__illustration" viewBox="0 0 96 96" fill="none"
+           stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M14 48a18 18 0 1 1 36 0"/>
+        <path d="M48 30v18l8 4"/>
+        <path d="m60 60 22 22"/>
+        <path d="M68 60h14v14"/>
+      </svg>
+      <h2 class="h2 empty-state__title">Trace not found.</h2>
+      <p class="body empty-state__body">
+        It may have been pruned. Default retention is 30 days.
+      </p>
+      <a href="/viz/index.html" class="button button--text">← Back to traces</a>
+    </div>
+
+    <div id="tree-wrapper" class="tree-wrapper">
+      <div class="column-header" role="row">
+        <span class="column-header__cell micro" role="columnheader"
+              data-col="fqn">Function</span>
+        <span class="column-header__cell micro column-header__cell--right"
+              role="columnheader" data-col="count">Count</span>
+        <span class="column-header__cell micro column-header__cell--right"
+              role="columnheader" data-col="total_wall">Total</span>
+        <span class="column-header__cell micro column-header__cell--right"
+              role="columnheader" data-col="self_wall">Self</span>
+        <span class="column-header__cell micro column-header__cell--right"
+              role="columnheader" data-col="pct_parent">%Parent</span>
+        <span class="column-header__cell micro column-header__cell--right"
+              role="columnheader" data-col="mem_delta">Mem</span>
+      </div>
+
+      <div id="tree-viewport" class="tree-viewport"
+           role="tree" aria-label="Call tree">
+        <div id="tree-spacer" class="tree-spacer"></div>
+        <ul id="tree-rows" class="tree-rows" role="presentation">
+          <!-- Pre-rendered skeleton rows; replaced by detail.js on
+               response. Five 28-px blocks per §3.3.9. -->
+          <li class="skeleton-tree-row" aria-hidden="true">
+            <div class="skeleton-row__block" style="width: 60%"></div>
+          </li>
+          <li class="skeleton-tree-row" aria-hidden="true">
+            <div class="skeleton-row__block" style="width: 45%"></div>
+          </li>
+          <li class="skeleton-tree-row" aria-hidden="true">
+            <div class="skeleton-row__block" style="width: 70%"></div>
+          </li>
+          <li class="skeleton-tree-row" aria-hidden="true">
+            <div class="skeleton-row__block" style="width: 50%"></div>
+          </li>
+          <li class="skeleton-tree-row" aria-hidden="true">
+            <div class="skeleton-row__block" style="width: 35%"></div>
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Copy-fallback modal: hidden by default; shown when the
+         clipboard API rejects or is absent. -->
+    <div id="copy-modal" class="modal" hidden role="dialog"
+         aria-modal="true" aria-labelledby="copy-modal-title">
+      <div class="modal__card">
+        <h2 id="copy-modal-title" class="h2">Copy trace key</h2>
+        <p class="small">Select all and copy with Ctrl/Cmd+C.</p>
+        <input id="copy-modal-input" type="text" readonly
+               class="login-input copy-modal__input">
+        <button id="copy-modal-close" type="button" class="button">OK</button>
+      </div>
+    </div>
+  </main>
+
+  <script type="module" src="/viz/js/detail.js"></script>
+</body>
+</html>

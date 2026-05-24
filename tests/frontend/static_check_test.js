@@ -66,24 +66,28 @@ for (const file of htmlFiles) {
     }
 }
 
-// 9.3 — list.js is read-only against the API. No write-method
-// string literal.
-const listSrc = read(path.join(vizDir, "js", "list.js"));
-for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
-    const needle = `'${method}'`;
-    assert_eq(false, listSrc.includes(needle),
-        `list.js does not contain literal ${needle}`);
-    const dq = `"${method}"`;
-    assert_eq(false, listSrc.includes(dq),
-        `list.js does not contain literal ${dq}`);
+// 9.3 — read-only API surface. Neither list.js nor detail.js may
+// issue write methods (the entire read-only frontend can't POST).
+// Phase 5 covered list.js; Phase 6 extends to detail.js and the
+// two new internal modules.
+const readOnlyClientFiles = ["list.js", "detail.js", "virtualizer.js", "tree-row.js"];
+for (const fname of readOnlyClientFiles) {
+    const src = read(path.join(vizDir, "js", fname));
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        const needle = `'${method}'`;
+        assert_eq(false, src.includes(needle),
+            `${fname} does not contain literal ${needle}`);
+        const dq = `"${method}"`;
+        assert_eq(false, src.includes(dq),
+            `${fname} does not contain literal ${dq}`);
+    }
 }
 
-// 9.4 — neither login.js nor list.js logs secret-shaped values.
-// The heuristic: no console.* call whose argument expression mentions
-// `token`, `password`, or a generic `body`/`request` variable name.
+// 9.4 — no JS file logs secret-shaped values. Same heuristic as
+// Phase 5, extended to detail.js / virtualizer.js / tree-row.js.
 const consoleCall = /console\.\w+\s*\([^)]*\b(token|password|body|request)\b[^)]*\)/;
 
-for (const fname of ["login.js", "list.js"]) {
+for (const fname of ["login.js", "list.js", "detail.js", "virtualizer.js", "tree-row.js"]) {
     const src = read(path.join(vizDir, "js", fname));
     assert_eq(null, src.match(consoleCall),
         `${fname} does not console.log token/password/body`);
@@ -100,8 +104,14 @@ assert_eq(false, loginSrc.includes("sessionStorage"),
 assert_eq(false, loginSrc.includes("document.cookie"),
     "login.js does not touch document.cookie");
 
-const listSrcAll = read(path.join(vizDir, "js", "list.js"));
-assert_eq(false, listSrcAll.includes("document.cookie"),
-    "list.js does not touch document.cookie");
+for (const fname of ["list.js", "detail.js", "virtualizer.js", "tree-row.js"]) {
+    const src = read(path.join(vizDir, "js", fname));
+    assert_eq(false, src.includes("document.cookie"),
+        `${fname} does not touch document.cookie`);
+    assert_eq(false, src.includes("localStorage"),
+        `${fname} does not use localStorage`);
+    assert_eq(false, src.includes("sessionStorage"),
+        `${fname} does not use sessionStorage`);
+}
 
 report_done();
