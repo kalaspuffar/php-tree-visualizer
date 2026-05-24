@@ -15,8 +15,15 @@
 #   bash tools/validate-proxy-configs.sh
 #
 # The script generates a temporary, substituted copy and
-# runs `nginx -t -c <that-copy> -p /tmp`. Expected output:
-# "test is successful" with exit 0.
+# runs `nginx -t -c <that-copy> -p /etc/nginx`. The
+# `-p /etc/nginx` is needed because etc/nginx-example.conf
+# uses `include fastcgi_params;` (a relative include that
+# nginx resolves against the prefix). On Debian/Ubuntu the
+# nginx-light package ships fastcgi_params at
+# /etc/nginx/fastcgi_params. This wrapper's own pid/log/
+# access paths are absolute under /tmp/ so they're
+# unaffected by the prefix. Expected output: "test is
+# successful" with exit 0.
 #
 # Why this exists: etc/nginx-example.conf is a server-block
 # fragment (location blocks only, no surrounding

@@ -102,6 +102,24 @@ generate_wrapper() {
 
 # ---- Individual configtests -----------------------------------------
 
+# Capture a configtest invocation under explicit `set +e` brackets.
+# Bash's `set -e` interaction with `var=$(cmd)` assignments is
+# version-dependent — defensively suppressing it around the
+# capture means a non-zero exit always lands in $rc instead of
+# silently killing the script. We restore -e immediately after.
+capture_configtest() {
+    local _output_var="$1"
+    local _rc_var="$2"
+    shift 2
+    set +e
+    local _output
+    _output="$("$@" 2>&1)"
+    local _rc=$?
+    set -e
+    printf -v "$_output_var" '%s' "$_output"
+    printf -v "$_rc_var" '%s' "$_rc"
+}
+
 run_apache_configtest() {
     # We call the apache2 binary directly, not the apache2ctl wrapper,
     # because Debian's apache2ctl unconditionally runs
@@ -122,11 +140,10 @@ run_apache_configtest() {
     local wrapper
     wrapper="$(generate_wrapper "$APACHE_TEMPLATE" apache)"
 
-    # `apache2 -t -f <file>` writes "Syntax OK" to stderr on success
-    # (Apache convention). We capture both streams and inspect them.
+    echo ">>> running ${apache_bin} -t -f ${wrapper}" >&2
     local output rc
-    output="$("$apache_bin" -t -f "$wrapper" 2>&1)"
-    rc=$?
+    capture_configtest output rc "$apache_bin" -t -f "$wrapper"
+    echo ">>> apache2 -t exited rc=${rc}" >&2
     if [ "$rc" -ne 0 ] || ! grep -q 'Syntax OK' <<<"$output"; then
         echo "error: apache2 -t FAILED against etc/apache-example.conf" >&2
         echo "------ apache2 -t output ------" >&2
@@ -145,12 +162,16 @@ run_nginx_configtest() {
     local wrapper
     wrapper="$(generate_wrapper "$NGINX_TEMPLATE" nginx)"
 
-    # `nginx -t -c <file> -p /tmp` runs the configtest with `/tmp` as
-    # the prefix, so any default-relative paths in nginx land in a
-    # writable location. nginx writes its configtest banner to stderr.
+    # `-p /etc/nginx` so relative includes inside etc/nginx-example.conf
+    # (specifically `include fastcgi_params;`) resolve against the
+    # standard Debian/Ubuntu nginx prefix where fastcgi_params ships
+    # with the nginx-light package. The wrapper's own pid/log/access
+    # paths are absolute under /tmp/ so they're unaffected by the
+    # prefix.
+    echo ">>> running nginx -t -c ${wrapper} -p /etc/nginx" >&2
     local output rc
-    output="$(nginx -t -c "$wrapper" -p /tmp 2>&1)"
-    rc=$?
+    capture_configtest output rc nginx -t -c "$wrapper" -p /etc/nginx
+    echo ">>> nginx -t exited rc=${rc}" >&2
     if [ "$rc" -ne 0 ] || ! grep -q 'test is successful' <<<"$output"; then
         echo "error: nginx -t FAILED against etc/nginx-example.conf" >&2
         echo "------ nginx -t output ------" >&2
