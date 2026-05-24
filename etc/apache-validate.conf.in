@@ -1,0 +1,63 @@
+# apache-validate.conf.in — input template used ONLY to
+# syntax-check etc/apache-example.conf. NOT for serving
+# traffic.
+#
+# This is an INPUT template: the `__REPO_ROOT__` placeholder
+# below is substituted by `tools/validate-proxy-configs.sh`
+# with the absolute path of this checkout at runtime. Do not
+# run `apache2ctl -t -f` against this file directly — the
+# Include would resolve to a literal `__REPO_ROOT__/etc/...`
+# path that does not exist.
+#
+# Usage (the supported entry point):
+#   bash tools/validate-proxy-configs.sh --proxy=apache
+# or, for both proxies in one go:
+#   bash tools/validate-proxy-configs.sh
+#
+# The script generates a temporary, substituted copy and
+# runs `apache2ctl -t -f <that-copy>`. Expected output:
+# "Syntax OK" (plus a benign "DocumentRoot does not exist"
+# warning — the path inside the example file is illustrative).
+#
+# What this file pulls in: just enough — MPM, proxy,
+# proxy_fcgi, rewrite, headers, alias, mime — to satisfy the
+# directives in apache-example.conf, wrapped inside a
+# <VirtualHost> so `apache2ctl -t` can parse it. The example
+# file itself is a vhost fragment (no <VirtualHost>, no
+# Listen, no MPM), which is the right shape for the operator
+# to paste into their existing vhost — but it can't be
+# validated standalone without scaffolding. This wrapper is
+# the scaffolding.
+
+ServerRoot /etc/apache2
+PidFile    /tmp/phptv-apache-validate.pid
+Mutex      file:/tmp default
+
+# mpm_prefork is what Debian/Ubuntu enable by default. If your host
+# uses event or worker, swap the module path here.
+LoadModule mpm_prefork_module /usr/lib/apache2/modules/mod_mpm_prefork.so
+
+LoadModule authz_core_module  /usr/lib/apache2/modules/mod_authz_core.so
+LoadModule authz_host_module  /usr/lib/apache2/modules/mod_authz_host.so
+LoadModule alias_module       /usr/lib/apache2/modules/mod_alias.so
+LoadModule rewrite_module     /usr/lib/apache2/modules/mod_rewrite.so
+LoadModule headers_module     /usr/lib/apache2/modules/mod_headers.so
+LoadModule mime_module        /usr/lib/apache2/modules/mod_mime.so
+LoadModule proxy_module       /usr/lib/apache2/modules/mod_proxy.so
+LoadModule proxy_fcgi_module  /usr/lib/apache2/modules/mod_proxy_fcgi.so
+
+# unixd_module and log_config_module are statically linked into the
+# apache2 binary on Debian/Ubuntu — do NOT LoadModule them.
+
+User  www-data
+Group www-data
+
+Listen 8080
+ServerName phptv-validate.local
+
+ErrorLog    /tmp/phptv-apache-validate.error.log
+TypesConfig /etc/mime.types
+
+<VirtualHost *:8080>
+    Include __REPO_ROOT__/etc/apache-example.conf
+</VirtualHost>
