@@ -50,10 +50,30 @@ php -r '
 require "tests/api/fixtures/make_index_sqlite.php";
 make_index_sqlite($argv[1], [
     ["trace_key" => str_repeat("1", 32), "uri_or_script" => "/srv/app/index.php", "start_time_ns" => 1700000000000000000],
-    ["trace_key" => str_repeat("2", 32), "uri_or_script" => "/srv/app/bin/run-tests.php", "start_time_ns" => 1700000001000000000],
+    ["trace_key" => str_repeat("2", 32), "uri_or_script" => "/srv/app/bin/run-tests.php", "start_time_ns" => 1700000001000000000, "anomaly_count" => 1],
     ["trace_key" => str_repeat("3", 32), "uri_or_script" => "/srv/app/cron/run-nightly.php", "start_time_ns" => 1700000002000000000, "state" => "active"],
 ]);
 ' "$DATA_DIR/index.sqlite"
+
+# Phase 4: build one per-trace `<key>.sqlite` so the trace-detail
+# endpoints have something to read. Use trace_key="22…" so we can
+# cross-check anomaly_count (1 in the index) on the metadata endpoint.
+php -r '
+require "tests/api/fixtures/make_trace_sqlite.php";
+$key = str_repeat("2", 32);
+make_trace_sqlite(
+    $argv[1] . "/traces/" . $key . ".sqlite",
+    ["trace_key" => $key, "uri_or_script" => "/srv/app/bin/run-tests.php",
+     "start_time_ns" => 1700000001000000000],
+    [1 => ["fqn" => "main"], 2 => ["fqn" => "helper"]],
+    [
+        ["node_id" => 2, "parent_node_id" => 1, "fn_id" => 1, "depth" => 1,
+         "total_wall_ns" => 800, "call_count" => 1],
+        ["node_id" => 3, "parent_node_id" => 2, "fn_id" => 2, "depth" => 2,
+         "total_wall_ns" => 400, "call_count" => 3],
+    ]
+);
+' "$DATA_DIR"
 
 # Pick a free port.
 PORT="$(php -r '$s = stream_socket_server("tcp://127.0.0.1:0"); $n = stream_socket_get_name($s, false); echo (int) substr($n, strrpos($n, ":") + 1); fclose($s);')"
@@ -125,6 +145,67 @@ if [[ "$FILTERED_TOTAL" != "2" ]]; then
     exit 1
 fi
 echo "  ok: filter matched 2 rows"
+
+echo "--- GET /api/traces/{key} (metadata) ---"
+META_BODY="$TMP/meta_body.json"
+META_KEY=$(printf '2%.0s' {1..32})
+META_STATUS=$(curl -sS -o "$META_BODY" -w '%{http_code}' \
+    -b "$JAR" \
+    "http://127.0.0.1:$PORT/api/traces/$META_KEY")
+if [[ "$META_STATUS" != "200" ]]; then
+    echo "FAIL: expected 200 from /api/traces/<key>, got $META_STATUS"
+    cat "$META_BODY"
+    exit 1
+fi
+ROOT_ID=$(php -r 'echo json_decode(file_get_contents($argv[1]), true)["root_node_id"] ?? "missing";' "$META_BODY")
+if [[ "$ROOT_ID" != "1" ]]; then
+    echo "FAIL: expected root_node_id=1, got $ROOT_ID"
+    cat "$META_BODY"
+    exit 1
+fi
+echo "  ok: 200 + root_node_id=1"
+
+echo "--- GET /api/traces/{key}/tree?depth=2 ---"
+TREE_BODY="$TMP/tree_body.json"
+TREE_STATUS=$(curl -sS -o "$TREE_BODY" -w '%{http_code}' \
+    -b "$JAR" \
+    "http://127.0.0.1:$PORT/api/traces/$META_KEY/tree?depth=2")
+if [[ "$TREE_STATUS" != "200" ]]; then
+    echo "FAIL: expected 200 from /tree, got $TREE_STATUS"
+    cat "$TREE_BODY"
+    exit 1
+fi
+NODE_COUNT=$(php -r 'echo count(json_decode(file_get_contents($argv[1]), true)["nodes"] ?? []);' "$TREE_BODY")
+if [[ "$NODE_COUNT" != "3" ]]; then
+    # Root + 2 children = 3 (depth=2 captures all 3 from the fixture)
+    echo "FAIL: expected 3 nodes, got $NODE_COUNT"
+    cat "$TREE_BODY"
+    exit 1
+fi
+echo "  ok: 200 + 3 nodes"
+
+echo "--- GET /api/traces/{key}/tree/1/children ---"
+CHILDREN_BODY="$TMP/children_body.json"
+CHILDREN_STATUS=$(curl -sS -o "$CHILDREN_BODY" -w '%{http_code}' \
+    -b "$JAR" \
+    "http://127.0.0.1:$PORT/api/traces/$META_KEY/tree/1/children")
+if [[ "$CHILDREN_STATUS" != "200" ]]; then
+    echo "FAIL: expected 200 from /children, got $CHILDREN_STATUS"
+    cat "$CHILDREN_BODY"
+    exit 1
+fi
+echo "  ok: 200 + children of root"
+
+echo "--- GET /api/traces/{missing-key} ---"
+GHOST_KEY=$(printf 'f%.0s' {1..32})
+GHOST_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -b "$JAR" \
+    "http://127.0.0.1:$PORT/api/traces/$GHOST_KEY")
+if [[ "$GHOST_STATUS" != "404" ]]; then
+    echo "FAIL: expected 404 for missing trace, got $GHOST_STATUS"
+    exit 1
+fi
+echo "  ok: 404 on unknown trace"
 
 echo "--- POST /api/auth (wrong token) ---"
 WRONG_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \

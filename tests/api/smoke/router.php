@@ -10,7 +10,7 @@ declare(strict_types=1);
  *   /api/auth             → api/auth.php
  *   /api/auth/logout      → api/auth.php
  *   /api/traces           → api/traces.php  (exact path)
- *   /api/traces/*         → 404 (Phase 4 file does not exist yet)
+ *   /api/traces/*         → api/trace.php   (Phase 4)
  *   anything else         → 404
  */
 
@@ -37,6 +37,11 @@ if ($path === '/api/auth' || $path === '/api/auth/logout') {
 
 if ($path === '/api/traces') {
     require $apiDir . '/traces.php';
+    return true;
+}
+
+if (str_starts_with($path, '/api/traces/')) {
+    require $apiDir . '/trace.php';
     return true;
 }
 
