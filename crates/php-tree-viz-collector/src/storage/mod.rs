@@ -20,7 +20,7 @@ use rusqlite::{params, Connection};
 
 pub use error::StorageError;
 
-pub(crate) use aggregate::AggregateOutcome;
+pub use aggregate::AggregateOutcome;
 
 /// Counters surfaced by `Storage::finalize_trace`. The finalize loop
 /// reads these to write its `finalized trace …` log line; tests read
@@ -259,6 +259,28 @@ impl Storage {
             .trace_conns
             .get_mut(key)
             .expect("just inserted; lookup must succeed"))
+    }
+
+    /// Total trace rows currently in `index.sqlite`. Used by the
+    /// disk-usage gauge to emit a `trace_count` field per tick.
+    /// Reads the count via `prepare_cached` so the statement is
+    /// reused across ticks (the query fires once per tick at hour
+    /// cadence in production; the cache is for tests).
+    pub fn count_traces(&self) -> Result<u64, StorageError> {
+        let mut stmt = self
+            .index_conn
+            .prepare_cached("SELECT COUNT(*) FROM traces")
+            .map_err(|e| StorageError::Query {
+                context: "prepare count_traces",
+                source: e,
+            })?;
+        let n: i64 =
+            stmt.query_row(params![], |row| row.get(0))
+                .map_err(|e| StorageError::Query {
+                    context: "query count_traces",
+                    source: e,
+                })?;
+        Ok(n.max(0) as u64)
     }
 
     /// List every `'active'` trace whose `last_batch_at_ns` precedes

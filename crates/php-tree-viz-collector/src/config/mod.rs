@@ -19,7 +19,8 @@ const ALLOWED_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"]
 const ALLOWED_LOG_FORMATS: &[&str] = &["json", "text"];
 
 /// The full collector configuration. Mirrors the section structure of
-/// `SPECIFICATION.md` §7.3.
+/// `SPECIFICATION.md` §7.3, plus an `[observability]` section owned
+/// by the `collector-observability` capability.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -32,6 +33,8 @@ pub struct Config {
     pub retention: Retention,
     #[serde(default)]
     pub log: Log,
+    #[serde(default)]
+    pub observability: Observability,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +59,14 @@ pub struct Auth {
 pub struct Storage {
     pub data_dir: PathBuf,
     pub retention_days: u32,
+    /// Reference denominator for the disk-usage gauge's
+    /// `over_threshold` calculation. Optional: when unset the gauge
+    /// still emits `data_dir_bytes` but `over_threshold` is always
+    /// `false`. Owned by `collector-observability` semantically;
+    /// kept under `[storage]` because that's the operator-facing
+    /// place to declare "I gave the data dir this much space."
+    #[serde(default)]
+    pub disk_capacity_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +130,39 @@ impl Default for Log {
     }
 }
 
+/// Configuration for the `collector-observability` capability — the
+/// periodic disk-usage gauge. Logging itself is configured by
+/// `[log]`; this section is for the gauge task only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observability {
+    /// How often the gauge fires, in seconds. Default 1 hour.
+    #[serde(default = "defaults::disk_usage_tick_seconds")]
+    pub disk_usage_tick_seconds: u64,
+    /// Threshold percentage. The gauge emits at `warn` level when
+    /// `data_dir_bytes >= storage.disk_capacity_bytes * warn_pct%`.
+    /// Default 80.
+    #[serde(default = "defaults::disk_usage_warn_pct")]
+    pub disk_usage_warn_pct: u8,
+    /// Test-only override that, when present, overrides
+    /// `disk_usage_tick_seconds` for the purpose of computing the
+    /// gauge's tick interval. Documented intentionally absent from
+    /// `etc/collector.toml.example`. Mirrors the
+    /// `retention.tick_seconds` pattern.
+    #[serde(default)]
+    pub disk_usage_tick_seconds_test_override: Option<u64>,
+}
+
+impl Default for Observability {
+    fn default() -> Self {
+        Self {
+            disk_usage_tick_seconds: defaults::disk_usage_tick_seconds(),
+            disk_usage_warn_pct: defaults::disk_usage_warn_pct(),
+            disk_usage_tick_seconds_test_override: None,
+        }
+    }
+}
+
 /// Defaults mirror `SPECIFICATION.md` §7.3. Defining them as functions
 /// (not `const` values) is required by `#[serde(default = "...")]`.
 mod defaults {
@@ -143,6 +187,12 @@ mod defaults {
     pub(super) fn log_format() -> String {
         "json".to_owned() // §7.3: "or 'text'"
     }
+    pub(super) fn disk_usage_tick_seconds() -> u64 {
+        3_600 // one hour
+    }
+    pub(super) fn disk_usage_warn_pct() -> u8 {
+        80
+    }
 }
 
 impl Config {
@@ -155,6 +205,7 @@ impl Config {
         self.finalize.validate()?;
         self.retention.validate()?;
         self.log.validate()?;
+        self.observability.validate()?;
         Ok(())
     }
 }
@@ -233,6 +284,12 @@ impl Storage {
                 "must be greater than zero",
             ));
         }
+        if matches!(self.disk_capacity_bytes, Some(0)) {
+            return Err(ConfigError::bad_value(
+                "storage.disk_capacity_bytes",
+                "must be greater than zero when set (omit to leave the disk-usage threshold disabled)",
+            ));
+        }
         Ok(())
     }
 }
@@ -267,6 +324,33 @@ impl Retention {
             return Err(ConfigError::bad_value(
                 "retention.tick_seconds",
                 "must be greater than zero when set (omit to use tick_minutes)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Observability {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.disk_usage_tick_seconds == 0 {
+            return Err(ConfigError::bad_value(
+                "observability.disk_usage_tick_seconds",
+                "must be greater than zero",
+            ));
+        }
+        if !(1..=100).contains(&self.disk_usage_warn_pct) {
+            return Err(ConfigError::bad_value(
+                "observability.disk_usage_warn_pct",
+                format!(
+                    "must be in the range 1..=100 (got {})",
+                    self.disk_usage_warn_pct
+                ),
+            ));
+        }
+        if matches!(self.disk_usage_tick_seconds_test_override, Some(0)) {
+            return Err(ConfigError::bad_value(
+                "observability.disk_usage_tick_seconds_test_override",
+                "must be greater than zero when set (omit to use disk_usage_tick_seconds)",
             ));
         }
         Ok(())
@@ -731,6 +815,195 @@ tick_seconds = 0
         assert!(msg.contains("warn")); // mentions allowed values
     }
 
+    // ---- Observability section ----
+
+    #[test]
+    fn observability_defaults_apply_when_section_is_absent() {
+        let cfg = parse(&minimal_toml()).expect("minimal config should validate");
+        assert_eq!(cfg.observability.disk_usage_tick_seconds, 3_600);
+        assert_eq!(cfg.observability.disk_usage_warn_pct, 80);
+        assert_eq!(
+            cfg.observability.disk_usage_tick_seconds_test_override,
+            None
+        );
+        assert_eq!(cfg.storage.disk_capacity_bytes, None);
+    }
+
+    #[test]
+    fn observability_explicit_values_round_trip() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+disk_capacity_bytes = 1073741824
+
+[observability]
+disk_usage_tick_seconds = 60
+disk_usage_warn_pct = 50
+disk_usage_tick_seconds_test_override = 2
+"#
+        );
+        let cfg = parse(&toml).expect("explicit observability section validates");
+        assert_eq!(cfg.observability.disk_usage_tick_seconds, 60);
+        assert_eq!(cfg.observability.disk_usage_warn_pct, 50);
+        assert_eq!(
+            cfg.observability.disk_usage_tick_seconds_test_override,
+            Some(2)
+        );
+        assert_eq!(cfg.storage.disk_capacity_bytes, Some(1_073_741_824));
+    }
+
+    #[test]
+    fn zero_disk_usage_tick_seconds_is_rejected() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[observability]
+disk_usage_tick_seconds = 0
+"#
+        );
+        let err = parse(&toml).expect_err("zero disk_usage_tick_seconds must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("observability.disk_usage_tick_seconds"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn disk_usage_warn_pct_out_of_range_is_rejected() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[observability]
+disk_usage_warn_pct = 101
+"#
+        );
+        let err = parse(&toml).expect_err("disk_usage_warn_pct = 101 must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("observability.disk_usage_warn_pct"), "{msg}");
+        assert!(msg.contains("1..=100"), "{msg}");
+    }
+
+    #[test]
+    fn zero_disk_usage_warn_pct_is_rejected() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[observability]
+disk_usage_warn_pct = 0
+"#
+        );
+        let err = parse(&toml).expect_err("disk_usage_warn_pct = 0 must fail");
+        assert!(format!("{err}").contains("observability.disk_usage_warn_pct"));
+    }
+
+    #[test]
+    fn zero_disk_usage_test_override_is_rejected() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+
+[observability]
+disk_usage_tick_seconds_test_override = 0
+"#
+        );
+        let err = parse(&toml).expect_err("zero test override must fail");
+        assert!(format!("{err}").contains("observability.disk_usage_tick_seconds_test_override"));
+    }
+
+    #[test]
+    fn zero_disk_capacity_bytes_is_rejected() {
+        let token = "a".repeat(40);
+        let salt = "b".repeat(40);
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1:8088"
+
+[auth]
+token = "{token}"
+session_salt = "{salt}"
+
+[storage]
+data_dir = "/var/lib/php-tree-viz"
+retention_days = 30
+disk_capacity_bytes = 0
+"#
+        );
+        let err = parse(&toml).expect_err("zero disk_capacity_bytes must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("storage.disk_capacity_bytes"), "{msg}");
+    }
+
+    #[test]
+    fn example_file_omits_test_only_override_key() {
+        // The test-only override is documented intentionally absent
+        // from the operator example so an operator never sets it by
+        // accident. Mirror the retention.tick_seconds rule.
+        assert!(
+            !EXAMPLE_FILE.contains("disk_usage_tick_seconds_test_override"),
+            "example file leaked the test-only override key"
+        );
+    }
+
     #[test]
     fn unknown_log_format_is_rejected() {
         let toml = replace_field(&full_toml(), "format", "\"yaml\"");
@@ -810,6 +1083,7 @@ tick_seconds = 0
             "[finalize]",
             "[retention]",
             "[log]",
+            "[observability]",
         ] {
             assert!(
                 EXAMPLE_FILE.contains(section),

@@ -342,7 +342,7 @@ fn escape_json(input: &str) -> String {
 }
 
 fn log_internal_error(err: &HttpError) {
-    eprintln!("http error during ingest: {err}");
+    tracing::error!(reason = %err, "ingest error");
 }
 
 #[cfg(test)]

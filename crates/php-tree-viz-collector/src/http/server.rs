@@ -63,6 +63,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     let storage_for_decoder = storage.clone();
     let storage_for_finalize = storage.clone();
     let storage_for_retention = storage.clone();
+    let storage_for_disk_usage = storage.clone();
     tokio::spawn(async move {
         while let Some(item) = batch_rx.recv().await {
             // INV-2 unaffected: `trace_key` is not a secret (it's
@@ -84,44 +85,62 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
                         };
                         match result {
                             Ok(outcome) => {
-                                println!(
-                                    "decoded batch path={} trace_key={} dict={} calls={} nodes={} pending={} anomalies={}",
-                                    item.path.display(),
-                                    item.trace_key,
-                                    batch.dict.len(),
-                                    batch.calls.len(),
-                                    outcome.nodes_touched,
-                                    outcome.pending_total,
-                                    outcome.anomalies_added,
+                                // F-1.10: structured `batch accepted`
+                                // event carries the canonical trace
+                                // identity (`trace_key`), the upstream
+                                // `meta.trace_id`, `host`, `pid`,
+                                // body counts, and the aggregation
+                                // outcome fields. Body byte count is
+                                // re-derived from the on-disk file
+                                // size — same authority the receiver
+                                // used to parse the batch.
+                                let body_bytes = bytes.len() as u64;
+                                tracing::info!(
+                                    trace_key = %item.trace_key,
+                                    trace_id = %batch.meta.trace_id,
+                                    host = %batch.meta.host,
+                                    pid = batch.meta.pid,
+                                    body_bytes = body_bytes,
+                                    dict_entries = batch.dict.len() as u64,
+                                    call_count = batch.calls.len() as u64,
+                                    nodes = outcome.nodes_touched,
+                                    pending = outcome.pending_total,
+                                    anomalies = outcome.anomalies_added,
+                                    "batch accepted"
                                 );
                             }
                             Err(e) => {
-                                // Still log the decode visibility so the operator
-                                // can tell parse succeeded but storage refused.
-                                println!(
-                                    "decoded batch path={} trace_key={} dict={} calls={} nodes=? pending=? anomalies=?",
-                                    item.path.display(),
-                                    item.trace_key,
-                                    batch.dict.len(),
-                                    batch.calls.len(),
+                                // Storage refused after a clean
+                                // parse. Surface the same
+                                // identity fields so the operator
+                                // can correlate to the decoder log
+                                // entry that did *not* land.
+                                tracing::warn!(
+                                    reason = %e,
+                                    trace_key = %item.trace_key,
+                                    trace_id = %batch.meta.trace_id,
+                                    host = %batch.meta.host,
+                                    pid = batch.meta.pid,
+                                    "storage failure"
                                 );
-                                eprintln!("storage: {e} trace_key={}", item.trace_key);
                             }
                         }
                     }
                     Err(err) => {
-                        eprintln!(
-                            "decoder: parse failed: {err} path={} trace_key={}",
-                            item.path.display(),
-                            item.trace_key,
+                        tracing::warn!(
+                            reason = %err,
+                            path = %item.path.display(),
+                            trace_key = %item.trace_key,
+                            "decoder failure"
                         );
                     }
                 },
                 Err(err) => {
-                    eprintln!(
-                        "decoder: read failed: {err} path={} trace_key={}",
-                        item.path.display(),
-                        item.trace_key,
+                    tracing::warn!(
+                        reason = %err,
+                        path = %item.path.display(),
+                        trace_key = %item.trace_key,
+                        "decoder failure"
                     );
                 }
             }
@@ -154,6 +173,19 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         retention_tick_seconds,
     ));
 
+    // Disk-usage gauge. Shares the same `Storage` mutex as the
+    // other three loops; lives long-as the runtime. Cadence is the
+    // production default (one hour) unless an operator or test
+    // overrides via the `observability` section. The first tick
+    // fires immediately so the operator sees a baseline gauge
+    // reading on startup; subsequent ticks honour the cadence.
+    tokio::spawn(crate::observability::disk_usage_loop(
+        storage_for_disk_usage,
+        config.observability.clone(),
+        config.storage.data_dir.clone(),
+        config.storage.disk_capacity_bytes,
+    ));
+
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| HttpError::Bind { addr, source })?;
@@ -168,7 +200,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     // process would exit with a signal status rather than `0`.
     let shutdown = build_shutdown_signal()?;
 
-    println!("listening on {bound}");
+    tracing::info!(addr = %bound, "listening");
 
     let state: SharedState = Arc::new(AppState {
         expected_token: config.auth.token.clone(),
@@ -186,7 +218,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         .await
         .map_err(HttpError::Serve)?;
 
-    println!("shutdown complete");
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
@@ -202,8 +234,8 @@ fn build_shutdown_signal() -> Result<impl Future<Output = ()>, HttpError> {
     let mut sigterm = signal(SignalKind::terminate()).map_err(HttpError::Serve)?;
     Ok(async move {
         tokio::select! {
-            _ = sigint.recv() => println!("shutdown: SIGINT received"),
-            _ = sigterm.recv() => println!("shutdown: SIGTERM received"),
+            _ = sigint.recv() => tracing::info!(signal = "SIGINT", "shutdown signal received"),
+            _ = sigterm.recv() => tracing::info!(signal = "SIGTERM", "shutdown signal received"),
         }
     })
 }
@@ -213,8 +245,8 @@ fn build_shutdown_signal() -> Result<impl Future<Output = ()>, HttpError> {
 fn build_shutdown_signal() -> Result<impl Future<Output = ()>, HttpError> {
     Ok(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            eprintln!("shutdown: ctrl_c listener failed: {e}");
+            tracing::error!(reason = %e, "ctrl_c listener failed");
         }
-        println!("shutdown: SIGINT received");
+        tracing::info!(signal = "SIGINT", "shutdown signal received");
     })
 }

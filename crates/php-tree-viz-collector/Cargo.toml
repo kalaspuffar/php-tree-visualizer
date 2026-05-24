@@ -16,3 +16,14 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "sync", "time"] }
 toml = "0.8"
 tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "smallvec", "ansi", "std"] }
+walkdir = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+tempfile = "3"
+
+[[bench]]
+name = "decode_batch"
+harness = false

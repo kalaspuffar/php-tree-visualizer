@@ -77,7 +77,7 @@ async fn run_one_tick(storage: &Mutex<Storage>, retention_nanos: i64) {
     let expired = match storage.list_expired_traces(cutoff_ns) {
         Ok(keys) => keys,
         Err(err) => {
-            eprintln!("retention: list query failed: {err}");
+            tracing::warn!(reason = %err, "retention list query failed");
             return;
         }
     };
@@ -92,15 +92,19 @@ async fn run_one_tick(storage: &Mutex<Storage>, retention_nanos: i64) {
             }
             Err(err) => {
                 // One trace's failure doesn't abort the tick. The
-                // summary line that follows reflects only the
+                // summary event that follows reflects only the
                 // successful prunes.
-                eprintln!("retention: {err} trace_key={key}");
+                tracing::warn!(
+                    reason = %err,
+                    trace_key = %key,
+                    "retention failure"
+                );
             }
         }
     }
 
     if removed_traces > 0 {
-        println!("swept retention removed_traces={removed_traces} freed_bytes={freed_bytes}");
+        tracing::info!(removed_traces, freed_bytes, "retention swept");
     }
 }
 

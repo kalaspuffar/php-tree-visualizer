@@ -65,10 +65,10 @@ const KIND_INVERTED_TIME: &str = "inverted_time";
 /// helper that does the actual INSERT is below.
 pub(super) const KIND_PENDING_PARENT_AT_FINALIZE: &str = "pending_parent_at_finalize";
 
-/// Counters surfaced to the caller for the `decoded batch`
-/// log line and the tests.
+/// Counters surfaced to the caller for the `batch accepted`
+/// log event and the tests.
 #[derive(Debug, Default)]
-pub(crate) struct AggregateOutcome {
+pub struct AggregateOutcome {
     /// Distinct node rows touched (inserted or updated) by
     /// this batch's aggregation. Includes both the in-batch
     /// loop and the drain pass.

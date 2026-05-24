@@ -35,7 +35,7 @@ impl TraceKey {
     /// production call sites only consume keys that were previously
     /// produced by `from_meta` (and persisted into a column that
     /// only accepts what `from_meta` emits). Tests use this freely.
-    pub(crate) fn from_raw(s: impl Into<String>) -> Self {
+    pub fn from_raw(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 }
