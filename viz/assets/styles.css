@@ -627,3 +627,481 @@ html, body {
 .list-error {
   margin: var(--s-3) 0;
 }
+
+
+/* ============================================================
+ * 7. Page: trace detail (§3.3.6.3)
+ * ============================================================ */
+
+.trace-page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.trace-header {
+  flex-shrink: 0;
+  padding: var(--s-3) var(--s-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 32px;
+  min-width: 0;
+}
+
+.breadcrumb__back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.breadcrumb__back:hover { text-decoration: underline; }
+
+.breadcrumb__sep {
+  color: var(--fg-subtle);
+  flex-shrink: 0;
+}
+
+.breadcrumb__uri {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.3;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.breadcrumb__key {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  flex-shrink: 0;
+  position: relative;
+}
+
+.breadcrumb__key-label { color: var(--fg-muted); }
+
+.copy-tooltip {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: var(--s-1);
+  padding: var(--s-1) var(--s-2);
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: var(--z-overlay);
+}
+
+.metadata-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-3);
+  height: 40px;
+  margin-top: var(--s-2);
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+.metadata-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 24px;
+  padding: 0 var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.metadata-chip__label { color: var(--fg-muted); }
+.metadata-chip__value { color: var(--fg); }
+
+.metadata-chip--warn   .metadata-chip__value { color: var(--warn); }
+.metadata-chip--danger .metadata-chip__value { color: var(--danger); }
+
+.metadata-chip__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.metadata-chip--active .metadata-chip__dot {
+  background: var(--warn);
+  animation: phptv-pulse var(--motion-pulse) ease-in-out infinite;
+}
+
+.banner-zone {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  margin-top: var(--s-2);
+}
+
+.banner-zone:empty { display: none; }
+
+
+/* ============================================================
+ * 8. Call-tree row (§3.3.7)
+ * ============================================================ */
+
+.trace-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0 var(--s-5);
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-wrapper {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* §3.3.7.1 — row grid; same widths the column header uses. */
+.tree-row,
+.column-header,
+.skeleton-tree-row {
+  display: grid;
+  grid-template-columns:
+    minmax(320px, 1fr)   /* Function */
+    80px                 /* Count */
+    96px                 /* Total */
+    96px                 /* Self */
+    140px                /* %Parent */
+    96px;                /* Mem */
+  column-gap: var(--s-3);
+  align-items: center;
+}
+
+.column-header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  height: 32px;
+  padding: 0 var(--s-3);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.column-header__cell {
+  color: var(--fg-muted);
+}
+
+.column-header__cell--right {
+  text-align: right;
+}
+
+.tree-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* The spacer carries the full virtual height. */
+.tree-spacer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  pointer-events: none;
+}
+
+/* The rendered rows are absolutely positioned at the current
+ * window's top. detail.js sets `transform: translateY(<N>px)`. */
+.tree-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.tree-row {
+  height: 28px;
+  padding: 0 var(--s-3);
+  color: var(--fg);
+  cursor: default;
+  border-left: 2px solid transparent;
+}
+
+.tree-row:hover { background: var(--surface-2); }
+
+.tree-row:focus-visible,
+.tree-row.is-focused {
+  background: var(--accent-bg);
+  border-left-color: var(--accent);
+  outline: none;
+}
+
+.tree-row--unresolved {
+  border-left-color: var(--danger);
+}
+
+.tree-row--unresolved .tree-row__fqn {
+  color: var(--danger);
+}
+
+.tree-row__function {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+}
+
+.tree-row__indent {
+  flex-shrink: 0;
+  /* `width: calc(var(--depth, 0) * 16px)` — CSP-safe via class on
+   * the row element setting --depth. */
+}
+
+/* 21 indent buckets (0..20 depths). The detail page caps at depth
+ * 20 visually; deeper trees still expand but stop indenting at 20
+ * (the chevron and fqn stay readable). */
+.tree-row--indent-0  .tree-row__indent { width:   0px; }
+.tree-row--indent-1  .tree-row__indent { width:  16px; }
+.tree-row--indent-2  .tree-row__indent { width:  32px; }
+.tree-row--indent-3  .tree-row__indent { width:  48px; }
+.tree-row--indent-4  .tree-row__indent { width:  64px; }
+.tree-row--indent-5  .tree-row__indent { width:  80px; }
+.tree-row--indent-6  .tree-row__indent { width:  96px; }
+.tree-row--indent-7  .tree-row__indent { width: 112px; }
+.tree-row--indent-8  .tree-row__indent { width: 128px; }
+.tree-row--indent-9  .tree-row__indent { width: 144px; }
+.tree-row--indent-10 .tree-row__indent { width: 160px; }
+.tree-row--indent-11 .tree-row__indent { width: 176px; }
+.tree-row--indent-12 .tree-row__indent { width: 192px; }
+.tree-row--indent-13 .tree-row__indent { width: 208px; }
+.tree-row--indent-14 .tree-row__indent { width: 224px; }
+.tree-row--indent-15 .tree-row__indent { width: 240px; }
+.tree-row--indent-16 .tree-row__indent { width: 256px; }
+.tree-row--indent-17 .tree-row__indent { width: 272px; }
+.tree-row--indent-18 .tree-row__indent { width: 288px; }
+.tree-row--indent-19 .tree-row__indent { width: 304px; }
+.tree-row--indent-20 .tree-row__indent { width: 320px; }
+
+.tree-row__chevron {
+  flex-shrink: 0;
+  width: 20px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.tree-row__chevron[hidden] { visibility: hidden; display: inline-flex; }
+
+.tree-row__chevron .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.tree-row--loading .tree-row__chevron .icon {
+  animation: phptv-rotate var(--motion-loader) linear infinite;
+  color: var(--accent);
+}
+
+.tree-row--load-error .tree-row__chevron .icon {
+  color: var(--danger);
+}
+
+@keyframes phptv-rotate {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.tree-row__fqn {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.fn-badge--int {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 var(--s-1);
+  margin: 0 var(--s-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+.tree-row__file-line {
+  flex-shrink: 0;
+  margin-left: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tree-row__anomaly-slot {
+  flex-shrink: 0;
+  width: 24px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.tree-row__anomaly-slot .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.anomaly-icon--warn   { color: var(--warn); }
+.anomaly-icon--danger { color: var(--danger); }
+
+/* Numeric cells (§3.3.7.1). */
+.tree-row__cell {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--fg);
+}
+
+.tree-row__cell--zero    { color: var(--fg-subtle); }
+.tree-row__cell--muted   { color: var(--fg-muted); }
+.tree-row__cell--danger  { color: var(--danger); }
+
+/* %Parent column = hot-path bar + percent text. */
+.tree-row__pct-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+}
+
+.tree-row__pct-text {
+  width: 40px;
+  text-align: right;
+}
+
+.hot-bar {
+  width: 80px;
+  height: 6px;
+  background: var(--surface-2);
+  border-radius: 3px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.hot-bar__fill {
+  height: 100%;
+  background: linear-gradient(to right, var(--hot-0), var(--hot-3));
+  border-radius: 3px;
+}
+
+/* 21 width buckets (D-6 — CSP-safe, no inline style attributes).
+ * Bucket N has width N% (N in {0, 5, 10, ..., 100}). The row
+ * builder rounds %parent to the nearest bucket. */
+.hot-bar__fill--0   { width:   0%; }
+.hot-bar__fill--5   { width:   5%; }
+.hot-bar__fill--10  { width:  10%; }
+.hot-bar__fill--15  { width:  15%; }
+.hot-bar__fill--20  { width:  20%; }
+.hot-bar__fill--25  { width:  25%; }
+.hot-bar__fill--30  { width:  30%; }
+.hot-bar__fill--35  { width:  35%; }
+.hot-bar__fill--40  { width:  40%; }
+.hot-bar__fill--45  { width:  45%; }
+.hot-bar__fill--50  { width:  50%; }
+.hot-bar__fill--55  { width:  55%; }
+.hot-bar__fill--60  { width:  60%; }
+.hot-bar__fill--65  { width:  65%; }
+.hot-bar__fill--70  { width:  70%; }
+.hot-bar__fill--75  { width:  75%; }
+.hot-bar__fill--80  { width:  80%; }
+.hot-bar__fill--85  { width:  85%; }
+.hot-bar__fill--90  { width:  90%; }
+.hot-bar__fill--95  { width:  95%; }
+.hot-bar__fill--100 { width: 100%; }
+
+/* Skeleton row for the tree zone (28-px version). */
+.skeleton-tree-row {
+  height: 28px;
+  padding: 0 var(--s-3);
+  background: var(--surface);
+  border-radius: 4px;
+}
+
+.skeleton-tree-row .skeleton-row__block {
+  height: 12px;
+  margin-left: 24px;
+}
+
+/* Copy-fallback modal (D-8). */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: var(--z-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal[hidden] { display: none; }
+
+.modal__card {
+  width: 480px;
+  max-width: 90vw;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: var(--s-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.copy-modal__input {
+  margin: 0;
+}
+
