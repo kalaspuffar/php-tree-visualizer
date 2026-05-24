@@ -103,26 +103,38 @@ generate_wrapper() {
 # ---- Individual configtests -----------------------------------------
 
 run_apache_configtest() {
-    if ! command -v apache2ctl >/dev/null 2>&1; then
-        echo "error: apache2ctl not on PATH — install apache2 (apt-get install apache2)" >&2
+    # We call the apache2 binary directly, not the apache2ctl wrapper,
+    # because Debian's apache2ctl unconditionally runs
+    # `mkdir -p $APACHE_RUN_DIR` (defaulting to /var/run/apache2)
+    # on every invocation — including `-t`. That fails as a non-root
+    # user (the CI runner, or any operator running this script
+    # locally without prior sudo). The apache2 binary's `-t -f` does
+    # the same syntax check without the runtime-dir setup.
+    local apache_bin=""
+    if command -v apache2 >/dev/null 2>&1; then
+        apache_bin=apache2
+    elif [ -x /usr/sbin/apache2 ]; then
+        apache_bin=/usr/sbin/apache2
+    else
+        echo "error: apache2 binary not found — install apache2 (apt-get install apache2)" >&2
         return 1
     fi
     local wrapper
     wrapper="$(generate_wrapper "$APACHE_TEMPLATE" apache)"
 
-    # apache2ctl -t -f <file> writes "Syntax OK" to stderr on success
+    # `apache2 -t -f <file>` writes "Syntax OK" to stderr on success
     # (Apache convention). We capture both streams and inspect them.
     local output rc
-    output="$(apache2ctl -t -f "$wrapper" 2>&1)"
+    output="$("$apache_bin" -t -f "$wrapper" 2>&1)"
     rc=$?
     if [ "$rc" -ne 0 ] || ! grep -q 'Syntax OK' <<<"$output"; then
-        echo "error: apache2ctl -t FAILED against etc/apache-example.conf" >&2
-        echo "------ apache2ctl output ------" >&2
+        echo "error: apache2 -t FAILED against etc/apache-example.conf" >&2
+        echo "------ apache2 -t output ------" >&2
         echo "$output" >&2
         echo "-------------------------------" >&2
         return 1
     fi
-    echo "ok: apache2ctl -t passed against etc/apache-example.conf"
+    echo "ok: apache2 -t passed against etc/apache-example.conf"
 }
 
 run_nginx_configtest() {
