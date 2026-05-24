@@ -48,11 +48,12 @@ for (const file of htmlFiles) {
     assert_eq(null, html.match(inlineStyleBlock), `${rel} has no inline <style> block`);
 }
 
-// 9.2 — CSP meta on every HTML.
+// 9.2 — CSP meta on every HTML. Phase 6b adds style-src-attr.
 const requiredDirectives = [
     "default-src 'self'",
     "script-src 'self'",
     "style-src 'self'",
+    "style-src-attr 'unsafe-inline'",
     "connect-src 'self'",
     "object-src 'none'",
 ];
@@ -66,11 +67,15 @@ for (const file of htmlFiles) {
     }
 }
 
-// 9.3 — read-only API surface. Neither list.js nor detail.js may
-// issue write methods (the entire read-only frontend can't POST).
-// Phase 5 covered list.js; Phase 6 extends to detail.js and the
-// two new internal modules.
-const readOnlyClientFiles = ["list.js", "detail.js", "virtualizer.js", "tree-row.js"];
+// 9.3 — read-only API surface. The entire read-only frontend (every
+// file except login.js / api-client.js) must never issue write
+// methods. Phase 5 covered list.js; Phase 6a added detail.js +
+// virtualizer.js + tree-row.js; Phase 6b adds search.js,
+// tooltip.js, keyboard.js.
+const readOnlyClientFiles = [
+    "list.js", "detail.js", "virtualizer.js", "tree-row.js",
+    "search.js", "tooltip.js", "keyboard.js",
+];
 for (const fname of readOnlyClientFiles) {
     const src = read(path.join(vizDir, "js", fname));
     for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
@@ -87,7 +92,10 @@ for (const fname of readOnlyClientFiles) {
 // Phase 5, extended to detail.js / virtualizer.js / tree-row.js.
 const consoleCall = /console\.\w+\s*\([^)]*\b(token|password|body|request)\b[^)]*\)/;
 
-for (const fname of ["login.js", "list.js", "detail.js", "virtualizer.js", "tree-row.js"]) {
+for (const fname of [
+    "login.js", "list.js", "detail.js", "virtualizer.js", "tree-row.js",
+    "search.js", "tooltip.js", "keyboard.js",
+]) {
     const src = read(path.join(vizDir, "js", fname));
     assert_eq(null, src.match(consoleCall),
         `${fname} does not console.log token/password/body`);
@@ -104,7 +112,10 @@ assert_eq(false, loginSrc.includes("sessionStorage"),
 assert_eq(false, loginSrc.includes("document.cookie"),
     "login.js does not touch document.cookie");
 
-for (const fname of ["list.js", "detail.js", "virtualizer.js", "tree-row.js"]) {
+for (const fname of [
+    "list.js", "detail.js", "virtualizer.js", "tree-row.js",
+    "search.js", "tooltip.js", "keyboard.js",
+]) {
     const src = read(path.join(vizDir, "js", fname));
     assert_eq(false, src.includes("document.cookie"),
         `${fname} does not touch document.cookie`);

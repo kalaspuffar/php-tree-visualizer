@@ -83,6 +83,11 @@ class ClassList {
 globalThis.document = {
     createElement: (tag) => new FakeNode(tag, null),
     createElementNS: (ns, tag) => new FakeNode(tag, ns),
+    createTextNode: (text) => {
+        const n = new FakeNode("#text", null);
+        n.textContent = String(text);
+        return n;
+    },
 };
 
 // ---- Tests ---------------------------------------------------------
@@ -345,6 +350,72 @@ assert_eq(0,   _internals.clampIndentBucket(-1), "clamp negative indent to 0");
 assert_eq(20,  _internals.clampIndentBucket(25), "clamp deep indent to 20");
 assert_eq(0,   _internals.computePctOfParent({ totalWallNs: 100, parentTotalWallNs: 0 }),
     "zero parent total -> 0% bucket");
+
+// 6b: searchPattern produces matched + unmatched spans.
+{
+    const li = buildTreeRow(
+        { ...baseRow, fqn: "Foo\\Bar::baz", hasChildren: false },
+        { indentDepthForUi: 0, searchPattern: "bar" }
+    );
+    const fqn = li.findOne((c) => c.className === "tree-row__fqn");
+    // Walk the fqn children: should be ["Foo\\" plain, "Bar" matched, "::baz" plain].
+    const segments = fqn.children;
+    assert_eq(3, segments.length, "fqn split into three segments");
+    // Plain text segments come back as FakeNodes via createTextNode → tagName "#TEXT".
+    assert_eq("Foo\\", segments[0].textContent, "first segment text");
+    assert_eq("Bar",   segments[1].textContent, "matched segment text");
+    assert_eq("::baz", segments[2].textContent, "last segment text");
+    assert_eq(
+        "tree-row__fqn-match",
+        segments[1].className,
+        "matched segment has the highlight class"
+    );
+}
+
+// 6b: searchPattern with no match → single plain segment.
+{
+    const li = buildTreeRow(
+        { ...baseRow, fqn: "Foo\\Bar::baz", hasChildren: false },
+        { indentDepthForUi: 0, searchPattern: "zzz" }
+    );
+    const fqn = li.findOne((c) => c.className === "tree-row__fqn");
+    assert_eq(1, fqn.children.length, "no match -> single segment");
+    assert_eq("Foo\\Bar::baz", fqn.children[0].textContent, "full fqn as plain text");
+}
+
+// 6b: isCurrentMatch -> tree-row--current-match class.
+{
+    const li = buildTreeRow(
+        { ...baseRow, hasChildren: false },
+        { indentDepthForUi: 0, isCurrentMatch: true }
+    );
+    assert_true(li.classList.contains("tree-row--current-match"),
+        "isCurrentMatch -> class applied");
+}
+
+// 6b: isFocused -> is-focused class.
+{
+    const li = buildTreeRow(
+        { ...baseRow, hasChildren: false },
+        { indentDepthForUi: 0, isFocused: true }
+    );
+    assert_true(li.classList.contains("is-focused"),
+        "isFocused -> class applied");
+}
+
+// 6b: both flags + searchPattern compose.
+{
+    const li = buildTreeRow(
+        { ...baseRow, fqn: "main", hasChildren: false },
+        { indentDepthForUi: 0, isCurrentMatch: true, isFocused: true, searchPattern: "main" }
+    );
+    assert_true(li.classList.contains("tree-row--current-match"), "current-match");
+    assert_true(li.classList.contains("is-focused"), "is-focused");
+    const fqn = li.findOne((c) => c.className === "tree-row__fqn");
+    const matchSpan = fqn.findOne((c) => c.className === "tree-row__fqn-match");
+    assert_true(matchSpan !== null, "match span present");
+    assert_eq("main", matchSpan.textContent, "match span text");
+}
 
 // Chevron click invokes the callback.
 {

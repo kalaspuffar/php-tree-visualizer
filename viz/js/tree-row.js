@@ -39,6 +39,7 @@ import {
     formatPercentOfParent,
     formatCount,
 } from "./time.js";
+import { highlightFqn } from "./search.js";
 
 const ICON_HREF = "/viz/assets/icons.svg";
 const MAX_INDENT_BUCKET = 20;     // matches the CSS rules
@@ -95,6 +96,12 @@ export function buildTreeRow(row, options = {}) {
     if (row.loadError) {
         li.classList.add("tree-row--load-error");
     }
+    if (options.isCurrentMatch) {
+        li.classList.add("tree-row--current-match");
+    }
+    if (options.isFocused) {
+        li.classList.add("is-focused");
+    }
 
     // Full fqn lives in the row's `title` for hover + screen-reader
     // recovery on truncation. Internal functions get the documented
@@ -103,7 +110,7 @@ export function buildTreeRow(row, options = {}) {
         ? "Internal function (PHP core)"
         : (row.fqn ?? "");
 
-    li.appendChild(buildFunctionCell(row, options, isUnresolved));
+    li.appendChild(buildFunctionCell(row, options, isUnresolved, options.searchPattern));
     li.appendChild(buildNumericCell(formatCount(row.count), "tree-row__cell"));
     li.appendChild(buildNumericCell(formatDuration(row.totalWallNs), "tree-row__cell"));
     li.appendChild(buildNumericCell(formatDuration(row.selfWallNs), "tree-row__cell"));
@@ -113,7 +120,7 @@ export function buildTreeRow(row, options = {}) {
     return li;
 }
 
-function buildFunctionCell(row, options, isUnresolved) {
+function buildFunctionCell(row, options, isUnresolved, searchPattern) {
     const wrap = document.createElement("span");
     wrap.className = "tree-row__function";
 
@@ -153,10 +160,26 @@ function buildFunctionCell(row, options, isUnresolved) {
     chevron.appendChild(chevronIcon(row));
     wrap.appendChild(chevron);
 
-    // fqn (or unresolved-fn replacement).
+    // fqn — plain text by default; with a non-empty searchPattern,
+    // split into matched/unmatched segments via highlightFqn().
     const fqn = document.createElement("span");
     fqn.className = "tree-row__fqn";
-    fqn.textContent = row.fqn ?? "";
+    const fqnText = row.fqn ?? "";
+    if (typeof searchPattern === "string" && searchPattern.length > 0) {
+        const segments = highlightFqn(fqnText, searchPattern);
+        for (const seg of segments) {
+            if (seg.matched) {
+                const span = document.createElement("span");
+                span.className = "tree-row__fqn-match";
+                span.textContent = seg.text;
+                fqn.appendChild(span);
+            } else {
+                fqn.appendChild(document.createTextNode(seg.text));
+            }
+        }
+    } else {
+        fqn.textContent = fqnText;
+    }
     wrap.appendChild(fqn);
 
     // Internal-function badge.

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
 
   <title>PHP Tree Visualizer — Trace</title>
   <link rel="stylesheet" href="/viz/assets/styles.css">
@@ -61,6 +61,72 @@
     </div>
 
     <div id="tree-wrapper" class="tree-wrapper">
+
+      <div class="tree-search" role="search">
+        <div class="tree-search__input-wrap">
+          <svg class="icon tree-search__icon" aria-hidden="true">
+            <use href="/viz/assets/icons.svg#icon-search"/>
+          </svg>
+          <input
+            id="tree-search-input"
+            type="search"
+            class="tree-search__input"
+            placeholder="Find in tree"
+            aria-label="Find in tree"
+            autocomplete="off"
+            spellcheck="false"
+          >
+          <button id="tree-search-clear" type="button"
+                  class="icon-button tree-search__clear"
+                  aria-label="Clear search" hidden>
+            <svg class="icon" aria-hidden="true">
+              <use href="/viz/assets/icons.svg#icon-x"/>
+            </svg>
+          </button>
+        </div>
+
+        <span id="tree-search-count" class="small tree-search__count"
+              role="status" aria-live="polite"></span>
+
+        <button id="tree-search-prev" type="button"
+                class="icon-button" aria-label="Previous match" disabled>
+          <svg class="icon" aria-hidden="true">
+            <use href="/viz/assets/icons.svg#icon-chevron-up"/>
+          </svg>
+        </button>
+        <button id="tree-search-next" type="button"
+                class="icon-button" aria-label="Next match" disabled>
+          <svg class="icon" aria-hidden="true">
+            <use href="/viz/assets/icons.svg#icon-chevron-down"/>
+          </svg>
+        </button>
+
+        <div class="sort-dropdown">
+          <button id="sort-trigger" type="button"
+                  class="button button--text sort-dropdown__trigger"
+                  aria-haspopup="menu" aria-expanded="false"
+                  title="Sort the call tree by metric">
+            Sort by
+            <svg class="icon" aria-hidden="true">
+              <use href="/viz/assets/icons.svg#icon-chevron-down"/>
+            </svg>
+          </button>
+          <ul id="sort-menu" class="sort-dropdown__menu"
+              role="menu" aria-labelledby="sort-trigger" hidden>
+            <li role="menuitemradio" data-sort="total_wall_desc"
+                aria-checked="true" tabindex="-1">Total (desc)</li>
+            <li role="menuitemradio" data-sort="self_wall_desc"
+                aria-checked="false" tabindex="-1">Self (desc)</li>
+            <li role="menuitemradio" data-sort="count_desc"
+                aria-checked="false" tabindex="-1">Count (desc)</li>
+            <li role="menuitemradio" data-sort="mem_delta_desc"
+                aria-checked="false" tabindex="-1">Mem (desc)</li>
+            <li role="menuitemradio" data-sort="fqn_asc"
+                aria-checked="false" tabindex="-1">Function (asc)</li>
+          </ul>
+        </div>
+      </div>
+
       <div class="column-header" role="row">
         <span class="column-header__cell micro" role="columnheader"
               data-col="fqn">Function</span>

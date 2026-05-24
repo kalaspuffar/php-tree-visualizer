@@ -1105,3 +1105,204 @@ html, body {
   margin: 0;
 }
 
+
+/* ============================================================
+ * 9. Tree search + sort chrome (§3.3.8.1 + §3.3.8.3 + §3.3.7.8)
+ * ============================================================ */
+
+.tree-search {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 40px;
+  padding: 0 var(--s-3);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.tree-search__input-wrap {
+  position: relative;
+  width: 280px;
+}
+
+.tree-search__icon {
+  position: absolute;
+  top: 50%;
+  left: var(--s-2);
+  transform: translateY(-50%);
+  color: var(--fg-muted);
+  pointer-events: none;
+}
+
+.tree-search__input {
+  width: 100%;
+  height: 32px;
+  padding: 0 var(--s-6) 0 var(--s-6);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.tree-search__input::placeholder { color: var(--fg-subtle); }
+
+.tree-search__input--no-matches {
+  border-bottom-color: var(--danger);
+}
+
+.tree-search__clear {
+  position: absolute;
+  top: 50%;
+  right: var(--s-1);
+  transform: translateY(-50%);
+}
+
+.tree-search__count {
+  color: var(--fg-muted);
+  min-width: 88px;
+}
+
+.tree-search__count--no-matches {
+  color: var(--danger);
+}
+
+/* Match-highlight: span wrapped inside the fqn for matched chars. */
+.tree-row__fqn-match {
+  outline: 1px solid rgba(251, 191, 36, 0.3);  /* --warn @ 30% */
+  text-decoration: underline rgba(251, 191, 36, 0.6);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+/* Current-match row background (overridden by focused-row state if
+ * both apply — see §3.3.10 collision note in design.md OQ-1). */
+.tree-row--current-match {
+  background: var(--accent-bg);
+}
+
+.tree-row.is-focused {
+  background: var(--accent-bg);
+  border-left-color: var(--accent);
+}
+
+/* Sort dropdown */
+.sort-dropdown {
+  position: relative;
+  margin-left: auto;
+}
+
+.sort-dropdown__trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+}
+
+.sort-dropdown__trigger .icon {
+  transition: transform var(--motion-chevron) ease-out;
+}
+
+.sort-dropdown__trigger[aria-expanded="true"] .icon {
+  transform: rotate(180deg);
+}
+
+.sort-dropdown__menu {
+  position: absolute;
+  top: calc(100% + var(--s-1));
+  right: 0;
+  min-width: 180px;
+  margin: 0;
+  padding: var(--s-1) 0;
+  list-style: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: var(--z-overlay);
+}
+
+.sort-dropdown__menu[hidden] { display: none; }
+
+.sort-dropdown__menu li {
+  padding: var(--s-2) var(--s-3);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.sort-dropdown__menu li:hover {
+  background: var(--surface-3);
+}
+
+.sort-dropdown__menu li[aria-checked="true"] {
+  color: var(--accent);
+}
+
+.sort-dropdown__menu li[aria-checked="true"]::before {
+  content: "✓ ";
+  margin-right: var(--s-1);
+}
+
+/* Active-column visual on the column header (§3.3.7.8). */
+.column-header__cell--active {
+  color: var(--accent);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  justify-content: flex-end;
+}
+
+.column-header__cell--active[data-col="fqn"] {
+  justify-content: flex-start;
+}
+
+.column-header__cell--active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+}
+
+.column-header__cell--sort-indicator .icon {
+  width: 14px;
+  height: 14px;
+}
+
+
+/* ============================================================
+ * 10. Tooltip popper (§3.3.8.7)
+ * ============================================================ */
+
+.phptv-tooltip {
+  position: fixed;
+  z-index: var(--z-overlay);
+  max-width: 320px;
+  padding: 6px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.4;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 100ms ease-out;
+}
+
+.phptv-tooltip.is-visible {
+  opacity: 1;
+}
+
+.phptv-tooltip[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .phptv-tooltip { transition-duration: 0.01ms !important; }
+}
+
