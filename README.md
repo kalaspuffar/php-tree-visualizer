@@ -136,7 +136,7 @@ umask 0007
 
 The collector emits structured `tracing` events on stdout (or journald, via systemd). The first events tell you the config loaded, the listener bound, and the periodic disk-usage gauge started. See [Expected output](#expected-output) for a sample.
 
-**For your first verification run**, set `log.format = "text"` in the config so the Expected output sample below matches what you see line-by-line. Production typically uses `"json"` — switch back once the wiring is confirmed; the JSON shape carries the same field set, just flattened to a top-level JSON object per event.
+The example config defaults to `log.format = "json"` — the [Expected output](#expected-output) sample below shows that shape. If you'd rather eyeball plain text during initial wiring, flip the value to `"text"` and `sudo systemctl restart php-tree-viz-collector`; the same events come out as `<timestamp>  INFO target: <message> field=value …` lines. The field set is identical between the two formats.
 
 ### 5. Front it with Apache or nginx
 
@@ -193,20 +193,19 @@ Browse to `http://<your-host>/viz/login.html`, sign in with the same bearer toke
 
 ### Expected output
 
-A successful run of steps 4–6 above produces a `tracing` event stream that starts like this. Timestamps, ports, byte counts, PIDs, and trace identifiers vary run-to-run; `<placeholder>` tokens mark the parts that change. The structure (event message, field names, level prefix) is what to verify.
+A successful run of steps 4–6 above produces a `tracing` event stream in the journal. The example config ships `log.format = "json"`, so each event is one JSON object on its own line. Timestamps, byte counts, PIDs, and trace identifiers vary run-to-run; `<placeholder>` tokens mark the parts that change. The structure — event message, field names, level — is what to verify against.
 
-```text
-<timestamp>  INFO config: configuration loaded path=/etc/php-tree-viz/collector.toml bind=127.0.0.1:<port> data_dir=/var/lib/php-tree-viz retention_days=30 queue_capacity=256 max_body_bytes=67108864 log_level=info log_format=text
-<timestamp>  INFO php_tree_viz_collector::http::server: listening addr=127.0.0.1:<port>
-<timestamp>  INFO php_tree_viz_collector::observability::disk_usage: disk usage data_dir_bytes=<N> trace_count=0 threshold_pct=80 over_threshold=false
-<timestamp>  INFO php_tree_viz_collector::http::logging: request method=POST path=/ingest/v1 remote_addr=127.0.0.1:<port> status=200 body_bytes=<N>
-<timestamp>  INFO php_tree_viz_collector::http::server: batch accepted trace_key=<32hex> trace_id=00000000-0000-0000-0000-000000000000 host=<host> pid=<pid> body_bytes=<N> dict_entries=<N> call_count=<N> nodes=<N> pending=<N> anomalies=0
-<timestamp>  INFO php_tree_viz_collector::finalize: trace finalized trace_key=<32hex> pending_dq2=0 cpu_snapshot_available=true
+```json
+{"timestamp":"<timestamp>","level":"INFO","message":"configuration loaded","path":"/etc/php-tree-viz/collector.toml","bind":"127.0.0.1:8088","data_dir":"/var/lib/php-tree-viz","retention_days":30,"queue_capacity":256,"max_body_bytes":67108864,"log_level":"info","log_format":"json","target":"config"}
+{"timestamp":"<timestamp>","level":"INFO","message":"listening","addr":"127.0.0.1:8088","target":"php_tree_viz_collector::http::server"}
+{"timestamp":"<timestamp>","level":"INFO","message":"disk usage","data_dir_bytes":<N>,"trace_count":0,"threshold_pct":80,"over_threshold":false,"target":"php_tree_viz_collector::observability::disk_usage"}
+{"timestamp":"<timestamp>","level":"INFO","message":"batch accepted","trace_key":"<32hex>","trace_id":"00000000-0000-0000-0000-000000000000","host":"<host>","pid":<pid>,"body_bytes":<N>,"dict_entries":<N>,"call_count":<N>,"nodes":<N>,"pending":0,"anomalies":0,"target":"php_tree_viz_collector::http::server"}
+{"timestamp":"<timestamp>","level":"INFO","message":"trace finalized","trace_key":"<32hex>","pending_dq2":0,"cpu_snapshot_available":true,"target":"php_tree_viz_collector::finalize"}
 ```
 
-After 30 s of no further batches, the `trace finalized` event appears for the same `trace_key`. The `disk usage` event repeats once per hour by default — adjust `[observability].disk_usage_tick_seconds` in the config for a snappier cadence during testing.
+View it directly with `sudo journalctl -u php-tree-viz-collector --output cat --no-pager`. Feed it through `jq` to filter — for example, `jq -r 'select(.message == "batch accepted") | .trace_key'` lists every accepted trace's key. The `disk usage` event repeats once per hour by default; adjust `[observability].disk_usage_tick_seconds` in the config for a snappier cadence during testing.
 
-If you ran with `log.format = "json"` (the production default) instead of `"text"`, each line is a JSON object with the same fields flattened to the top level.
+If you prefer the human-readable line layout for an interactive verification, flip `log.format` to `"text"` in `/etc/php-tree-viz/collector.toml` and `sudo systemctl restart php-tree-viz-collector`. The same events come out shaped like `<timestamp>  INFO target: <message> field=value …` on a single line per event — easier to eyeball, harder to filter by program.
 
 If you don't see the `listening` event within a second of starting the binary, look for a `config error:` or `observability error:` line on stderr — those are the only places the collector writes outside of the `tracing` subscriber, and they signal a startup failure.
 
@@ -226,14 +225,8 @@ Filter level is `log.level` in the config (`trace|debug|info|warn|error`, defaul
 
 Output format is `log.format`. Two shapes:
 
-- **`text`** (the layout shown under [Expected output](#expected-output)) — timestamp, level, target, message, and `field=value` pairs, all on one line. Easy to eyeball during initial verification.
-- **`json`** (the production default and what `etc/collector.toml.example` ships) — one JSON object per event, with every field flattened to the top level. Example:
-
-  ```json
-  {"timestamp":"<ts>","level":"INFO","message":"batch accepted","trace_key":"<32hex>","trace_id":"00000000-...","host":"<host>","pid":<n>,"body_bytes":<n>,"dict_entries":2,"call_count":2,"nodes":2,"pending":0,"anomalies":0,"target":"php_tree_viz_collector::http::server"}
-  ```
-
-  journald reads this natively when the unit ships `format = "json"`; `journalctl -u php-tree-viz-collector --output cat` shows one JSON line per event, which feeds straight into `jq` for filtering. Switch to `json` once the install is verified.
+- **`json`** (the production default; what [Expected output](#expected-output) shows) — one JSON object per event, with every field flattened to the top level. journald reads this natively; `journalctl -u php-tree-viz-collector --output cat` prints one object per line; `jq` filters across them cleanly.
+- **`text`** — `<timestamp>  INFO target: <message> field=value …` on a single line per event. Easier to eyeball, harder to filter by program. Flip `log.format = "text"` in the config and `sudo systemctl restart php-tree-viz-collector` to switch.
 
 ## Project status
 
