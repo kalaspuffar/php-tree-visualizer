@@ -161,13 +161,22 @@ pub struct Collector {
 
 impl Collector {
     pub fn spawn(config_path: &Path) -> Self {
-        let mut child = Command::new(BIN)
-            .arg("--config")
+        Self::spawn_with_env(config_path, &[])
+    }
+
+    /// Same as `spawn`, but lets a test set extra environment variables
+    /// on the subprocess. Used by the sd_notify integration test to
+    /// inject `NOTIFY_SOCKET`.
+    pub fn spawn_with_env(config_path: &Path, env: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(BIN);
+        cmd.arg("--config")
             .arg(config_path)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to launch the collector binary");
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("failed to launch the collector binary");
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
