@@ -226,6 +226,13 @@ html, body {
 .banner--warn   { background: var(--warn-bg);   color: var(--warn); }
 .banner--info   { background: var(--info-bg);   color: var(--info); }
 
+/* Explicit `display: flex` on .banner above outweighs the user-agent
+ * stylesheet's `[hidden] { display: none }`. JS toggling `hidden`
+ * is a silent no-op without this override. Same pattern as the
+ * existing .modal[hidden] / .sort-dropdown__menu[hidden] /
+ * .phptv-tooltip[hidden] rules elsewhere in this file. */
+.banner[hidden] { display: none; }
+
 .banner__icon {
   width: 20px;
   height: 20px;
@@ -616,6 +623,12 @@ html, body {
 .empty-state__title { color: var(--fg); margin: 0; }
 .empty-state__body  { max-width: 480px; margin: 0; }
 
+/* Same [hidden] override as .banner above — see that comment for
+ * the rationale. Defensive: the trace-detail page no longer uses a
+ * static .empty-state block, but the trace-list page still builds
+ * .empty-state dynamically. Keeps the pattern consistent. */
+.empty-state[hidden] { display: none; }
+
 /* The illustration is a simple 96x96 stroked SVG; the .empty-state
  * container handles sizing. */
 .empty-state__illustration {
@@ -776,6 +789,33 @@ html, body {
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* Same [hidden] override as .banner / .empty-state above. Defensive
+ * — current detail.js doesn't toggle tree-wrapper hidden anymore,
+ * but the override keeps the door closed if a future contributor
+ * does and the CSS bug returns. */
+.tree-wrapper[hidden] { display: none; }
+
+/* Inline empty state inside the tree zone — a small text-only block
+ * below the column header, shown in place of the tree viewport when
+ * the trace doesn't exist or has no calls. Plain default `display`
+ * (block), so `[hidden]` works via the user-agent rule alone. */
+.tree-empty {
+  padding: var(--s-5) var(--s-3);
+  text-align: center;
+  color: var(--fg-muted);
+}
+
+.tree-empty__title {
+  color: var(--fg);
+  font-weight: 600;
+  margin: 0 0 var(--s-2);
+}
+
+.tree-empty__body {
+  max-width: 480px;
+  margin: 0 auto;
 }
 
 /* §3.3.7.1 — row grid; same widths the column header uses. */
