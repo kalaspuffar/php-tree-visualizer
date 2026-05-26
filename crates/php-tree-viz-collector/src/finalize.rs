@@ -65,6 +65,7 @@ async fn run_one_tick(storage: &Mutex<Storage>, idle_nanos: i64) {
             Ok(outcome) => {
                 tracing::info!(
                     trace_key = %key,
+                    pending_dq1 = outcome.pending_dq1,
                     pending_dq2 = outcome.pending_dq2,
                     cpu_snapshot_available = outcome.cpu_snapshot_available,
                     "trace finalized"
