@@ -105,6 +105,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
                                     call_count = batch.calls.len() as u64,
                                     nodes = outcome.nodes_touched,
                                     pending = outcome.pending_total,
+                                    dict_pending = outcome.dict_pending_added,
                                     anomalies = outcome.anomalies_added,
                                     "batch accepted"
                                 );

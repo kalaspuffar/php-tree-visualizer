@@ -1129,9 +1129,13 @@ fn build_test_batch_with_chain(host: &str, pid: u64, start_time: i64) -> Vec<u8>
 }
 
 /// Build a tiny MessagePack batch with one top-level Call whose
-/// `fn_id` is **not** in `dict` — the canonical DQ-1 shape. The
-/// aggregation step will skip the Call and write one anomaly row
-/// with `kind = 'unresolved_fn'`.
+/// `fn_id` is **not** in `dict` — the canonical DQ-1 shape.
+///
+/// Post `tolerate-out-of-order-batches`: aggregation does NOT write
+/// an anomaly row during `record_batch`. Instead it parks the Call
+/// in `pending_calls` expecting a late dict entry. The
+/// `unresolved_fn` anomaly row appears only at idle-finalize, for
+/// any pending row whose fn_id never made it into `dict`.
 fn build_test_batch_with_unresolved_fn(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
     #[derive(Serialize)]
     struct TestMeta<'a> {
@@ -2169,10 +2173,14 @@ fn well_formed_fixture_produces_no_anomalies() {
 }
 
 #[test]
-fn dq1_batch_writes_unresolved_fn_anomaly_e2e() {
+fn dq1_batch_parks_call_and_writes_unresolved_fn_at_finalize_e2e() {
+    // Two phases under one collector. First: the batch lands, the
+    // Call parks in `pending_calls`, no anomaly row exists yet.
+    // Second: the fast-finalize tick fires; the residual pending
+    // row becomes a single `unresolved_fn` anomaly row.
     let dir = unique_tempdir("dq1_e2e");
     let data_dir = dir.join("data");
-    let path = write_config(&dir, "127.0.0.1:0");
+    let path = write_config_with_fast_finalize(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
 
     let body = build_test_batch_with_unresolved_fn("dq1-host", 1, 1);
@@ -2181,11 +2189,30 @@ fn dq1_batch_writes_unresolved_fn_anomaly_e2e() {
     assert_eq!(status, 200);
     collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
+    // ---- Phase 1: post-batch, pre-finalize ----
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
         .unwrap();
     let conn = open_trace_db_ro(&data_dir, &trace_key);
+    let n_anom_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        n_anom_before, 0,
+        "DQ-1 must NOT be written during record_batch"
+    );
+    let pending_before: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT call_id, parent_call_id, fn_id FROM pending_calls",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(pending_before, (1, 0, 99));
 
+    // ---- Phase 2: post-finalize ----
+    collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
     let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
         .query_row(
             "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
@@ -2197,6 +2224,11 @@ fn dq1_batch_writes_unresolved_fn_anomaly_e2e() {
     assert_eq!(kind, "unresolved_fn");
     assert_eq!(sample_call_id, 1);
     assert_eq!(detail, "fn_id=99");
+
+    let n_pending: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_pending, 0, "pending_calls drained at finalize");
 
     let n_index: i64 = open_index_db_ro(&data_dir)
         .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
@@ -2224,24 +2256,76 @@ fn dq1_no_longer_emits_stderr_line() {
 }
 
 #[test]
-fn decoded_batch_log_carries_anomalies_field() {
+fn decoded_batch_log_carries_anomalies_and_dict_pending_fields() {
+    // Post `tolerate-out-of-order-batches`: a DQ-1 batch parks the
+    // call rather than writing an anomaly during `record_batch`, so
+    // the `anomalies` field on the `batch accepted` event is 0 for
+    // this shape — the new `dict_pending` field records the parking
+    // instead. Use an inverted-time batch to confirm DQ-3 still
+    // increments `anomalies` in-batch.
     let dir = unique_tempdir("anom_log_field");
     let path = write_config(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
 
-    let body = build_test_batch_with_unresolved_fn("dq1-log", 1, 1);
+    // 1) Unknown-fn batch: anomalies=0, dict_pending=1.
+    let body = build_test_batch_with_unresolved_fn("dict-pending-host", 1, 1);
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
-    let stdout = collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
 
-    let line = stdout
+    // 2) Inverted-time batch (different host → different trace_key):
+    //    anomalies=1, dict_pending=0.
+    let body = build_test_batch_with_inverted_time("dq3-log-host", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    // Wait until BOTH batch-accepted lines have been written.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let stdout = loop {
+        let s = collector.stdout_so_far.lock().unwrap().clone();
+        if s.matches(EVENT_BATCH_ACCEPTED).count() >= 2 {
+            break s;
+        }
+        if Instant::now() > deadline {
+            panic!("only one batch-accepted line within 5s:\n{s}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let lines: Vec<&str> = stdout
         .lines()
-        .find(|l| l.contains(EVENT_BATCH_ACCEPTED))
-        .expect("batch accepted event must be present");
+        .filter(|l| l.contains(EVENT_BATCH_ACCEPTED))
+        .collect();
+    assert_eq!(lines.len(), 2, "expected two batch-accepted lines");
+
+    // Tracing's default fmt layer renders string fields unquoted
+    // (`host=dict-pending-host`). Match on the bare host substring so
+    // the assertion isn't tied to a specific quoting convention.
+    let dict_pending_line = lines
+        .iter()
+        .find(|l| l.contains("dict-pending-host"))
+        .expect("dict-pending-host line missing");
     assert!(
-        line.contains("anomalies=1"),
-        "expected anomalies=1 in: {line}"
+        dict_pending_line.contains("anomalies=0"),
+        "expected anomalies=0 for parked-DQ-1 batch in: {dict_pending_line}"
+    );
+    assert!(
+        dict_pending_line.contains("dict_pending=1"),
+        "expected dict_pending=1 in: {dict_pending_line}"
+    );
+
+    let dq3_line = lines
+        .iter()
+        .find(|l| l.contains("dq3-log-host"))
+        .expect("dq3-log-host line missing");
+    assert!(
+        dq3_line.contains("anomalies=1"),
+        "expected anomalies=1 for DQ-3 batch in: {dq3_line}"
+    );
+    assert!(
+        dq3_line.contains("dict_pending=0"),
+        "expected dict_pending=0 for DQ-3 batch in: {dq3_line}"
     );
 }
 
@@ -2288,10 +2372,15 @@ fn anomaly_count_on_traces_row_mirrors_per_trace_anomalies_e2e() {
     let path = write_config(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
 
-    // Two requests: one DQ-1, one DQ-3, against different hosts
-    // (so two distinct trace_keys). Each trace's index row's
-    // anomaly_count must match its per-trace SQLite anomalies row
-    // count (1 each).
+    // Two requests: one unknown-fn (DQ-1 deferred to finalize), one
+    // DQ-3 (anomaly written in-batch), against different hosts so
+    // they get distinct trace_keys. The invariant under test is the
+    // in-batch shape:
+    //     traces.anomaly_count == per-trace SELECT COUNT(*)
+    // For the unknown-fn trace both are 0 (the call sits in
+    // pending_calls); for the DQ-3 trace both are 1. The "DQ-1
+    // eventually becomes 1" assertion lives in
+    // `dq1_batch_parks_call_and_writes_unresolved_fn_at_finalize_e2e`.
     for (host, body) in [
         (
             "anom-e2e-a",
@@ -2348,10 +2437,13 @@ fn consecutive_batches_with_anomalies_accumulate_the_counter() {
     let path = write_config(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
 
-    // Two DQ-1 batches against the same host → same trace_key →
-    // counter must sum.
+    // Two DQ-3 batches against the same host → same trace_key →
+    // counter must sum. (Pre `tolerate-out-of-order-batches` this
+    // test used DQ-1 batches; those no longer write anomalies in-
+    // batch, so the accumulation invariant is exercised here with
+    // DQ-3 — which still emits its anomaly row immediately.)
     for _ in 0..2 {
-        let body = build_test_batch_with_unresolved_fn("anom-acc", 7, 7);
+        let body = build_test_batch_with_inverted_time("anom-acc", 7, 7);
         let req = ingest_request(&collector.bound, &body);
         let (status, _) = send_raw(&collector.bound, &req);
         assert_eq!(status, 200);

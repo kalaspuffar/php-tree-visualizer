@@ -489,6 +489,59 @@ were written.
 
 ---
 
+## 2026-05-26 — Out-of-order batch arrival within one `trace_id` is an accepted ingest contract
+
+The collector is now reorder-tolerant for batches sharing a
+`trace_id` (change: `tolerate-out-of-order-batches`). Recorders are
+free to ship batches concurrently and/or out of produce order; the
+visualizer reconstructs the trace identically to in-order arrival,
+provided the full set eventually lands while the trace is still
+`'active'` (or briefly reactivates per DR-3 before the missing
+batch arrives).
+
+Practically: a call referencing an `fn_id` whose introducing
+`DictEntry` is in a later-arriving batch is **parked in
+`pending_calls`**, not dropped. The drain pass (per batch + at
+finalize) resolves the row once both its `fn_id` is in `dict` AND
+its `parent_call_id` is bound (`0` or in `call_to_node`).
+
+DQ-1 (`unresolved_fn`) is therefore emitted only at
+`Storage::finalize_trace`, alongside DQ-2
+(`pending_parent_at_finalize`), for residual `pending_calls` rows
+that never resolved. The split:
+
+- `fn_id ∉ dict` at finalize → DQ-1 (missing dict is the more
+  diagnostic miss; emits DQ-1 even if parent is also unbound).
+- `fn_id ∈ dict` at finalize but parent never seen → DQ-2.
+
+Consequences for downstream code and UX:
+
+- While a trace is `'active'`, `traces.anomaly_count` and the
+  UI's anomaly badge **under-report DQ-1**. The badge is "stable
+  at finalize," not in-flight. The status-dot pulse on `'active'`
+  already signals "in flight."
+- A trace finalized once and then reactivated by a late batch
+  (DR-3) keeps any DQ-1 rows written by the first finalize, even
+  if the late batch's dict now resolves them into `nodes`. This
+  is an accepted trade-off; revisit if it becomes user-visible.
+- `pending_calls` may grow larger during the active window than
+  it used to: every unknown-fn_id call now parks. The §7.2
+  "active trace ≤ a few MB" sizing envelope and the 30 s
+  idle-finalize timeout are the existing controls — no new cap.
+
+The `batch accepted` structured event now carries an additional
+field, `dict_pending=<N>`, counting per-batch parks-on-fn_id, so
+operators can see how much reorder buffering each batch triggers.
+
+The `trace finalized` structured event now carries
+`pending_dq1=<N>` alongside `pending_dq2=<N>`.
+
+The same `pending_calls` table holds both kinds of pending rows
+— no schema migration was needed. Classification at finalize is
+a `SELECT fn_id FROM dict` snapshot at finalize time.
+
+---
+
 ## How to update this file
 
 Append new entries to the bottom under a `## YYYY-MM-DD — <topic>`

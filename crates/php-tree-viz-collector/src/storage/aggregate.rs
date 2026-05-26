@@ -4,40 +4,50 @@
 //! The flow inside one call to [`aggregate_calls`]:
 //!
 //! 1. Build the set of known `dict.fn_id` for this trace (one
-//!    SELECT). Calls referencing fn_ids not in the set are DQ-1
-//!    candidates and get skipped with a stderr log line.
+//!    SELECT). The set already reflects the just-arrived batch's
+//!    dict entries — `record_batch` inserts them before calling
+//!    here.
 //! 2. Walk `batch.calls` **in reverse order**. The recorder
 //!    emits records in exit order; reversing yields
 //!    parents-before-children within a batch, so most in-batch
 //!    parent lookups succeed against `call_to_node` on the
 //!    first try.
 //! 3. For each Call:
-//!    - Resolve `parent_node_id`: `1` if `c.parent == 0`,
-//!      else `SELECT node_id FROM call_to_node WHERE call_id = ?`.
-//!    - If resolved: upsert the `(parent_node_id, fn_id)` bucket
-//!      (RETURNING node_id), bump the parent's
+//!    - If its `fn_id` is not yet in `dict`, park it in
+//!      `pending_calls` (the introducing `DictEntry` will arrive
+//!      in a later batch — see the `tolerate-out-of-order-batches`
+//!      change). The Call is **not** dropped; no anomaly row is
+//!      written here.
+//!    - Otherwise, resolve `parent_node_id`: `1` if
+//!      `c.parent == 0`, else
+//!      `SELECT node_id FROM call_to_node WHERE call_id = ?`.
+//!    - If parent resolved: upsert the `(parent_node_id, fn_id)`
+//!      bucket (RETURNING node_id), bump the parent's
 //!      `children_total_wall_ns`, map `call_id → node_id`.
-//!    - If unresolved (cross-batch parent): insert into
+//!    - If parent unresolved (cross-batch parent): insert into
 //!      `pending_calls`.
 //! 4. After the in-batch loop, drain `pending_calls` iteratively:
-//!    pending rows whose `parent_call_id` is now in
+//!    pending rows whose `fn_id` is now in `dict` AND whose
+//!    `parent_call_id` is either zero (top-level) or now in
 //!    `call_to_node` get the same upsert + parent-bump + mapping
 //!    treatment, then are deleted. Loop until no progress.
 //!
-//! Two anomaly kinds are written by this module:
+//! Only one anomaly kind is written by this module:
 //!
-//! - **DQ-1 (`unresolved_fn`)**: a Call references a `fn_id` not in
-//!   `dict`. The Call is skipped (no node row, no `call_to_node`
-//!   mapping), and one anomaly row with `node_id = NULL` and
-//!   `detail = "fn_id=<N>"` is inserted.
 //! - **DQ-3 (`inverted_time`)**: a Call has `t_out < t_in`. The
 //!   Call still folds into a node (its wall delta is clamped to 0
 //!   via `.max(0)` to honour DI-3), and one anomaly row with
 //!   `node_id = <resulting node>` and `detail = "t_in=<I>,t_out=<O>"`
 //!   is inserted.
 //!
-//! **DQ-2 (`pending_parent_at_finalize`)** is detected at idle-
-//! finalize (DI-4); not in this module.
+//! **DQ-1 (`unresolved_fn`)** and **DQ-2 (`pending_parent_at_finalize`)**
+//! are written by `Storage::finalize_trace`. At finalize, every
+//! row still in `pending_calls` is classified by whether its
+//! `fn_id` is in `dict`: if not, it becomes DQ-1; otherwise (the
+//! residual cause must be a never-arrived parent) it becomes
+//! DQ-2. This split is necessary because batch arrival order is
+//! not guaranteed to match recorder produce order — the dict-
+//! defining batch may arrive after batches that reference it.
 
 use std::collections::HashSet;
 
@@ -82,15 +92,20 @@ pub struct AggregateOutcome {
     /// Total `pending_calls` rows remaining in the trace
     /// after the drain pass.
     pub pending_total: u32,
-    /// Calls skipped because their `fn_id` was missing from
-    /// the trace's `dict` (DQ-1). Each one also bumps
-    /// `anomalies_added`.
-    pub dq1_skipped: u32,
+    /// Calls parked in `pending_calls` because their `fn_id` was
+    /// not yet in the trace's `dict` when the batch was aggregated.
+    /// The introducing `DictEntry` is expected in a later batch
+    /// (out-of-order arrival is allowed); only rows still unresolved
+    /// at finalize become DQ-1 anomalies. This counter exists so
+    /// operators can see how much fn_id-reordering buffering each
+    /// batch triggers via the `batch accepted` log event.
+    pub dict_pending_added: u32,
     /// Calls that folded into a node despite `t_out < t_in` (DQ-3).
     /// Each one also bumps `anomalies_added`.
     pub dq3_inverted: u32,
     /// Total `anomalies` rows inserted by this batch's
-    /// aggregation. Equals `dq1_skipped + dq3_inverted` today; kept
+    /// aggregation. Equals `dq3_inverted` today — DQ-1 and DQ-2
+    /// are written exclusively by `Storage::finalize_trace`. Kept
     /// as its own field so the `index.sqlite.traces.anomaly_count`
     /// bump has a single source of truth and so future kinds can
     /// add to it without rewriting the call site.
@@ -143,14 +158,15 @@ pub(super) fn aggregate_calls(
     // ---- in-batch loop (reverse order = parents first) ----
     for c in batch.calls.iter().rev() {
         if !known.contains(&c.fn_id) {
-            // DQ-1: unresolved fn_id. Record + skip. The Call still
-            // cannot fold (no `dict` row means an FK violation if we
-            // tried) but the anomaly row is now durable evidence of
-            // the skip; the operator sees it via
-            // `traces.anomaly_count`, not stderr.
-            insert_unresolved_fn_anomaly(tx, c.call_id, c.fn_id)?;
-            outcome.dq1_skipped += 1;
-            outcome.anomalies_added += 1;
+            // The `DictEntry` for this `fn_id` is in a batch we
+            // haven't seen yet. Park the Call in `pending_calls`;
+            // the drain pass (here and at finalize) will fold it
+            // once the dict-defining batch arrives. No anomaly row
+            // — DQ-1 is emitted exclusively by `finalize_trace`
+            // for rows whose `fn_id` truly never arrives.
+            insert_pending_call(tx, c)?;
+            outcome.pending_added += 1;
+            outcome.dict_pending_added += 1;
             continue;
         }
 
@@ -370,8 +386,18 @@ fn insert_pending_call(tx: &Transaction, c: &wire::Call) -> Result<(), StorageEr
     Ok(())
 }
 
-/// Iteratively resolve pending rows whose parent is now in
-/// `call_to_node`. Loops until a pass resolves zero rows.
+/// Iteratively resolve pending rows whose `fn_id` is now in `dict`
+/// AND whose `parent_call_id` is either `0` (top-level under the
+/// synthetic root) or already in `call_to_node`. Loops until a pass
+/// resolves zero rows. Nothing here writes anomaly rows — DQ-1 and
+/// DQ-2 emission is exclusively `Storage::finalize_trace`'s job.
+///
+/// The `known` argument carries the dict-fn_id set the caller built
+/// at the top of `aggregate_calls`. Rebuilding it from the live
+/// `dict` table on every drain iteration would be more correct in
+/// the presence of mid-iteration inserts (none happen today) but
+/// the caller's snapshot is the one that already reflects the just-
+/// accumulated batch dict, which is the contract we need.
 fn drain_pending(
     tx: &Transaction,
     known: &HashSet<u32>,
@@ -380,26 +406,24 @@ fn drain_pending(
     loop {
         // Materialise the resolvable rows first so we can
         // mutate the table inside the loop without holding the
-        // SELECT's cursor.
+        // SELECT's cursor. Top-level pending rows
+        // (`parent_call_id = 0`) resolve under the synthetic root
+        // — the LEFT JOIN + COALESCE turns "no call_to_node row"
+        // into the synthetic root's node_id for that case, and
+        // filters out rows whose parent is genuinely unbound.
         let resolvable: Vec<PendingRow> = {
-            let mut stmt = tx
-                .prepare_cached(
-                    "SELECT p.call_id, p.parent_call_id, p.fn_id, p.t_in_ns, p.t_out_ns, \
-                            p.cpu_u_ns, p.cpu_s_ns, p.mem_in_bytes, p.mem_out_bytes, \
-                            p.abnormal_exit, c.node_id \
-                     FROM pending_calls p \
-                     JOIN call_to_node c ON c.call_id = p.parent_call_id",
-                )
-                .map_err(|e| StorageError::Query {
-                    context: "prepare drain query",
-                    source: e,
-                })?;
-            let rows =
-                stmt.query_map([], PendingRow::from_row)
+            let mut stmt =
+                tx.prepare_cached(DRAIN_RESOLVABLE_SQL)
                     .map_err(|e| StorageError::Query {
-                        context: "query drain pending",
+                        context: "prepare drain query",
                         source: e,
                     })?;
+            let rows = stmt
+                .query_map(params![SYNTHETIC_ROOT_NODE_ID], PendingRow::from_row)
+                .map_err(|e| StorageError::Query {
+                    context: "query drain pending",
+                    source: e,
+                })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| StorageError::Query {
                     context: "collect drain pending rows",
@@ -407,32 +431,21 @@ fn drain_pending(
                 })?
         };
 
+        // The SQL filter cannot express "fn_id in dict" against the
+        // in-memory `known` set; do the second half of the
+        // resolvability predicate here. Rows with an unknown fn_id
+        // stay in `pending_calls` for a future batch to resolve, or
+        // for `finalize_trace` to classify as DQ-1.
+        let resolvable: Vec<PendingRow> = resolvable
+            .into_iter()
+            .filter(|row| known.contains(&row.fn_id))
+            .collect();
+
         if resolvable.is_empty() {
             break;
         }
 
         for row in &resolvable {
-            // Pre-validate fn_id against dict — a pending Call
-            // whose fn_id never appeared in dict is DQ-1 territory.
-            // Same handling as the in-batch path: record + skip +
-            // delete the pending row (so it doesn't accumulate
-            // forever). The anomaly row keeps a durable trail
-            // even though the pending row is gone.
-            if !known.contains(&row.fn_id) {
-                insert_unresolved_fn_anomaly(tx, row.call_id as u32, row.fn_id)?;
-                outcome.dq1_skipped += 1;
-                outcome.anomalies_added += 1;
-                tx.execute(
-                    "DELETE FROM pending_calls WHERE call_id = ?1",
-                    params![row.call_id],
-                )
-                .map_err(|e| StorageError::Query {
-                    context: "delete pending dq1",
-                    source: e,
-                })?;
-                continue;
-            }
-
             // Reconstruct the wire Call shape just enough to
             // pass to fold_call_into_nodes. We don't carry
             // `depth` in pending_calls; the closest stand-in is
@@ -477,11 +490,35 @@ fn drain_pending(
     Ok(())
 }
 
-/// DQ-1 anomaly insert. The Call never folds into a `nodes` row
-/// (its `fn_id` is absent from `dict`), so `node_id` is NULL; the
-/// `detail` string carries the missing fn_id so the UI / operator
-/// can identify which dict entry was lost in transit.
-fn insert_unresolved_fn_anomaly(
+/// SQL for the drain pass's parent-resolvability filter. The
+/// LEFT JOIN + COALESCE collapses two cases into one row shape:
+///
+/// - `parent_call_id = 0` (top-level): no `call_to_node` match;
+///   COALESCE picks `?1` (the synthetic root's node_id), so the row
+///   is resolvable against the root.
+/// - `parent_call_id != 0` and present in `call_to_node`:
+///   COALESCE picks `c.node_id`, the resolved parent.
+///
+/// Rows where `parent_call_id != 0` and `call_to_node` has no match
+/// are filtered out by the `WHERE` clause — they remain pending.
+const DRAIN_RESOLVABLE_SQL: &str = "
+SELECT p.call_id, p.parent_call_id, p.fn_id, p.t_in_ns, p.t_out_ns,
+       p.cpu_u_ns, p.cpu_s_ns, p.mem_in_bytes, p.mem_out_bytes,
+       p.abnormal_exit, COALESCE(c.node_id, ?1) AS parent_node_id
+FROM pending_calls p
+LEFT JOIN call_to_node c ON c.call_id = p.parent_call_id
+WHERE p.parent_call_id = 0 OR c.node_id IS NOT NULL
+";
+
+/// DQ-1 anomaly insert. Called by `Storage::finalize_trace` for
+/// every row left in `pending_calls` at finalize whose `fn_id`
+/// never made it into `dict`. The Call never folded into a `nodes`
+/// row, so `node_id` is NULL; the `detail` string carries the
+/// missing `fn_id` so the UI / operator can identify which dict
+/// entry was lost in transit. Never called from the in-batch
+/// aggregation path or the drain pass — both park unknown-fn_id
+/// calls instead, deferring the verdict to finalize.
+pub(super) fn insert_unresolved_fn_anomaly(
     tx: &Transaction,
     call_id: u32,
     fn_id: u32,
@@ -1010,10 +1047,15 @@ mod tests {
         assert_eq!(pending, 1, "orphan must still be pending");
     }
 
-    // ---- DQ-1 detection ----
+    // ---- DQ-1 deferral (park unknown-fn_id calls; finalize emits) ----
 
     #[test]
-    fn dq1_call_is_skipped_and_rest_aggregate() {
+    fn unknown_fn_id_call_parks_and_rest_aggregate() {
+        // Previously this test asserted in-batch DQ-1 skip + anomaly.
+        // After `tolerate-out-of-order-batches`, the unknown-fn_id
+        // call parks in `pending_calls` instead. No anomaly row is
+        // written during `record_batch`; the rest of the batch's
+        // valid calls still fold.
         let mut conn = fresh_trace_db();
         install_dict(&conn, &[dict_entry(7)]); // fn_id=99 deliberately missing
         let batch = Batch {
@@ -1022,8 +1064,10 @@ mod tests {
             calls: vec![call(1, 0, 99, 100), call(2, 0, 7, 200)],
         };
         let outcome = aggregate_in(&mut conn, &batch);
-        assert_eq!(outcome.dq1_skipped, 1);
-        assert_eq!(outcome.nodes_touched, 1);
+        assert_eq!(outcome.dict_pending_added, 1);
+        assert_eq!(outcome.anomalies_added, 0);
+        assert_eq!(outcome.nodes_touched, 1, "fn=7 still folds");
+        assert_eq!(outcome.pending_total, 1);
 
         let n_under_root: i64 = conn
             .query_row(
@@ -1032,16 +1076,34 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n_under_root, 1, "only fn=7 should land");
+        assert_eq!(n_under_root, 1, "only fn=7 should land in nodes");
+
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n_anom, 0,
+            "no anomaly during record_batch; DQ-1 deferred to finalize"
+        );
+
+        let n_pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_calls WHERE call_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_pending, 1, "unknown-fn_id call sits in pending_calls");
     }
 
     #[test]
-    fn synthetic_root_fn0_is_in_known_set_so_no_dq1_for_root_children() {
+    fn synthetic_root_fn0_is_in_known_set_so_root_children_resolve() {
         // Children of root reference parent=0 (the wire convention),
         // so resolve_parent returns Some(1) without consulting
-        // call_to_node, and the child's own fn_id is what gets
-        // DQ-1-checked. This test just sanity-checks that fn_id=0
-        // is in the known set after seed.
+        // call_to_node, and the child's own fn_id is checked against
+        // the dict. This test just sanity-checks that fn_id=0 is in
+        // the known set after seed — the entry point used by both
+        // aggregate_calls and drain_pending.
         let conn = fresh_trace_db();
         let tx = conn.unchecked_transaction().unwrap();
         let known = known_fn_ids(&tx).unwrap();
@@ -1051,37 +1113,43 @@ mod tests {
         );
     }
 
-    // ---- DQ-1 anomaly inserts ----
+    // ---- DQ-1 anomaly emission moved to finalize ----
 
     #[test]
-    fn dq1_writes_unresolved_fn_anomaly_row() {
+    fn unknown_fn_id_call_does_not_write_anomaly_during_record() {
+        // The aggregation layer never writes `unresolved_fn` itself.
+        // That row appears only at `Storage::finalize_trace`, against
+        // any pending row whose fn_id never made it into `dict`.
         let mut conn = fresh_trace_db();
-        install_dict(&conn, &[dict_entry(7)]); // fn_id=99 deliberately missing
+        install_dict(&conn, &[dict_entry(7)]); // fn_id=99 missing
         let batch = Batch {
             meta: meta(),
             dict: vec![],
             calls: vec![call(42, 0, 99, 100)],
         };
         let outcome = aggregate_in(&mut conn, &batch);
-        assert_eq!(outcome.dq1_skipped, 1);
-        assert_eq!(outcome.anomalies_added, 1);
+        assert_eq!(outcome.dict_pending_added, 1);
+        assert_eq!(outcome.anomalies_added, 0);
         assert_eq!(outcome.nodes_touched, 0);
 
-        let (node_id, kind, sample_call_id, detail): (Option<i64>, String, i64, String) = conn
-            .query_row(
-                "SELECT node_id, kind, sample_call_id, detail FROM anomalies",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(node_id, None, "unresolved_fn carries no node");
-        assert_eq!(kind, KIND_UNRESOLVED_FN);
-        assert_eq!(sample_call_id, 42);
-        assert_eq!(detail, "fn_id=99");
+        assert_eq!(n_anom, 0);
+
+        let pending_call_id: i64 = conn
+            .query_row("SELECT call_id FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending_call_id, 42);
     }
 
     #[test]
-    fn multiple_dq1_calls_produce_multiple_rows() {
+    fn multiple_unknown_fn_id_calls_all_park() {
+        // Three unknown-fn_id calls + one valid call. Pre-change,
+        // the three would have produced three `unresolved_fn` rows
+        // immediately. Post-change, they wait in pending_calls for
+        // the dict to arrive (or for finalize to convert them to
+        // DQ-1).
         let mut conn = fresh_trace_db();
         install_dict(&conn, &[dict_entry(7)]);
         let batch = Batch {
@@ -1095,23 +1163,19 @@ mod tests {
             ],
         };
         let outcome = aggregate_in(&mut conn, &batch);
-        assert_eq!(outcome.dq1_skipped, 3);
-        assert_eq!(outcome.anomalies_added, 3);
-        assert_eq!(outcome.nodes_touched, 1);
+        assert_eq!(outcome.dict_pending_added, 3);
+        assert_eq!(outcome.anomalies_added, 0);
+        assert_eq!(outcome.nodes_touched, 1, "only fn=7 folds");
 
-        let n_anomalies: i64 = conn
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 3);
+
+        let n_anom: i64 = conn
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_anomalies, 3);
-
-        let n_unresolved: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM anomalies WHERE kind = 'unresolved_fn'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(n_unresolved, 3);
+        assert_eq!(n_anom, 0);
     }
 
     // ---- DQ-3 anomaly inserts ----
@@ -1271,44 +1335,50 @@ mod tests {
     }
 
     #[test]
-    fn dq1_via_drain_pending_still_writes_anomaly() {
-        // Sequence:
-        //   batch 1 — child Call with parent=999 (unseen) and fn_id=99
-        //             (which IS in dict at this moment via batch.dict).
-        //             The Call goes to pending_calls (parent unseen).
-        //   later — Calls in fresh batches eventually surface
-        //             parent=999 via the wire. Walking through the
-        //             drain pass, the pending row's fn_id is checked
-        //             against `dict`. If we ensure fn_id=99 is NOT
-        //             in dict at drain time, we exercise the
-        //             drain-path DQ-1 branch.
-        //
-        // We can't easily make a fn_id "disappear" from dict after
-        // it's been inserted (INSERT OR IGNORE is one-way), so to
-        // hit the drain DQ-1 path we deliberately keep fn_id=99
-        // out of dict throughout — the in-batch loop already
-        // skips it before it can become pending. The drain-path
-        // DQ-1 branch is dead code under the current pre-pending
-        // check; it's defensive in case future changes route a
-        // pending row through with a stale fn_id.
-        //
-        // For coverage purposes this test simply confirms that
-        // the in-batch DQ-1 path writes the anomaly and does NOT
-        // create a pending row (no drain needed).
+    fn drain_pass_folds_pending_when_late_dict_arrives() {
+        // Replaces the pre-change `dq1_via_drain_pending_still_writes_anomaly`.
+        // The drain pass no longer writes DQ-1 anomalies. Instead, a
+        // pending row whose fn_id was unknown at park time gets folded
+        // into `nodes` the moment a later batch carries the missing
+        // `DictEntry`. No anomaly row is written.
         let mut conn = fresh_trace_db();
-        install_dict(&conn, &[dict_entry(7)]); // fn=99 missing
-        let batch = Batch {
+        install_dict(&conn, &[dict_entry(7)]); // fn=99 still missing
+
+        // Batch A: child Call with parent=999 (unseen) AND fn_id=99
+        // (also missing). With the new logic, the fn_id check parks
+        // the call first; the same row would be parked by the parent
+        // check anyway. Either way it lands in pending_calls.
+        let batch_a = Batch {
             meta: meta(),
             dict: vec![],
-            calls: vec![call(10, 999, 99, 100)], // parent unseen, fn missing
+            calls: vec![call(10, 999, 99, 100)],
         };
-        let outcome = aggregate_in(&mut conn, &batch);
-        assert_eq!(outcome.dq1_skipped, 1);
-        assert_eq!(outcome.anomalies_added, 1);
-        assert_eq!(
-            outcome.pending_added, 0,
-            "DQ-1 short-circuits before pending"
-        );
+        let outcome_a = aggregate_in(&mut conn, &batch_a);
+        assert_eq!(outcome_a.dict_pending_added, 1);
+        assert_eq!(outcome_a.anomalies_added, 0);
+        assert_eq!(outcome_a.pending_added, 1);
+
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 1);
+
+        // Batch B: introduces fn_id=99 in the dict and the parent
+        // (call_id=999, parent=root, fn=7). Both blockers go away
+        // at once → drain folds the pending row.
+        let batch_b = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(99)],
+            calls: vec![call(999, 0, 7, 500)],
+        };
+        // Mirror what `record_batch` would do: insert the new dict
+        // entry before calling `aggregate_calls`. The test harness's
+        // `aggregate_in` doesn't run the full `record_batch` path,
+        // so dict accumulation happens here.
+        install_dict(&conn, &[dict_entry(99)]);
+        let outcome_b = aggregate_in(&mut conn, &batch_b);
+        assert_eq!(outcome_b.pending_resolved, 1);
+        assert_eq!(outcome_b.anomalies_added, 0);
 
         let n_pending: i64 = conn
             .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
@@ -1318,6 +1388,238 @@ mod tests {
         let n_anom: i64 = conn
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_anom, 1);
+        assert_eq!(
+            n_anom, 0,
+            "drain pass folds the call; no DQ-1 anomaly anywhere"
+        );
+
+        let n_fn_99: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE fn_id = 99", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n_fn_99, 1);
+    }
+
+    // ---- out-of-order arrival ----
+
+    #[test]
+    fn late_dict_resolves_parked_top_level_call() {
+        // Batch A: one top-level Call with fn=99 — but fn=99 not in
+        // dict yet. Expectation: one pending row, no nodes, no
+        // anomalies.
+        let mut conn = fresh_trace_db();
+        // No `install_dict` for fn=99 yet.
+        let batch_a = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(1, 0, 99, 100)],
+        };
+        let outcome_a = aggregate_in(&mut conn, &batch_a);
+        assert_eq!(outcome_a.dict_pending_added, 1);
+        assert_eq!(outcome_a.nodes_touched, 0);
+        assert_eq!(outcome_a.anomalies_added, 0);
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 1);
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom, 0);
+
+        // Batch B: introduces fn=99 in the dict, no calls. Expectation:
+        // the pending row drains, one nodes row appears for
+        // (parent=root, fn=99), still no anomalies.
+        install_dict(&conn, &[dict_entry(99)]);
+        let batch_b = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(99)],
+            calls: vec![],
+        };
+        let outcome_b = aggregate_in(&mut conn, &batch_b);
+        assert_eq!(outcome_b.pending_resolved, 1);
+        assert_eq!(outcome_b.anomalies_added, 0);
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 0);
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom, 0);
+        let (parent, fn_id_): (i64, i64) = conn
+            .query_row(
+                "SELECT parent_node_id, fn_id FROM nodes WHERE fn_id = 99",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(parent, SYNTHETIC_ROOT_NODE_ID);
+        assert_eq!(fn_id_, 99);
+    }
+
+    #[test]
+    fn late_dict_resolves_parked_child_call() {
+        // Batch A: parent Call (call_id=20, parent=0, fn=8 in dict)
+        // and child Call (call_id=10, parent=20, fn=99 NOT in dict).
+        // Expectation: parent folds, child parks on fn_id.
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(8)]);
+        let batch_a = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(8)],
+            calls: vec![call(10, 20, 99, 50), call(20, 0, 8, 300)],
+        };
+        let outcome_a = aggregate_in(&mut conn, &batch_a);
+        assert_eq!(outcome_a.dict_pending_added, 1, "child parked on fn_id");
+        assert!(outcome_a.nodes_touched >= 1, "parent folds");
+
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 1);
+        let parent_node_id: i64 = conn
+            .query_row("SELECT node_id FROM nodes WHERE fn_id = 8", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(parent_node_id > 1);
+
+        // Batch B: introduces fn=99 in dict, no calls.
+        install_dict(&conn, &[dict_entry(99)]);
+        let batch_b = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(99)],
+            calls: vec![],
+        };
+        let outcome_b = aggregate_in(&mut conn, &batch_b);
+        assert_eq!(outcome_b.pending_resolved, 1);
+        assert_eq!(outcome_b.anomalies_added, 0);
+
+        // Child now folded under the parent's node.
+        let (child_parent_node, child_fn_id): (i64, i64) = conn
+            .query_row(
+                "SELECT parent_node_id, fn_id FROM nodes WHERE fn_id = 99",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(child_parent_node, parent_node_id);
+        assert_eq!(child_fn_id, 99);
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom, 0);
+    }
+
+    #[test]
+    fn reverse_order_three_batches_yield_same_tree() {
+        // One trace, three logical batches A/B/C. Replay forward in
+        // one DB, reverse in another, then compare the resulting
+        // `nodes` rows under the same `(parent_node_id, fn_id)` key.
+        // The trees must be byte-identical apart from auto-assigned
+        // `node_id`s.
+        //
+        // Layout:
+        //   A introduces fn=7 (top-level Call call_id=1, wall=100)
+        //   B introduces fn=8 as a child of A's call (call_id=2,
+        //       parent=1, wall=200) — fn=8 dict in B.
+        //   C introduces fn=9 as a child of B's call (call_id=3,
+        //       parent=2, wall=50) — fn=9 dict in C.
+        let mk_a = || Batch {
+            meta: meta(),
+            dict: vec![dict_entry(7)],
+            calls: vec![call(1, 0, 7, 100)],
+        };
+        let mk_b = || Batch {
+            meta: meta(),
+            dict: vec![dict_entry(8)],
+            calls: vec![call(2, 1, 8, 200)],
+        };
+        let mk_c = || Batch {
+            meta: meta(),
+            dict: vec![dict_entry(9)],
+            calls: vec![call(3, 2, 9, 50)],
+        };
+
+        // Forward arrival order: A, B, C.
+        let mut conn_fwd = fresh_trace_db();
+        for batch in [mk_a(), mk_b(), mk_c()] {
+            install_dict(&conn_fwd, &batch.dict);
+            aggregate_in(&mut conn_fwd, &batch);
+        }
+
+        // Reverse arrival order: C, B, A.
+        let mut conn_rev = fresh_trace_db();
+        for batch in [mk_c(), mk_b(), mk_a()] {
+            install_dict(&conn_rev, &batch.dict);
+            aggregate_in(&mut conn_rev, &batch);
+        }
+
+        // Compare the per-`(parent_node_id, fn_id)` projection. We
+        // can't compare `node_id`s directly (they're autoincrement
+        // and depend on insertion order), so project to the bucket
+        // key + counters and assert the sets are equal.
+        fn project(conn: &rusqlite::Connection) -> Vec<(i64, i64, i64, i64)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT COALESCE(parent_node_id, -1), fn_id, call_count, total_wall_ns \
+                     FROM nodes \
+                     ORDER BY fn_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        }
+
+        // Pre-finalize: both DBs may differ in pending_calls (reverse
+        // run still has the C-batch row parked until later batches
+        // arrive). Drain both fully by sending one terminal "all
+        // dicts present" no-op batch, then compare.
+        let terminal = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![],
+        };
+        aggregate_in(&mut conn_fwd, &terminal);
+        aggregate_in(&mut conn_rev, &terminal);
+
+        // After drain, no pending rows should remain in either DB.
+        let pending_fwd: i64 = conn_fwd
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        let pending_rev: i64 = conn_rev
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending_fwd, 0, "forward run drained");
+        assert_eq!(pending_rev, 0, "reverse run drained too");
+
+        // No anomalies in either run.
+        let anom_fwd: i64 = conn_fwd
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        let anom_rev: i64 = conn_rev
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(anom_fwd, 0);
+        assert_eq!(anom_rev, 0);
+
+        let fwd = project(&conn_fwd);
+        let rev = project(&conn_rev);
+        assert_eq!(
+            fwd, rev,
+            "post-drain node projections must be equal under any \
+             arrival permutation within a trace"
+        );
     }
 }

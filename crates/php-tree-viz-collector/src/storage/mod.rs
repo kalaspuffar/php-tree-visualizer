@@ -13,7 +13,7 @@ mod aggregate;
 mod error;
 mod schema;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
@@ -24,14 +24,22 @@ pub use aggregate::AggregateOutcome;
 
 /// Counters surfaced by `Storage::finalize_trace`. The finalize loop
 /// reads these to write its `finalized trace …` log line; tests read
-/// them to assert the per-trace DQ-2 count and the trace's
+/// them to assert the per-trace DQ-1 / DQ-2 splits and the trace's
 /// `cpu_snapshot_available` outcome.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FinalizeOutcome {
     /// Rows inserted into `anomalies` with
-    /// `kind = 'pending_parent_at_finalize'` during this finalize
-    /// pass. Equals the number of rows that were in `pending_calls`
-    /// at finalize time.
+    /// `kind = 'unresolved_fn'` (DQ-1) during this finalize pass.
+    /// One row per residual `pending_calls` row whose `fn_id` was
+    /// not in the per-trace `dict` at finalize — the call was
+    /// parked during in-batch aggregation expecting a late
+    /// `DictEntry`, which never arrived.
+    pub pending_dq1: u32,
+    /// Rows inserted into `anomalies` with
+    /// `kind = 'pending_parent_at_finalize'` (DQ-2) during this
+    /// finalize pass. One row per residual `pending_calls` row
+    /// whose `fn_id` IS in `dict` but whose `parent_call_id` was
+    /// never seen in `call_to_node`.
     pub pending_dq2: u32,
     /// `false` when every non-root `nodes` row in this trace has
     /// `total_cpu_u_ns + total_cpu_s_ns == 0` (the extension was
@@ -119,6 +127,16 @@ impl Storage {
         // values still flow through to aggregate_calls, which
         // writes the inverted_time anomaly row with the original
         // (signed) values in `detail`.
+        //
+        // The trace-level wall counter is computed from
+        // `batch.calls` directly — *not* from whichever subset of
+        // calls actually folded into `nodes` this batch. A call
+        // parked in `pending_calls` (because its parent or its
+        // `fn_id`'s defining `DictEntry` is in a still-to-arrive
+        // batch) contributes its wall to `traces.total_wall_ns`
+        // immediately, matching the eventual folded outcome. This
+        // keeps `total_wall_ns` independent of arrival order; the
+        // `tolerate-out-of-order-batches` change relies on this.
         let call_count = batch.calls.len() as i64;
         let total_wall_delta: i64 = batch
             .calls
@@ -376,15 +394,37 @@ impl Storage {
             source: e,
         })?;
 
-        // ---- DQ-2 inserts + pending drain ----
+        // ---- DQ-1 + DQ-2 split + pending drain ----
+        //
+        // Every residual pending row is classified by whether its
+        // `fn_id` is in the per-trace `dict` at this moment:
+        //
+        // - `fn_id ∉ dict`  → DQ-1 (`unresolved_fn`). The missing
+        //   `DictEntry` is the more diagnostic miss; emit one
+        //   `unresolved_fn` row even if the parent_call_id is also
+        //   unresolved (the spec's tiebreak).
+        // - `fn_id ∈ dict`  → DQ-2 (`pending_parent_at_finalize`).
+        //   The residual cause must be a never-arrived parent.
+        //
+        // The dict snapshot is taken once at the top of the loop;
+        // nothing mutates `dict` inside finalize_trace, so a single
+        // read is sufficient.
+        let known_dict_fn_ids = collect_dict_fn_ids(&tx)?;
         let pending = collect_pending_rows(&tx)?;
-        let pending_dq2 = pending.len() as u32;
-        for (call_id, parent_call_id) in &pending {
-            aggregate::insert_pending_parent_at_finalize_anomaly(
-                &tx,
-                *call_id as u32,
-                *parent_call_id as u32,
-            )?;
+        let mut pending_dq1: u32 = 0;
+        let mut pending_dq2: u32 = 0;
+        for row in &pending {
+            if known_dict_fn_ids.contains(&row.fn_id) {
+                aggregate::insert_pending_parent_at_finalize_anomaly(
+                    &tx,
+                    row.call_id,
+                    row.parent_call_id,
+                )?;
+                pending_dq2 += 1;
+            } else {
+                aggregate::insert_unresolved_fn_anomaly(&tx, row.call_id, row.fn_id)?;
+                pending_dq1 += 1;
+            }
         }
         // Bulk wipe — cheaper than per-row DELETE and we just turned
         // every row above into an anomaly. The transaction makes
@@ -408,6 +448,16 @@ impl Storage {
         //      arithmetic would have left the index counter
         //      underreporting after a crash between the per-trace
         //      and index commits.
+        //
+        //      After the DQ-1/DQ-2 split above, the row count here
+        //      equals (pre-existing DQ-3 rows) + (pending_dq1 +
+        //      pending_dq2) inserted this finalize. This is the
+        //      contract behind the `anomaly_count on the trace row
+        //      reflects both DQ-1 and DQ-2 inserts` scenario in
+        //      `openspec/specs/collector-storage/spec.md` —
+        //      a single `SELECT COUNT(*)` keeps the index counter
+        //      in lockstep with the per-trace table without the
+        //      caller having to thread per-kind deltas through.
         let absolute_anomaly_count: i64 = tx
             .query_row("SELECT COUNT(*) FROM anomalies", [], |row| row.get(0))
             .map_err(|e| StorageError::Query {
@@ -469,6 +519,7 @@ impl Storage {
         self.trace_conns.remove(key);
 
         Ok(FinalizeOutcome {
+            pending_dq1,
             pending_dq2,
             cpu_snapshot_available: cpu_available,
         })
@@ -543,18 +594,34 @@ impl Storage {
     }
 }
 
-/// Pull every `(call_id, parent_call_id)` pair out of `pending_calls`
-/// into an owned Vec, so the statement's cursor is dropped before the
-/// caller mutates the table. Used by `Storage::finalize_trace`.
-fn collect_pending_rows(tx: &Connection) -> Result<Vec<(i64, i64)>, StorageError> {
+/// One row pulled out of `pending_calls` at finalize, just enough
+/// to classify it (DQ-1 vs DQ-2) and write the resulting anomaly.
+#[derive(Debug, Clone, Copy)]
+struct ResidualPending {
+    call_id: u32,
+    parent_call_id: u32,
+    fn_id: u32,
+}
+
+/// Pull every residual `pending_calls` row into an owned Vec so the
+/// statement's cursor is dropped before the caller mutates the table.
+/// Used by `Storage::finalize_trace` to classify residuals into DQ-1
+/// (`fn_id ∉ dict`) and DQ-2 (`fn_id ∈ dict` but parent missing).
+fn collect_pending_rows(tx: &Connection) -> Result<Vec<ResidualPending>, StorageError> {
     let mut stmt = tx
-        .prepare_cached("SELECT call_id, parent_call_id FROM pending_calls")
+        .prepare_cached("SELECT call_id, parent_call_id, fn_id FROM pending_calls")
         .map_err(|e| StorageError::Query {
             context: "prepare collect_pending_rows",
             source: e,
         })?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .query_map([], |row| {
+            Ok(ResidualPending {
+                call_id: row.get::<_, i64>(0)? as u32,
+                parent_call_id: row.get::<_, i64>(1)? as u32,
+                fn_id: row.get::<_, i64>(2)? as u32,
+            })
+        })
         .map_err(|e| StorageError::Query {
             context: "query collect_pending_rows",
             source: e,
@@ -567,6 +634,36 @@ fn collect_pending_rows(tx: &Connection) -> Result<Vec<(i64, i64)>, StorageError
         })?);
     }
     Ok(out)
+}
+
+/// Snapshot the per-trace `dict.fn_id` set as a `HashSet<u32>`. Used
+/// by `Storage::finalize_trace` to classify residual `pending_calls`
+/// rows into DQ-1 (`fn_id ∉ dict`) vs DQ-2 (`fn_id ∈ dict`, parent
+/// never arrived). Mirrors the helper in `storage::aggregate` —
+/// kept here to avoid leaking that one across the module boundary
+/// just for finalize.
+fn collect_dict_fn_ids(tx: &Connection) -> Result<HashSet<u32>, StorageError> {
+    let mut stmt =
+        tx.prepare_cached("SELECT fn_id FROM dict")
+            .map_err(|e| StorageError::Query {
+                context: "prepare collect_dict_fn_ids",
+                source: e,
+            })?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| StorageError::Query {
+            context: "query collect_dict_fn_ids",
+            source: e,
+        })?;
+    let mut set = HashSet::new();
+    for row in rows {
+        let id = row.map_err(|e| StorageError::Query {
+            context: "iterate collect_dict_fn_ids",
+            source: e,
+        })?;
+        set.insert(id as u32);
+    }
+    Ok(set)
 }
 
 /// Stat a single file and return its length in bytes. A missing
@@ -1123,10 +1220,18 @@ mod tests {
 
     #[test]
     fn anomaly_count_on_traces_row_mirrors_per_trace_anomalies() {
-        // Build a batch with 3 DQ-1 Calls (missing fn_id=99) and
-        // 2 DQ-3 Calls (t_out < t_in on a known fn_id=7), plus
-        // one normal Call. Expect 5 anomaly rows in the per-trace
-        // db and `traces.anomaly_count = 5` in the index.
+        // Invariant: after every `record_batch`,
+        //   index.traces.anomaly_count == SELECT COUNT(*) FROM <trace>.anomalies
+        //
+        // Post `tolerate-out-of-order-batches`, only DQ-3
+        // (`inverted_time`) lands in-batch. DQ-1 calls park in
+        // `pending_calls` and are emitted only by `finalize_trace`.
+        // The test uses the same batch shape as before (3 unknown-
+        // fn calls + 2 DQ-3 + 1 normal) to assert: (a) the in-batch
+        // counter matches the per-trace count (2 DQ-3 rows); (b) the
+        // 3 unknown-fn calls are visible in `pending_calls`; (c) a
+        // follow-up batch adds another DQ-3 and the invariant still
+        // holds.
         let dir = unique_dir("anom_count");
         let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
         let key = TraceKey::from_raw("44444444444444444444444444444444");
@@ -1148,11 +1253,11 @@ mod tests {
         let b = batch_with(
             vec![dict_entry(7, "ok")],
             vec![
-                call(10, 0, 99, 100), // DQ-1
-                call(11, 0, 99, 100), // DQ-1
-                call(12, 0, 99, 100), // DQ-1
-                inverted(20),         // DQ-3
-                inverted(21),         // DQ-3
+                call(10, 0, 99, 100), // unknown fn → parks
+                call(11, 0, 99, 100), // unknown fn → parks
+                call(12, 0, 99, 100), // unknown fn → parks
+                inverted(20),         // DQ-3 → 1 anomaly now
+                inverted(21),         // DQ-3 → 1 anomaly now
                 call(30, 0, 7, 100),  // normal
             ],
             meta("anom-host", 1, 1),
@@ -1163,27 +1268,50 @@ mod tests {
             .index_conn
             .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_index, 5);
-
         let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
         let conn = Connection::open(&trace_path).unwrap();
         let n_per_trace: i64 = conn
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_per_trace, 5);
+        assert_eq!(n_index, n_per_trace, "in-batch invariant");
+        assert_eq!(n_per_trace, 2, "only the two DQ-3 rows land in-batch");
 
-        // Second batch: one more DQ-3, no DQ-1. Counter accumulates.
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n_pending, 3,
+            "the three unknown-fn calls wait in pending_calls"
+        );
+
+        // Second batch: one more DQ-3, no unknown-fn calls. Counter
+        // accumulates the new DQ-3 row; pending_calls unchanged.
         let b2 = batch_with(vec![], vec![inverted(22)], meta("anom-host", 1, 1));
         storage.record_batch(&sub, &b2, 2_000).unwrap();
         let n_index2: i64 = storage
             .index_conn
             .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_index2, 6);
         let n_per_trace2: i64 = conn
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_per_trace2, 6);
+        assert_eq!(n_index2, n_per_trace2, "in-batch invariant still holds");
+        assert_eq!(n_per_trace2, 3, "two original DQ-3 + one new = three");
+
+        // Drive finalize to confirm DQ-1 emission now and that the
+        // invariant continues to hold post-finalize.
+        let outcome = storage.finalize_trace(&key, 3_000).unwrap();
+        assert_eq!(outcome.pending_dq1, 3, "three unknown-fn calls → 3 DQ-1");
+        assert_eq!(outcome.pending_dq2, 0);
+        let n_index3: i64 = storage
+            .index_conn
+            .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+            .unwrap();
+        let n_per_trace3: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_index3, n_per_trace3, "post-finalize invariant");
+        assert_eq!(n_per_trace3, 6, "3 DQ-3 + 3 DQ-1 emitted at finalize");
     }
 
     // ---- finalize_trace ----
@@ -1400,17 +1528,24 @@ mod tests {
     }
 
     #[test]
-    fn finalize_trace_anomaly_count_reflects_dq2() {
+    fn finalize_trace_anomaly_count_reflects_dq1_and_dq2() {
+        // Previously this test asserted DQ-1 fired in-batch and only
+        // DQ-2 inserts happened at finalize. After
+        // `tolerate-out-of-order-batches`, DQ-1 is emitted only at
+        // finalize: every residual pending row whose fn_id is not in
+        // dict becomes DQ-1, the rest (fn_id known, parent unknown)
+        // becomes DQ-2.
         let dir = unique_dir("finalize_anom_count");
         let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
         let key = TraceKey::from_raw("77777777777777777777777777777777");
         let sub = dummy_submission(&key, &dir.join("traces"));
 
-        // Build a batch with mixed anomalies + pending:
-        //   - 1 DQ-1 (missing fn_id=99)
-        //   - 1 DQ-3 (inverted time on fn_id=7)
-        //   - 2 orphan children (cross-batch parent never seen)
-        //   - 1 normal Call
+        // Build a batch:
+        //   - 1 unknown-fn_id call (fn=99 missing) → parks; later DQ-1.
+        //   - 1 DQ-3 (inverted time on fn=7) → folds + 1 anomaly now.
+        //   - 2 orphan children whose fn=7 IS in dict but parent=999
+        //     is unseen → pending; later DQ-2.
+        //   - 1 normal Call at fn=7 → folds.
         let inverted = Call {
             call_id: 100,
             parent: 0,
@@ -1427,17 +1562,19 @@ mod tests {
         let b = batch_with(
             vec![dict_entry(7, "ok")],
             vec![
-                call(10, 0, 99, 100),  // DQ-1
-                inverted,              // DQ-3 at fn=7
-                call(20, 999, 7, 100), // orphan → pending
-                call(21, 999, 7, 100), // orphan → pending
+                call(10, 0, 99, 100),  // unknown fn → pending → DQ-1 at finalize
+                inverted,              // DQ-3 at fn=7 (in-batch anomaly)
+                call(20, 999, 7, 100), // orphan → pending → DQ-2 at finalize
+                call(21, 999, 7, 100), // orphan → pending → DQ-2 at finalize
                 call(30, 0, 7, 100),   // normal at fn=7
             ],
             meta("mix-host", 1, 1),
         );
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
-        // After record_batch: 2 anomalies (DQ-1 + DQ-3), 2 pending.
+        // After record_batch: only the DQ-3 row has been written.
+        // The unknown-fn_id call waits for its dict entry; both
+        // orphan children wait for their parent.
         let n_index_before: i64 = storage
             .index_conn
             .query_row(
@@ -1446,12 +1583,20 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n_index_before, 2);
+        assert_eq!(
+            n_index_before, 1,
+            "only DQ-3 lands in-batch; DQ-1 and DQ-2 wait for finalize"
+        );
 
-        // Finalize adds 2 DQ-2 rows → 4 total in per-trace.
+        // Finalize splits the 3 residual pending rows:
+        //   - call_id=10: fn=99 ∉ dict → DQ-1
+        //   - call_id=20: fn=7 ∈ dict, parent=999 ∉ call_to_node → DQ-2
+        //   - call_id=21: fn=7 ∈ dict, parent=999 ∉ call_to_node → DQ-2
         let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert_eq!(outcome.pending_dq1, 1);
         assert_eq!(outcome.pending_dq2, 2);
 
+        // Per-trace SQLite now holds: 1 DQ-3 + 1 DQ-1 + 2 DQ-2 = 4.
         let n_index_after: i64 = storage
             .index_conn
             .query_row(
@@ -1468,6 +1613,117 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n_per_trace, 4);
+
+        let n_dq1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anomalies WHERE kind = 'unresolved_fn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_dq1, 1);
+        let n_dq2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anomalies WHERE kind = 'pending_parent_at_finalize'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_dq2, 2);
+        let n_dq3: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anomalies WHERE kind = 'inverted_time'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_dq3, 1);
+    }
+
+    #[test]
+    fn finalize_splits_pending_into_dq1_and_dq2() {
+        // Construct a trace whose pending_calls has five rows:
+        //   - 2 with fn_id NOT in dict (→ DQ-1)
+        //   - 3 with fn_id IN dict but parent_call_id never seen (→ DQ-2)
+        let dir = unique_dir("finalize_split");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("11111111111111111111111111111111");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "known")],
+            vec![
+                call(10, 0, 99, 100),   // unknown fn → DQ-1
+                call(11, 0, 99, 100),   // unknown fn → DQ-1
+                call(20, 9001, 7, 100), // known fn, orphan parent → DQ-2
+                call(21, 9001, 7, 100), // known fn, orphan parent → DQ-2
+                call(22, 9002, 7, 100), // known fn, orphan parent → DQ-2
+            ],
+            meta("split-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert_eq!(outcome.pending_dq1, 2);
+        assert_eq!(outcome.pending_dq2, 3);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let n_dq1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anomalies WHERE kind = 'unresolved_fn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_dq2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anomalies WHERE kind = 'pending_parent_at_finalize'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_dq1, 2);
+        assert_eq!(n_dq2, 3);
+
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 0, "pending_calls drained at finalize");
+    }
+
+    #[test]
+    fn finalize_emits_dq1_only_when_both_unknown() {
+        // A pending row whose fn_id is missing from dict AND whose
+        // parent_call_id is also unseen is classified as DQ-1 only
+        // — the missing fn_id is the more diagnostic miss per the
+        // spec's tiebreak.
+        let dir = unique_dir("finalize_tiebreak");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("22222222222222222222222222222222");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "ok")],
+            vec![call(10, 999, 99, 100)], // fn=99 missing AND parent=999 unseen
+            meta("tiebreak-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        assert_eq!(outcome.pending_dq1, 1);
+        assert_eq!(outcome.pending_dq2, 0);
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let kinds: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT kind FROM anomalies").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(kinds, vec!["unresolved_fn".to_string()]);
     }
 
     #[test]
