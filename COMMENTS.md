@@ -540,6 +540,68 @@ The same `pending_calls` table holds both kinds of pending rows
 — no schema migration was needed. Classification at finalize is
 a `SELECT fn_id FROM dict` snapshot at finalize time.
 
+## 2026-05-27 — Reorder-invariance is tested+locked; the drain is seed-then-cascade (≈O(N))
+
+A load test reported that out-of-order ingest of a 5.5M-call /
+551-batch `Zend/bench.php` trace finalized with an empty tree and
+`anomaly_count == call_count`, while in-order ingest was perfect.
+Investigation (change: `out-of-order-scale-hardening`):
+
+- **The correctness bug was NOT in current `main`.** A reproduction
+  harness ingesting a deep cross-batch chain in-order, reversed, and
+  shuffled produces an identical finalized tree with
+  `anomaly_count = 0` on `main` (which has the
+  `tolerate-out-of-order-batches` fix, merged as PR #30 / `22ee82c`).
+  The decisive tell: the report's `anomaly_count` *plateaued at
+  807,672 during ACTIVE*, but on current code `record_batch` writes
+  anomalies only for DQ-3 (`inverted_time`) — bench.php has none —
+  so a non-zero active count is impossible. **The load test ran a
+  pre-#30 binary.** Action for operators: rebuild the collector from
+  `main ≥ 22ee82c` before re-running the load test.
+
+- **Reorder-invariance is now a locked guarantee.** New test
+  `reorder_invariance_in_reversed_and_shuffled_matches_in_order`
+  (storage tests): same batch set ingested in-order / reversed /
+  shuffled → identical `(depth, fn_id, parent_fn_id, call_count,
+  total_wall_ns, children_total_wall_ns)` projection, `anomaly_count
+  = 0`, `pending_calls` empty. Two test-authoring gotchas worth
+  remembering: (1) the in-batch fold trusts the wire `depth` while
+  the drain recomputes `parent_depth + 1` (`pending_calls` has no
+  depth column) — they only agree when the wire `depth` is valid
+  (`== parent_depth + 1`), which real recorder output always is, so
+  synthetic test data MUST set depths that way; (2) compare the
+  projection sorted on the FULL tuple (sort in Rust), not a partial
+  SQL `ORDER BY` — tie-broken rows otherwise sort in insertion order
+  and the Vec comparison goes spuriously flaky even when the
+  multisets match.
+
+- **`drain_pending` rewritten from `O(N×depth)` to ≈`O(N)`.** The old
+  loop re-scanned the entire `pending_calls` table once per cascade
+  level — fine for tests, catastrophic for a 5.5M-row backlog with
+  deep recursion (the dict-completing batch's drain would run for
+  hours, which an operator can't tell from "hung," and a forced
+  finalize mid-drain reproduces the empty-tree symptom). Now: one
+  **seed** scan finds currently-resolvable rows; a **cascade**
+  worklist follows each resolved `call_id` to its pending children
+  via the `idx_pending_parent` index. The worklist carries
+  `(call_id, node_id, depth)` so the cascade needs no `call_to_node`
+  re-lookup and no per-row depth lookup (`fold_call_into_nodes` now
+  returns the `node_id`). The drain is **gated**: skipped entirely
+  for a batch that adds no `dict` row and folds nothing in-batch,
+  since only those two events can unblock a pending row — so the many
+  pure-park batches under heavy shuffle cost nothing. No schema
+  change.
+
+- **Perf can't be proven at unit-test scale.** At 4000 calls the
+  drain is not the bottleneck (per-statement SQLite insert cost
+  dominates), so seed+cascade and the old drain run in comparable
+  time — a small test can't discriminate `O(N)` from `O(N×depth)`.
+  The discriminator is the `#[ignore]` `reorder_drain_scales_to_deep_chains`
+  test (20k-call depth-20k reversed chain, run with
+  `cargo test -- --ignored reorder_drain_scales`): ~10s on
+  seed+cascade, minutes on the old drain. The default 4000-call test
+  keeps only a coarse 30s catastrophic-regression backstop.
+
 ---
 
 ## How to update this file
