@@ -69,7 +69,12 @@ assert_true(in_array('salt-' . str_repeat('b', 36), $sentinels, true), 'salt in 
 // --- 3.5 Malformed-line cases --------------------------------------
 
 $bad = tempnam(sys_get_temp_dir(), 'phptv_bad_');
-file_put_contents($bad, "[auth]\ntoken = \"ok\"\ngarbage no equals sign\n");
+// The value sentinel must not collide with the random temp filename
+// (alphanumeric) that appears in the error message's path. A short
+// needle like "ok" matches by chance — use a dash-bearing token that
+// can never be a substring of `/tmp/phptv_bad_<alnum>`.
+$secret = 'do-not-echo-this-value';
+file_put_contents($bad, "[auth]\ntoken = \"$secret\"\ngarbage no equals sign\n");
 Config::forgetCache();
 $err = assert_throws(
     TomlParseError::class,
@@ -80,7 +85,7 @@ assert_true(
     $err !== null && str_contains($err->getMessage(), ':3'),
     'error message contains line number 3'
 );
-assert_not_contains($err?->getMessage() ?? '', 'ok', 'value is NOT echoed in exception');
+assert_not_contains($err?->getMessage() ?? '', $secret, 'value is NOT echoed in exception');
 @unlink($bad);
 
 // Assignment before section
