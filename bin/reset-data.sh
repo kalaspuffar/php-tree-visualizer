@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# etc/reset-data.sh — reset the collector's data state to clean/empty.
+# bin/reset-data.sh — reset the collector's data state to clean/empty.
 #
 # For test/eval loops on limited hardware. Instead of re-running
 # install-debian.sh, this wipes every trace and rebuilds an empty,
@@ -21,7 +21,7 @@
 # retention sweeper.
 #
 # Usage:
-#   sudo etc/reset-data.sh [--config PATH] [--no-restart] [--yes]
+#   sudo bin/reset-data.sh [--config PATH] [--no-restart] [--yes]
 #
 #   --config PATH   collector.toml to read [storage].data_dir from.
 #                   Default: $PHPTV_CONFIG or /etc/php-tree-viz/collector.toml

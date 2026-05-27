@@ -917,7 +917,7 @@ at the HTTP edge is the access boundary, not the file mode bits.
 
 - The collector user (canonically `phptv` for a dedicated-user
   production deployment, or `www-data` for the single-user
-  convention the `etc/install-debian.sh` script uses) — owns and
+  convention the `bin/install-debian.sh` script uses) — owns and
   writes everything under `/var/lib/php-tree-viz/`.
 - The PHP-FPM user (typically `www-data`) — a member of the shared
   group; reads AND writes within the data directory via the `0660`

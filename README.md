@@ -60,9 +60,9 @@ On a freshly-imaged Debian 13 box, every step in the rest of this Quickstart is 
 ```bash
 git clone https://github.com/kalaspuffar/php-tree-visualizer.git
 cd php-tree-visualizer
-sudo bash etc/install-debian.sh <your-hostname>                  # Apache (default)
+sudo bash bin/install-debian.sh <your-hostname>                  # Apache (default)
 # or
-sudo bash etc/install-debian.sh <your-hostname> --proxy=nginx    # nginx
+sudo bash bin/install-debian.sh <your-hostname> --proxy=nginx    # nginx
 ```
 
 The script installs apt packages, builds the collector, deploys the config + systemd unit + reverse-proxy vhost, starts everything, and runs a smoke test that POSTs a probe batch and confirms it lands in `/api/traces`. The reverse proxy is `apache` by default; pass `--proxy=nginx` to install nginx instead. Re-running on a working install is a no-op — secrets are preserved, packages are skipped, the vhost is overwritten from the tracked template.
@@ -147,7 +147,7 @@ The collector binds to localhost only. The web stack (PHP API + static frontend)
 - Apache: [`etc/apache-example.conf`](./etc/apache-example.conf)
 - nginx: [`etc/nginx-example.conf`](./etc/nginx-example.conf)
 
-Both snippets cover the same routes: `/` redirects to `/viz/login.html`; `/api/*` rewrites to the PHP handlers in [`api/`](./api/); `/api/internal/*` is denied (those are PHP includes, never HTTP-reachable); `/viz/*` serves the static frontend in [`viz/`](./viz/) with `X-Content-Type-Options` + `Referrer-Policy`; `/ingest/v1` reverse-proxies to the collector on `127.0.0.1:8088`. The snippets are *fragments* — paste them inside an existing vhost on your machine, or let `etc/install-debian.sh` wrap them into a complete vhost for you.
+Both snippets cover the same routes: `/` redirects to `/viz/login.html`; `/api/*` rewrites to the PHP handlers in [`api/`](./api/); `/api/internal/*` is denied (those are PHP includes, never HTTP-reachable); `/viz/*` serves the static frontend in [`viz/`](./viz/) with `X-Content-Type-Options` + `Referrer-Policy`; `/ingest/v1` reverse-proxies to the collector on `127.0.0.1:8088`. The snippets are *fragments* — paste them inside an existing vhost on your machine, or let `bin/install-debian.sh` wrap them into a complete vhost for you.
 
 **For Apache**, enable the full set of modules the snippet uses **before** you reload — note that `a2enmod proxy_fcgi` does NOT auto-enable `proxy` or `proxy_http`; you have to name them all:
 
@@ -235,6 +235,47 @@ Output format is `log.format`. Two shapes:
 
 - **`json`** (the production default; what [Expected output](#expected-output) shows) — one JSON object per event, with every field flattened to the top level. journald reads this natively; `journalctl -u php-tree-viz-collector --output cat` prints one object per line; `jq` filters across them cleanly.
 - **`text`** — `<timestamp>  INFO target: <message> field=value …` on a single line per event. Easier to eyeball, harder to filter by program. Flip `log.format = "text"` in the config and `sudo systemctl restart php-tree-viz-collector` to switch.
+
+## Scripts
+
+Operator and developer helper scripts live in [`bin/`](./bin/). They are POSIX-bash, resolve the repo root from their own location (so they work from any working directory), and carry `--help`/usage headers.
+
+| Script | Purpose |
+| --- | --- |
+| `bin/install-debian.sh` | One-shot Debian-13 installer: apt packages, builds the collector, deploys config + systemd unit + reverse-proxy vhost, starts everything, runs a smoke test. |
+| `bin/reset-data.sh` | Reset the data state to clean/empty for test loops — wipe all traces and rebuild an empty, correctly-permissioned data layout, without re-running the installer or the retention sweeper. |
+| `bin/validate-proxy-configs.sh` | Syntax-check the Apache/nginx example fragments under `etc/` with the proxy's native configtest. Also run in CI. |
+
+### `bin/install-debian.sh`
+
+```bash
+sudo bash bin/install-debian.sh <public-hostname> [data-dir-owner] [--proxy=apache|nginx]
+```
+
+Idempotent — re-running preserves secrets, skips installed packages, and overwrites the vhost from the tracked template. Debian-13-only; the [Quickstart](#quickstart) above documents the equivalent manual steps for other distros.
+
+### `bin/reset-data.sh`
+
+```bash
+sudo bin/reset-data.sh [--config PATH] [--no-restart] [--yes]
+```
+
+For fast test/eval loops on limited hardware: instead of re-running the installer, this resets only the data. It stops the collector, deletes the known artifacts under `[storage].data_dir` (`index.sqlite{,-wal,-shm}`, `traces/`, `tmp/`), recreates the empty layout `2770` setgid preserving the data dir's existing owner:group, then restarts the collector so it rebuilds a fresh empty `index.sqlite`. It does not touch the binary, config, vhost, or unit, and does not invoke the retention sweeper.
+
+- Deletes only the named artifacts — never `rm -rf` the data dir itself.
+- Refuses system paths, relative/missing `data_dir`, and (unless `--yes`) non-interactive runs.
+- `--no-restart` skips all `systemctl` calls — use it when you run the collector manually rather than via systemd.
+- Reads `[storage].data_dir` from `$PHPTV_CONFIG` or `/etc/php-tree-viz/collector.toml`; override with `--config`.
+
+### `bin/validate-proxy-configs.sh`
+
+```bash
+bash bin/validate-proxy-configs.sh [--proxy=apache|nginx|both]
+```
+
+Wraps the `etc/*-example.conf` fragments in the `etc/*-validate.conf.in` scaffolding and runs `apache2ctl -t` / `nginx -t`. Exits `0` iff the selected configtest(s) pass. Needs `apache2` and/or `nginx` on `PATH` for the chosen proxy.
+
+> Test-suite smoke runners (`tests/api/smoke/*.sh`) intentionally stay with the tests — they are coupled to the test layout, not operator tooling.
 
 ## Project status
 

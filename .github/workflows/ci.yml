@@ -14,12 +14,12 @@ name: CI
 #                  (Node-based unit tests for the framework-free JS
 #                  modules under viz/js/)
 #
-#   proxy-configs: bash tools/validate-proxy-configs.sh
+#   proxy-configs: bash bin/validate-proxy-configs.sh
 #                  (apache2ctl -t and nginx -t against the example
 #                  fragments under etc/, via the .in wrappers)
 #
 # All four already run locally before every commit (the proxy
-# configtests via the tools/ script); CI is the safety net for
+# configtests via the bin/ script); CI is the safety net for
 # "I forgot to run the suite" days.
 #
 # The Rust toolchain is pinned via `rust-toolchain.toml`. The PHP
@@ -147,7 +147,7 @@ jobs:
         # --no-install-recommends keeps the install minimal:
         # we only need the binaries (`apache2ctl`, `nginx`)
         # and their core modules for `-t` / `configtest`.
-        # nginx-light matches what etc/install-debian.sh
+        # nginx-light matches what bin/install-debian.sh
         # installs, keeping CI and the operator install
         # path on the same package.
         run: |
@@ -159,4 +159,4 @@ jobs:
         # (substituting __REPO_ROOT__) and runs apache2ctl -t
         # plus nginx -t. Exit non-zero on any failure with the
         # offending tool's stderr re-emitted for the CI log.
-        run: bash tools/validate-proxy-configs.sh
+        run: bash bin/validate-proxy-configs.sh

@@ -17,9 +17,9 @@
 #     local check before pushing.
 #
 # Usage:
-#   bash tools/validate-proxy-configs.sh                   # both
-#   bash tools/validate-proxy-configs.sh --proxy=apache    # apache only
-#   bash tools/validate-proxy-configs.sh --proxy=nginx     # nginx only
+#   bash bin/validate-proxy-configs.sh                   # both
+#   bash bin/validate-proxy-configs.sh --proxy=apache    # apache only
+#   bash bin/validate-proxy-configs.sh --proxy=nginx     # nginx only
 #
 # Exit codes:
 #   0   selected configtest(s) passed.
@@ -65,9 +65,9 @@ done
 
 # ---- Resolve REPO_ROOT from the script's own location ----------------
 #
-# The script lives in tools/, so the repo is one level up. Resolving
+# The script lives in bin/, so the repo is one level up. Resolving
 # from the script's own path (not $PWD) means `bash
-# /abs/path/tools/validate-proxy-configs.sh` works from any cwd.
+# /abs/path/bin/validate-proxy-configs.sh` works from any cwd.
 
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
