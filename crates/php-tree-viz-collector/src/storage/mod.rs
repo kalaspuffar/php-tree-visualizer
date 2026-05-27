@@ -2225,4 +2225,242 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
     }
+
+    // ---- reorder-invariance (out-of-order-scale-hardening) ----
+
+    /// Build a multi-batch trace whose `fn_id`s are defined only in
+    /// the first produce-order batch, whose Calls form a deep parent
+    /// chain spanning every batch (`call_id=k → parent=k-1`), with a
+    /// branch point every few calls so multiple `(parent, fn)`
+    /// buckets exist. Reordering this batch set forces dict-pending
+    /// parking (later batches reference fn_ids defined in batch 0)
+    /// and a deep cross-batch parent cascade.
+    fn build_reorder_chain(n_batches: u32, calls_per_batch: u32) -> Vec<Batch> {
+        let n_fns: u32 = 8;
+        let total = n_batches * calls_per_batch;
+        // depth_of[cid] = call-stack depth of cid. Root is depth 0;
+        // a top-level call (parent=0) is depth 1. The recorder always
+        // emits `depth == parent_depth + 1`; mirror that here so the
+        // in-batch fold (which trusts wire `depth`) and the drain
+        // fold (which recomputes `parent_depth + 1`) agree — exactly
+        // as they do for valid wire data.
+        let mut depth_of: Vec<u32> = vec![0; (total + 1) as usize];
+        let mut batches = Vec::new();
+        let mut next_call_id: u32 = 1;
+        for b in 0..n_batches {
+            let mut calls = Vec::new();
+            for _ in 0..calls_per_batch {
+                let cid = next_call_id;
+                // Mostly a linear chain (parent = cid-1); every 7th
+                // call instead hangs off an older ancestor to create
+                // branching siblings under one parent.
+                let parent = if cid == 1 {
+                    0
+                } else if cid.is_multiple_of(7) {
+                    (cid / 2).max(1)
+                } else {
+                    cid - 1
+                };
+                let parent_depth = if parent == 0 {
+                    0
+                } else {
+                    depth_of[parent as usize]
+                };
+                let depth = parent_depth + 1;
+                depth_of[cid as usize] = depth;
+                let fn_id = ((cid - 1) % n_fns) + 1;
+                // vary wall so total_wall_ns is a meaningful signal
+                let mut c = call(cid, parent, fn_id, (cid % 13) as i64 + 1);
+                c.depth = depth;
+                calls.push(c);
+                next_call_id += 1;
+            }
+            let dict: Vec<DictEntry> = if b == 0 {
+                (1..=n_fns).map(|f| dict_entry(f, "f")).collect()
+            } else {
+                vec![]
+            };
+            batches.push(batch_with(dict, calls, meta("reorder-host", 1, 1)));
+        }
+        batches
+    }
+
+    /// One projected `nodes` row:
+    /// `(depth, fn_id, parent_fn_id, call_count, total_wall_ns,
+    ///   children_total_wall_ns)`.
+    type ProjectedNode = (i64, i64, i64, i64, i64, i64);
+
+    /// A structural projection of a finalized trace's `nodes` tree
+    /// that is independent of autoincrement `node_id` insertion
+    /// order. Each tuple is one node's
+    /// `(depth, fn_id, parent_fn_id, call_count, total_wall_ns,
+    ///   children_total_wall_ns)`. We join to the parent row to use
+    /// its `fn_id` as a stable stand-in for the parent identity
+    /// (root's parent_node_id is NULL → parent_fn_id = -1).
+    fn project_tree(conn: &Connection) -> Vec<ProjectedNode> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.depth, n.fn_id, COALESCE(p.fn_id, -1), \
+                        n.call_count, n.total_wall_ns, n.children_total_wall_ns \
+                 FROM nodes n LEFT JOIN nodes p ON p.node_id = n.parent_node_id \
+                 WHERE n.node_id != 1",
+            )
+            .unwrap();
+        let mut rows: Vec<ProjectedNode> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        // Total-order sort on the FULL tuple so two equal multisets
+        // always compare equal as Vecs (a partial SQL ORDER BY would
+        // leave tie-broken rows in insertion order, which differs by
+        // arrival order and makes the comparison spuriously flaky).
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Ingest `batches` in the given index order into a fresh trace,
+    /// finalize, and return
+    /// `(tree projection, anomaly_count, pending_count)`.
+    fn ingest_order_and_snapshot(
+        label: &str,
+        order: &[usize],
+        batches: &[Batch],
+    ) -> (Vec<ProjectedNode>, i64, i64) {
+        let dir = unique_dir(label);
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+        let mut t = 1_000i64;
+        for &i in order {
+            storage.record_batch(&sub, &batches[i], t).unwrap();
+            t += 1;
+        }
+        storage.finalize_trace(&key, t + 1_000).unwrap();
+
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let projection = project_tree(&conn);
+        let anomaly_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        (projection, anomaly_count, pending)
+    }
+
+    #[test]
+    fn reorder_invariance_in_reversed_and_shuffled_matches_in_order() {
+        // 200 batches × 20 calls = 4000-call trace, chain depth ~4000.
+        let batches = build_reorder_chain(200, 20);
+        let n = batches.len();
+        let in_order: Vec<usize> = (0..n).collect();
+        let reversed: Vec<usize> = (0..n).rev().collect();
+        // Deterministic shuffle: interleave from both ends.
+        let mut shuffled: Vec<usize> = Vec::with_capacity(n);
+        let (mut lo, mut hi) = (0usize, n - 1);
+        while lo <= hi {
+            shuffled.push(lo);
+            if lo != hi {
+                shuffled.push(hi);
+            }
+            lo += 1;
+            if hi == 0 {
+                break;
+            }
+            hi -= 1;
+        }
+
+        let start = std::time::Instant::now();
+        let (proj_in, anom_in, pend_in) =
+            ingest_order_and_snapshot("reorder_in", &in_order, &batches);
+        let (proj_rev, anom_rev, pend_rev) =
+            ingest_order_and_snapshot("reorder_rev", &reversed, &batches);
+        let (proj_shuf, anom_shuf, pend_shuf) =
+            ingest_order_and_snapshot("reorder_shuf", &shuffled, &batches);
+        let elapsed = start.elapsed();
+
+        // Correctness: every order produces a clean, identical tree.
+        assert_eq!(anom_in, 0, "in-order must have zero anomalies");
+        assert_eq!(anom_rev, 0, "reversed must have zero anomalies");
+        assert_eq!(anom_shuf, 0, "shuffled must have zero anomalies");
+        assert_eq!(pend_in, 0, "in-order pending must drain");
+        assert_eq!(pend_rev, 0, "reversed pending must drain");
+        assert_eq!(pend_shuf, 0, "shuffled pending must drain");
+        assert!(!proj_in.is_empty(), "tree must be non-trivial");
+        assert_eq!(proj_in, proj_rev, "reversed tree must equal in-order");
+        assert_eq!(proj_in, proj_shuf, "shuffled tree must equal in-order");
+
+        // Coarse perf backstop. At this size (4000 calls) the drain
+        // is NOT the bottleneck — per-statement SQLite insert cost
+        // dominates, so the seed+cascade and the old per-level-scan
+        // drains run in comparable time here. This 30s ceiling only
+        // trips on a catastrophic regression (e.g. an accidental
+        // O(N^3) or a non-terminating cascade). The real O(N) vs
+        // O(N×depth) discrimination lives in the `#[ignore]`
+        // `reorder_drain_scales_to_deep_chains` test below, which
+        // uses a regime where the old drain would blow past minutes.
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "three reorder ingests took {elapsed:?}; expected < 30s — \
+             drain may have catastrophically regressed"
+        );
+    }
+
+    /// On-demand scale proof for the seed+cascade drain. A 20k-call
+    /// reversed-arrival chain of depth ~20k: every batch but the last
+    /// is pure-park (gate skips its drain), and the final dict-bearing
+    /// batch must cascade the entire backlog. The seed+cascade drain
+    /// does this in `O(N)` (≈ one indexed child lookup + one fold per
+    /// row); the pre-rewrite per-level full-scan drain would do
+    /// `O(N×depth) ≈ 4×10^8` row probes on that final batch — minutes
+    /// in a debug build. `#[ignore]` so default CI stays fast; run
+    /// with `cargo test -- --ignored reorder_drain_scales`.
+    #[test]
+    #[ignore = "scale/perf proof — run explicitly with --ignored"]
+    fn reorder_drain_scales_to_deep_chains() {
+        let batches = build_reorder_chain(1000, 20); // 20_000 calls, depth ~20k
+        let n = batches.len();
+        let in_order: Vec<usize> = (0..n).collect();
+        let reversed: Vec<usize> = (0..n).rev().collect();
+
+        let (proj_in, anom_in, pend_in) =
+            ingest_order_and_snapshot("scale_in", &in_order, &batches);
+
+        let start = std::time::Instant::now();
+        let (proj_rev, anom_rev, pend_rev) =
+            ingest_order_and_snapshot("scale_rev", &reversed, &batches);
+        let elapsed = start.elapsed();
+
+        assert_eq!(anom_in, 0);
+        assert_eq!(
+            anom_rev, 0,
+            "reversed ingest at scale must have zero anomalies"
+        );
+        assert_eq!(pend_in, 0);
+        assert_eq!(pend_rev, 0, "reversed ingest at scale must drain fully");
+        assert!(!proj_in.is_empty(), "tree must be built");
+        assert_eq!(
+            proj_in, proj_rev,
+            "reversed tree must equal in-order at scale"
+        );
+        // The seed+cascade drain finalizes the reversed backlog in
+        // seconds; a reversion to the O(N×depth) drain would run for
+        // minutes on this 20k-deep chain and trip this bound.
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "20k-call reversed ingest took {elapsed:?}; expected < 60s — \
+             drain regressed to O(N×depth)?"
+        );
+    }
 }

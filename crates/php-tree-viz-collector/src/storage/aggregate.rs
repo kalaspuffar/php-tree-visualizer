@@ -26,11 +26,15 @@
 //!      `children_total_wall_ns`, map `call_id → node_id`.
 //!    - If parent unresolved (cross-batch parent): insert into
 //!      `pending_calls`.
-//! 4. After the in-batch loop, drain `pending_calls` iteratively:
-//!    pending rows whose `fn_id` is now in `dict` AND whose
-//!    `parent_call_id` is either zero (top-level) or now in
-//!    `call_to_node` get the same upsert + parent-bump + mapping
-//!    treatment, then are deleted. Loop until no progress.
+//! 4. After the in-batch loop, drain `pending_calls` with a
+//!    seed-then-cascade worklist: one **seed** pass finds the
+//!    rows resolvable right now (`fn_id` in `dict` AND
+//!    `parent_call_id` zero or in `call_to_node`), folds them,
+//!    and enqueues their `call_id`s; the **cascade** then follows
+//!    each resolved `call_id` to its pending children via the
+//!    `parent_call_id` index, folding those whose `fn_id` is
+//!    known. Total work is ~`O(N)` in the number of rows resolved
+//!    rather than `O(N × depth)` — no per-level full-table scan.
 //!
 //! Only one anomaly kind is written by this module:
 //!
@@ -49,7 +53,7 @@
 //! not guaranteed to match recorder produce order — the dict-
 //! defining batch may arrive after batches that reference it.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use rusqlite::{params, Transaction};
 
@@ -175,6 +179,10 @@ pub(super) fn aggregate_calls(
             Some(pid) => {
                 fold_call_into_nodes(tx, pid, c, &mut outcome)?;
                 outcome.nodes_touched += 1;
+                // In-batch folds use the wire `depth` directly and
+                // don't seed the drain worklist; the drain's own seed
+                // pass re-discovers any child made resolvable by this
+                // fold (its parent is now in `call_to_node`).
             }
             None => {
                 insert_pending_call(tx, c)?;
@@ -184,7 +192,21 @@ pub(super) fn aggregate_calls(
     }
 
     // ---- drain pending_calls ----
-    drain_pending(tx, &known, &mut outcome)?;
+    //
+    // Gate: a previously-pending row can only become resolvable if
+    // this batch grew `dict` (unblocking an fn-pending row) or folded
+    // a Call in the in-batch loop (unblocking a parent-pending child
+    // via a new `call_to_node` row). A pure-park batch — empty dict
+    // and zero in-batch folds — cannot resolve anything, so skip the
+    // O(N) seed scan entirely. `nodes_touched` is only bumped by the
+    // in-batch loop at this point (drain has not run yet), so it is
+    // exactly the in-batch fold count. Treating a non-empty `dict` as
+    // "may have grown" is conservative: a fully-duplicate dict runs a
+    // no-op drain rather than risk skipping a needed one.
+    let in_batch_folded = outcome.nodes_touched > 0;
+    if !batch.dict.is_empty() || in_batch_folded {
+        drain_pending(tx, &known, &mut outcome)?;
+    }
 
     // Total pending rows after drain — operator visibility via
     // the log line. Anything left here is a genuine cross-batch
@@ -257,12 +279,16 @@ fn resolve_parent(tx: &Transaction, parent_call_id: u32) -> Result<Option<i64>, 
 /// anomaly row attached to the resulting `node_id`. The Call still
 /// folds in either case; `saturating_sub` clamps the wall delta
 /// to 0 so `nodes.total_wall_ns` never decreases (DI-3).
+///
+/// Returns the resulting node's `node_id` so the drain cascade can
+/// carry it forward as the parent_node_id of this Call's children
+/// without a follow-up `call_to_node` lookup.
 fn fold_call_into_nodes(
     tx: &Transaction,
     parent_node_id: i64,
     c: &wire::Call,
     outcome: &mut AggregateOutcome,
-) -> Result<(), StorageError> {
+) -> Result<i64, StorageError> {
     // DI-3 requires `total_wall_ns >= children_total_wall_ns`
     // (self time non-negative). `saturating_sub` only clamps at
     // i64::MIN/MAX — for `t_out < t_in` it returns a negative
@@ -348,7 +374,7 @@ fn fold_call_into_nodes(
         outcome.anomalies_added += 1;
     }
 
-    Ok(())
+    Ok(node_id)
 }
 
 /// Insert a Call into `pending_calls` for a future batch's
@@ -386,111 +412,163 @@ fn insert_pending_call(tx: &Transaction, c: &wire::Call) -> Result<(), StorageEr
     Ok(())
 }
 
-/// Iteratively resolve pending rows whose `fn_id` is now in `dict`
-/// AND whose `parent_call_id` is either `0` (top-level under the
-/// synthetic root) or already in `call_to_node`. Loops until a pass
-/// resolves zero rows. Nothing here writes anomaly rows — DQ-1 and
-/// DQ-2 emission is exclusively `Storage::finalize_trace`'s job.
+/// Resolve every pending row whose `fn_id` is in `dict` AND whose
+/// `parent_call_id` is `0` (top-level) or already in `call_to_node`,
+/// transitively, using a seed-then-cascade worklist. Nothing here
+/// writes anomaly rows — DQ-1 and DQ-2 emission is exclusively
+/// `Storage::finalize_trace`'s job.
 ///
 /// The `known` argument carries the dict-fn_id set the caller built
-/// at the top of `aggregate_calls`. Rebuilding it from the live
-/// `dict` table on every drain iteration would be more correct in
-/// the presence of mid-iteration inserts (none happen today) but
-/// the caller's snapshot is the one that already reflects the just-
-/// accumulated batch dict, which is the contract we need.
+/// at the top of `aggregate_calls`, already reflecting the just-
+/// accumulated batch dict.
+///
+/// **Why seed-then-cascade.** The previous implementation re-scanned
+/// the entire `pending_calls` table once per cascade level, which is
+/// `O(N × depth)` — catastrophic for a deeply-recursive trace with a
+/// multi-million-row backlog. Instead:
+///
+/// 1. **Seed:** one scan ([`DRAIN_RESOLVABLE_SQL`]) finds the rows
+///    resolvable against the *current* `call_to_node` (children whose
+///    parent folded in an earlier batch or the in-batch loop) plus
+///    top-level rows. This also catches the "late `DictEntry`, parent
+///    resolved earlier" case, because it re-examines all currently-
+///    resolvable rows each drain. Fold each; enqueue its `call_id`.
+/// 2. **Cascade:** pop a resolved `call_id` `p` and look up its pending
+///    children by the `parent_call_id` index ([`DRAIN_CHILDREN_SQL`]);
+///    fold those whose `fn_id` is known; enqueue them. Each pending
+///    row is visited once (when its parent is popped), so the cascade
+///    is `O(rows resolved)`.
 fn drain_pending(
     tx: &Transaction,
     known: &HashSet<u32>,
     outcome: &mut AggregateOutcome,
 ) -> Result<(), StorageError> {
-    loop {
-        // Materialise the resolvable rows first so we can
-        // mutate the table inside the loop without holding the
-        // SELECT's cursor. Top-level pending rows
-        // (`parent_call_id = 0`) resolve under the synthetic root
-        // — the LEFT JOIN + COALESCE turns "no call_to_node row"
-        // into the synthetic root's node_id for that case, and
-        // filters out rows whose parent is genuinely unbound.
-        let resolvable: Vec<PendingRow> = {
+    // Worklist entries carry the resolved row's `(call_id, node_id,
+    // depth)` so the cascade can fold its children without a
+    // follow-up `call_to_node` lookup (node_id) or `nodes` depth
+    // lookup (a child's depth is the parent's depth + 1).
+    let mut worklist: VecDeque<(i64, i64, u32)> = VecDeque::new();
+
+    // ---- seed pass ----
+    let seed: Vec<PendingRow> = {
+        let mut stmt =
+            tx.prepare_cached(DRAIN_RESOLVABLE_SQL)
+                .map_err(|e| StorageError::Query {
+                    context: "prepare drain seed query",
+                    source: e,
+                })?;
+        let rows = stmt
+            .query_map(params![SYNTHETIC_ROOT_NODE_ID], PendingRow::from_row)
+            .map_err(|e| StorageError::Query {
+                context: "query drain seed",
+                source: e,
+            })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| StorageError::Query {
+                context: "collect drain seed rows",
+                source: e,
+            })?
+    };
+    for row in &seed {
+        // The SQL cannot test `fn_id ∈ known` against the in-memory
+        // set; rows with an unknown fn_id stay pending (a future
+        // batch's dict, or finalize's DQ-1, handles them).
+        if !known.contains(&row.fn_id) {
+            continue;
+        }
+        // The seed is the only place we look up the parent's depth
+        // (once per seed row); the cascade carries depth forward.
+        let parent_depth: u32 = tx
+            .query_row(
+                "SELECT depth FROM nodes WHERE node_id = ?1",
+                params![row.parent_node_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| StorageError::Query {
+                context: "lookup seed parent depth",
+                source: e,
+            })? as u32;
+        let depth = parent_depth + 1;
+        let node_id = resolve_pending_row(tx, row, depth, outcome)?;
+        worklist.push_back((row.call_id, node_id, depth));
+    }
+
+    // ---- cascade ----
+    while let Some((parent_call_id, parent_node_id, parent_depth)) = worklist.pop_front() {
+        let children: Vec<PendingRow> = {
             let mut stmt =
-                tx.prepare_cached(DRAIN_RESOLVABLE_SQL)
+                tx.prepare_cached(DRAIN_CHILDREN_SQL)
                     .map_err(|e| StorageError::Query {
-                        context: "prepare drain query",
+                        context: "prepare drain children query",
                         source: e,
                     })?;
             let rows = stmt
-                .query_map(params![SYNTHETIC_ROOT_NODE_ID], PendingRow::from_row)
+                .query_map(
+                    params![parent_call_id, parent_node_id],
+                    PendingRow::from_row,
+                )
                 .map_err(|e| StorageError::Query {
-                    context: "query drain pending",
+                    context: "query drain children",
                     source: e,
                 })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| StorageError::Query {
-                    context: "collect drain pending rows",
+                    context: "collect drain children rows",
                     source: e,
                 })?
         };
-
-        // The SQL filter cannot express "fn_id in dict" against the
-        // in-memory `known` set; do the second half of the
-        // resolvability predicate here. Rows with an unknown fn_id
-        // stay in `pending_calls` for a future batch to resolve, or
-        // for `finalize_trace` to classify as DQ-1.
-        let resolvable: Vec<PendingRow> = resolvable
-            .into_iter()
-            .filter(|row| known.contains(&row.fn_id))
-            .collect();
-
-        if resolvable.is_empty() {
-            break;
-        }
-
-        for row in &resolvable {
-            // Reconstruct the wire Call shape just enough to
-            // pass to fold_call_into_nodes. We don't carry
-            // `depth` in pending_calls; the closest stand-in is
-            // parent_depth + 1, which we look up.
-            let parent_depth: i64 = tx
-                .query_row(
-                    "SELECT depth FROM nodes WHERE node_id = ?1",
-                    params![row.parent_node_id],
-                    |r| r.get(0),
-                )
-                .map_err(|e| StorageError::Query {
-                    context: "lookup parent depth",
-                    source: e,
-                })?;
-            let synthetic_call = wire::Call {
-                call_id: row.call_id as u32,
-                parent: row.parent_call_id as u32,
-                fn_id: row.fn_id,
-                depth: (parent_depth + 1) as u32,
-                t_in: row.t_in_ns,
-                t_out: row.t_out_ns,
-                cpu_u: row.cpu_u_ns,
-                cpu_s: row.cpu_s_ns,
-                mem_in: row.mem_in_bytes,
-                mem_out: row.mem_out_bytes,
-                abnormal_exit: row.abnormal_exit != 0,
-            };
-            fold_call_into_nodes(tx, row.parent_node_id, &synthetic_call, outcome)?;
-
-            tx.execute(
-                "DELETE FROM pending_calls WHERE call_id = ?1",
-                params![row.call_id],
-            )
-            .map_err(|e| StorageError::Query {
-                context: "delete drained pending",
-                source: e,
-            })?;
-            outcome.pending_resolved += 1;
-            outcome.nodes_touched += 1;
+        let child_depth = parent_depth + 1;
+        for row in &children {
+            if !known.contains(&row.fn_id) {
+                continue; // fn_id not yet in dict — stays pending
+            }
+            let node_id = resolve_pending_row(tx, row, child_depth, outcome)?;
+            worklist.push_back((row.call_id, node_id, child_depth));
         }
     }
     Ok(())
 }
 
-/// SQL for the drain pass's parent-resolvability filter. The
+/// Fold one pending row into the `nodes` tree at the given `depth`
+/// and delete it from `pending_calls`. `row.parent_node_id` is the
+/// resolved parent's node_id (the synthetic root for top-level
+/// rows). Returns the resulting node's `node_id` so the caller can
+/// carry it onto the cascade worklist as the children's
+/// parent_node_id.
+fn resolve_pending_row(
+    tx: &Transaction,
+    row: &PendingRow,
+    depth: u32,
+    outcome: &mut AggregateOutcome,
+) -> Result<i64, StorageError> {
+    let synthetic_call = wire::Call {
+        call_id: row.call_id as u32,
+        parent: row.parent_call_id as u32,
+        fn_id: row.fn_id,
+        depth,
+        t_in: row.t_in_ns,
+        t_out: row.t_out_ns,
+        cpu_u: row.cpu_u_ns,
+        cpu_s: row.cpu_s_ns,
+        mem_in: row.mem_in_bytes,
+        mem_out: row.mem_out_bytes,
+        abnormal_exit: row.abnormal_exit != 0,
+    };
+    let node_id = fold_call_into_nodes(tx, row.parent_node_id, &synthetic_call, outcome)?;
+    tx.execute(
+        "DELETE FROM pending_calls WHERE call_id = ?1",
+        params![row.call_id],
+    )
+    .map_err(|e| StorageError::Query {
+        context: "delete drained pending",
+        source: e,
+    })?;
+    outcome.pending_resolved += 1;
+    outcome.nodes_touched += 1;
+    Ok(node_id)
+}
+
+/// SQL for the drain **seed** pass's parent-resolvability filter. The
 /// LEFT JOIN + COALESCE collapses two cases into one row shape:
 ///
 /// - `parent_call_id = 0` (top-level): no `call_to_node` match;
@@ -508,6 +586,19 @@ SELECT p.call_id, p.parent_call_id, p.fn_id, p.t_in_ns, p.t_out_ns,
 FROM pending_calls p
 LEFT JOIN call_to_node c ON c.call_id = p.parent_call_id
 WHERE p.parent_call_id = 0 OR c.node_id IS NOT NULL
+";
+
+/// SQL for the drain **cascade**: the pending children of a single
+/// just-resolved parent `call_id` (`?1`), backed by the
+/// `idx_pending_parent` index. `?2` is the parent's `node_id`, bound
+/// in as the synthetic `parent_node_id` column so the row shape
+/// matches [`PendingRow::from_row`] without a join.
+const DRAIN_CHILDREN_SQL: &str = "
+SELECT call_id, parent_call_id, fn_id, t_in_ns, t_out_ns,
+       cpu_u_ns, cpu_s_ns, mem_in_bytes, mem_out_bytes,
+       abnormal_exit, ?2 AS parent_node_id
+FROM pending_calls
+WHERE parent_call_id = ?1
 ";
 
 /// DQ-1 anomaly insert. Called by `Storage::finalize_trace` for
@@ -1045,6 +1136,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 1, "orphan must still be pending");
+    }
+
+    #[test]
+    fn pure_park_batches_skip_drain_then_dict_batch_resolves_backlog() {
+        // The drain gate: a batch with an empty `dict` that folds
+        // nothing in-batch cannot make any pending row resolvable, so
+        // its drain is skipped. The accumulated backlog must still
+        // resolve when a later dict-bearing batch arrives.
+        let mut conn = fresh_trace_db();
+        // fn=8 deliberately NOT in dict yet.
+        install_dict(&conn, &[dict_entry(7)]);
+
+        // Two pure-park batches: top-level calls with fn=8 (unknown),
+        // empty batch dict → parked on fn_id, drain skipped.
+        for cid in [10u32, 11u32] {
+            let park_batch = Batch {
+                meta: meta(),
+                dict: vec![],
+                calls: vec![call(cid, 0, 8, 100)],
+            };
+            aggregate_in(&mut conn, &park_batch);
+        }
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 2, "both fn=8 calls park while fn=8 is unknown");
+        let nodes_fn8: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE fn_id = 8", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(nodes_fn8, 0, "nothing folded yet");
+
+        // Dict-bearing batch introduces fn=8 → gate runs the drain →
+        // both parked rows (parent=0, fn=8 now known) resolve.
+        install_dict(&conn, &[dict_entry(8)]);
+        let dict_batch = Batch {
+            meta: meta(),
+            dict: vec![dict_entry(8)],
+            calls: vec![],
+        };
+        let outcome = aggregate_in(&mut conn, &dict_batch);
+        assert_eq!(outcome.pending_resolved, 2, "backlog drains on dict batch");
+
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+        let nodes_fn8: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE fn_id = 8 AND parent_node_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            nodes_fn8, 1,
+            "both fn=8 calls collapse into one root bucket"
+        );
+        let n_anom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_anom, 0, "drain writes no anomalies");
     }
 
     // ---- DQ-1 deferral (park unknown-fn_id calls; finalize emits) ----
