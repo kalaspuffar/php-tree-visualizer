@@ -7,7 +7,7 @@
 #   sudo systemctl enable --now php-tree-viz-collector
 #
 # This file is the example. The operator's deployed file is at
-# /etc/systemd/system/. The `etc/install-debian.sh` script handles
+# /etc/systemd/system/. The `bin/install-debian.sh` script handles
 # the copy + enable; manual operators do it themselves.
 #
 # --- UMask=0007 ---

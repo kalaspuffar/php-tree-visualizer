@@ -3,16 +3,16 @@
 # traffic.
 #
 # This is an INPUT template: the `__REPO_ROOT__` placeholder
-# below is substituted by `tools/validate-proxy-configs.sh`
+# below is substituted by `bin/validate-proxy-configs.sh`
 # with the absolute path of this checkout at runtime. Do not
 # run `apache2ctl -t -f` against this file directly — the
 # Include would resolve to a literal `__REPO_ROOT__/etc/...`
 # path that does not exist.
 #
 # Usage (the supported entry point):
-#   bash tools/validate-proxy-configs.sh --proxy=apache
+#   bash bin/validate-proxy-configs.sh --proxy=apache
 # or, for both proxies in one go:
-#   bash tools/validate-proxy-configs.sh
+#   bash bin/validate-proxy-configs.sh
 #
 # The script generates a temporary, substituted copy and
 # runs `apache2 -t -f <that-copy>` (the binary directly, not

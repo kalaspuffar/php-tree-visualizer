@@ -11,7 +11,7 @@
 # distro-specific, the rest is shape-portable.
 #
 # Usage:
-#   sudo bash etc/install-debian.sh <public-hostname> [data-dir-owner] [--proxy=apache|nginx]
+#   sudo bash bin/install-debian.sh <public-hostname> [data-dir-owner] [--proxy=apache|nginx]
 #
 # Arguments:
 #   <public-hostname>    The DNS name the vhost will serve, e.g.
@@ -105,7 +105,7 @@ if [ -z "$HOSTNAME_ARG" ]; then
 fi
 
 # Resolve repo root from the script's location (the script lives in
-# etc/, so the repo is one level up).
+# bin/, so the repo is one level up).
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 # Hardcoded conventions. Operators wanting non-default paths should
