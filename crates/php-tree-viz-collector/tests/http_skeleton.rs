@@ -3520,3 +3520,197 @@ fn retention_sweeper_does_not_disturb_fresh_traces() {
     let fresh_key = synth_trace_key("ret-new", 2, fresh_start);
     assert_eq!(sole_key, fresh_key, "the surviving trace is the fresh one");
 }
+
+// ---- collector-health-endpoints: integration tests ----
+//
+// The unit tests in `src/http/health.rs` pin the readiness
+// predicate and the response-shape semantics deterministically.
+// These integration tests verify the wire-level contract: routing,
+// auth-skip, method-discipline, and "probes don't log on success."
+
+/// Build an HTTP/1.1 GET request line + headers. No body. The
+/// existing `request_with_body` helper hardcodes `Content-Length`
+/// and would force a `Content-Length: 0` header — that's fine for
+/// our probe routes (axum handles GET-with-content-length-0
+/// cleanly), but the dedicated helper keeps probe-test bodies
+/// obvious at the call site.
+fn get_request_no_auth(host: &str, path: &str) -> Vec<u8> {
+    request_with_body("GET", path, &[], &[], host)
+}
+
+fn get_request_with_auth(host: &str, path: &str) -> Vec<u8> {
+    request_with_body(
+        "GET",
+        path,
+        &[("Authorization", &format!("Bearer {TOKEN}"))],
+        &[],
+        host,
+    )
+}
+
+#[test]
+fn liveness_returns_200_with_documented_body() {
+    let dir = unique_tempdir("liveness_basic");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = get_request_no_auth(&collector.bound, "/health");
+    let (status, body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"ok"}"#);
+}
+
+#[test]
+fn liveness_succeeds_without_authorization_header() {
+    let dir = unique_tempdir("liveness_no_auth");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = get_request_no_auth(&collector.bound, "/health");
+    let (status, _body) = send_raw(&collector.bound, &req);
+    // 200, NOT 401 — proves probes skip the auth middleware.
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn liveness_post_returns_405() {
+    let dir = unique_tempdir("liveness_post");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // POST /health with valid auth + content-type — still 405,
+    // because the route is GET-only and method dispatch overrides
+    // the absence of auth on this route.
+    let req = request_with_body(
+        "POST",
+        "/health",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        b"",
+        &collector.bound,
+    );
+    let (status, _body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 405);
+}
+
+#[test]
+fn liveness_probe_emits_no_log_line() {
+    let dir = unique_tempdir("liveness_silent");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // Three back-to-back probes; if probe logging were enabled
+    // we'd expect three `http request` lines with `path="/health"`.
+    for _ in 0..3 {
+        let req = get_request_no_auth(&collector.bound, "/health");
+        let (status, _) = send_raw(&collector.bound, &req);
+        assert_eq!(status, 200);
+    }
+
+    // Give the runtime a beat to flush any subscriber output.
+    std::thread::sleep(Duration::from_millis(150));
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+
+    // Strong predicate: the per-request logging middleware would
+    // emit an event whose typed `path` field renders as `/health`.
+    // Asserting on the substring catches both that and any future
+    // health-specific log line.
+    assert!(
+        !stdout.contains("/health"),
+        "no /health line should appear in the journal: {stdout}"
+    );
+    // And explicitly: no `http request` line for the probes.
+    let probe_log_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("http request") && l.contains("path=\"/health\""))
+        .collect();
+    assert!(
+        probe_log_lines.is_empty(),
+        "expected zero http-request log lines for /health: {probe_log_lines:?}"
+    );
+}
+
+#[test]
+fn readiness_returns_200_when_queue_has_spare_capacity() {
+    let dir = unique_tempdir("readiness_happy");
+    // Default queue_capacity (per write_config) → fresh startup =
+    // 100% spare → 200.
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = get_request_no_auth(&collector.bound, "/ready");
+    let (status, body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"ready"}"#);
+}
+
+#[test]
+fn readiness_succeeds_without_authorization_header() {
+    let dir = unique_tempdir("readiness_no_auth");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = get_request_no_auth(&collector.bound, "/ready");
+    let (status, _body) = send_raw(&collector.bound, &req);
+    // 200 (or 503 if somehow saturated, which on a fresh startup
+    // it isn't) — but NEVER 401. The point of this test is to
+    // prove auth is not gating the route.
+    assert_ne!(status, 401, "readiness must not be gated by auth");
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn readiness_with_wrong_token_still_responds_normally() {
+    let dir = unique_tempdir("readiness_wrong_token");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // A wrong-token Authorization header would 401 on /ingest/v1.
+    // On /ready it must be ignored — the route never inspects the
+    // header at all.
+    let req = request_with_body(
+        "GET",
+        "/ready",
+        &[("Authorization", "Bearer this-is-not-the-real-token")],
+        &[],
+        &collector.bound,
+    );
+    let (status, _body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn readiness_post_returns_405() {
+    let dir = unique_tempdir("readiness_post");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = request_with_body(
+        "POST",
+        "/ready",
+        &[
+            ("Authorization", &format!("Bearer {TOKEN}")),
+            ("Content-Type", MEDIA_TYPE),
+        ],
+        b"",
+        &collector.bound,
+    );
+    let (status, _body) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 405);
+}
+
+#[test]
+fn unknown_path_still_returns_404_after_router_merge() {
+    // Regression test for the router refactor: merging the probe
+    // routes onto the top-level router must not accidentally
+    // change the 404 behaviour for unmatched paths.
+    let dir = unique_tempdir("unknown_path");
+    let path = write_config(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let req = get_request_with_auth(&collector.bound, "/this-route-does-not-exist");
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 404);
+}

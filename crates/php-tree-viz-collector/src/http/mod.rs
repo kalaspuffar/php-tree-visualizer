@@ -10,6 +10,7 @@
 mod auth;
 mod content_type;
 mod error;
+mod health;
 mod ingest;
 mod logging;
 mod router;
