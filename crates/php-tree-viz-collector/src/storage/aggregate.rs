@@ -114,6 +114,28 @@ pub struct AggregateOutcome {
     /// bump has a single source of truth and so future kinds can
     /// add to it without rewriting the call site.
     pub anomalies_added: u32,
+    /// Number of calls in `batch.calls` that this aggregation
+    /// **actually processed** (folded in-batch or parked into
+    /// `pending_calls`). Redelivered calls — those whose `call_id`
+    /// was already in `call_to_node` or `pending_calls` when the
+    /// batch arrived — are excluded. `Storage::record_batch` binds
+    /// this as the `index.sqlite.traces.call_count` delta, replacing
+    /// the previous `batch.calls.len()`: see the `idempotent-ingest`
+    /// capability.
+    pub call_count_delta: u32,
+    /// Sum of `c.t_out.saturating_sub(c.t_in).max(0)` over the same
+    /// new-call subset that contributes to `call_count_delta`. The
+    /// `.max(0)` clamp keeps DI-3 (`total_wall_ns ≥ 0`) intact for
+    /// DQ-3 inverted-time calls, mirroring the clamp the in-batch
+    /// loop uses when folding. `Storage::record_batch` binds this as
+    /// the `index.sqlite.traces.total_wall_ns` delta.
+    pub total_wall_ns_delta: i64,
+    /// Count of calls in `batch.calls` whose `call_id` was already
+    /// known (`call_to_node` or `pending_calls`) when the batch
+    /// arrived, and which were therefore skipped — no fold, no park,
+    /// no counter delta. Observability for at-least-once delivery;
+    /// surfaced on the `batch accepted` log event as `redelivered`.
+    pub redelivered_skipped: u32,
 }
 
 /// Insert the synthetic root rows (`dict.fn_id=0`,
@@ -161,6 +183,29 @@ pub(super) fn aggregate_calls(
 
     // ---- in-batch loop (reverse order = parents first) ----
     for c in batch.calls.iter().rev() {
+        // Idempotency against per-trace `call_id` redelivery
+        // (`idempotent-ingest`). The new php-analyze shipper is
+        // at-least-once: under retry the same `call_id` arrives
+        // more than once. If we've already recorded this call —
+        // folded (`call_to_node`) or parked (`pending_calls`) —
+        // skip it entirely: no fold, no park, no counter delta.
+        // The two PRIMARY KEY constraints already dedup the row
+        // state; this check makes the counter sites dedup-aware
+        // too. Same-batch repeats are caught here as well — the
+        // first iteration's fold/park populates the table the
+        // second iteration's lookup hits.
+        if call_id_already_known(tx, c.call_id)? {
+            outcome.redelivered_skipped += 1;
+            continue;
+        }
+        // New call this batch: contributes to the trace's
+        // `call_count` and `total_wall_ns` deltas.
+        // `.max(0)` mirrors the in-batch fold's clamp so DQ-3
+        // inverted-time calls (`t_out < t_in`) never make
+        // `traces.total_wall_ns` decrease (DI-3).
+        outcome.call_count_delta += 1;
+        outcome.total_wall_ns_delta += c.t_out.saturating_sub(c.t_in).max(0);
+
         if !known.contains(&c.fn_id) {
             // The `DictEntry` for this `fn_id` is in a batch we
             // haven't seen yet. Park the Call in `pending_calls`;
@@ -245,6 +290,36 @@ fn known_fn_ids(tx: &Transaction) -> Result<HashSet<u32>, StorageError> {
         set.insert(id as u32);
     }
     Ok(set)
+}
+
+/// Has the collector already recorded this `call_id` for this
+/// trace? True iff `call_id` appears in `call_to_node` (folded) or
+/// `pending_calls` (parked). Both tables have `call_id` as PRIMARY
+/// KEY, so each branch is a single indexed point lookup; the
+/// combined `UNION ALL … LIMIT 1` short-circuits at the first hit.
+/// Used by the in-batch loop to make `Storage::record_batch`
+/// idempotent against at-least-once delivery
+/// (`idempotent-ingest`).
+fn call_id_already_known(tx: &Transaction, call_id: u32) -> Result<bool, StorageError> {
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT 1 FROM call_to_node WHERE call_id = ?1 \
+             UNION ALL \
+             SELECT 1 FROM pending_calls WHERE call_id = ?1 \
+             LIMIT 1",
+        )
+        .map_err(|e| StorageError::Query {
+            context: "prepare call_id_already_known",
+            source: e,
+        })?;
+    match stmt.query_row(params![call_id as i64], |_| Ok(())) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(StorageError::Query {
+            context: "query call_id_already_known",
+            source: e,
+        }),
+    }
 }
 
 /// `parent` on the wire is the parent call's `call_id`; `0`
@@ -1199,6 +1274,121 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n_anom, 0, "drain writes no anomalies");
+    }
+
+    // ---- idempotent-ingest: redelivery is a counter no-op ----
+
+    #[test]
+    fn redelivered_call_is_skipped_and_counter_delta_excludes_it() {
+        // First delivery: one top-level Call folds normally.
+        // outcome.call_count_delta = 1, redelivered_skipped = 0.
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(1, 0, 7, 100)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.call_count_delta, 1);
+        assert_eq!(outcome.total_wall_ns_delta, 100);
+        assert_eq!(outcome.redelivered_skipped, 0);
+        assert_eq!(outcome.nodes_touched, 1);
+        let (node_calls, node_wall): (i64, i64) = conn
+            .query_row(
+                "SELECT call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(node_calls, 1);
+        assert_eq!(node_wall, 100);
+
+        // Second delivery (same call_id): redelivered, skipped.
+        // outcome.call_count_delta = 0, redelivered_skipped = 1.
+        // Node row is unchanged — no double-fold.
+        let outcome2 = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome2.call_count_delta, 0);
+        assert_eq!(outcome2.total_wall_ns_delta, 0);
+        assert_eq!(outcome2.redelivered_skipped, 1);
+        assert_eq!(outcome2.nodes_touched, 0);
+        let (node_calls, node_wall): (i64, i64) = conn
+            .query_row(
+                "SELECT call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(node_calls, 1, "redelivery must not double-count");
+        assert_eq!(node_wall, 100, "redelivery must not double-add wall");
+    }
+
+    #[test]
+    fn redelivered_pending_call_is_skipped_no_double_park() {
+        // First delivery: parent unknown, so the Call parks. One
+        // row in pending_calls; pending_added = 1.
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(10, 999, 7, 50)], // parent 999 never seen
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.call_count_delta, 1);
+        assert_eq!(outcome.pending_added, 1);
+        assert_eq!(outcome.redelivered_skipped, 0);
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 1);
+
+        // Re-deliver the same Call. Now its call_id is in
+        // pending_calls → skipped. pending_added = 0, no second
+        // row inserted, call_count_delta = 0.
+        let outcome2 = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome2.call_count_delta, 0);
+        assert_eq!(outcome2.pending_added, 0);
+        assert_eq!(outcome2.redelivered_skipped, 1);
+        let n_pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pending, 1, "no second park");
+    }
+
+    #[test]
+    fn same_call_id_twice_in_one_batch_records_once() {
+        // Pathological-but-possible: a single batch carrying the
+        // same call_id twice. Reverse iteration processes the
+        // SECOND-occurring entry first (`batch.calls.iter().rev()`).
+        // The first iteration folds it (no in-batch_loop dedup hit
+        // because call_to_node was empty); the second iteration's
+        // dedup lookup hits and skips it.
+        let mut conn = fresh_trace_db();
+        install_dict(&conn, &[dict_entry(7)]);
+        let batch = Batch {
+            meta: meta(),
+            dict: vec![],
+            calls: vec![call(5, 0, 7, 100), call(5, 0, 7, 999)],
+        };
+        let outcome = aggregate_in(&mut conn, &batch);
+        assert_eq!(outcome.call_count_delta, 1);
+        assert_eq!(outcome.redelivered_skipped, 1);
+        assert_eq!(outcome.nodes_touched, 1);
+        let (node_calls, node_wall): (i64, i64) = conn
+            .query_row(
+                "SELECT call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(node_calls, 1);
+        // Wall is whichever occurrence folded first (reverse order →
+        // the LATER call_id wins in iteration order, but call_ids are
+        // equal here, so it's the second-in-array, which the wire spec
+        // says shouldn't happen; either 100 or 999 is correct per the
+        // spec's tiebreak — we don't pin which).
+        assert!(node_wall == 100 || node_wall == 999, "got {node_wall}");
     }
 
     // ---- DQ-1 deferral (park unknown-fn_id calls; finalize emits) ----
