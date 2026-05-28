@@ -76,6 +76,16 @@ pub struct Finalize {
     pub idle_seconds: u32,
     #[serde(default = "defaults::tick_seconds")]
     pub tick_seconds: u32,
+    /// Hard cap (seconds) before a trace whose `pending_calls` is
+    /// non-empty is force-finalised. Under out-of-order delivery the
+    /// presence of pending rows means more batches are expected;
+    /// finalising on `idle_seconds` alone destroys the backlog and
+    /// produces spurious DQ anomalies (see the
+    /// `finalize-defers-on-pending` change). The hard cap is the
+    /// safety net so a trace whose resolvers truly never arrive
+    /// still finalises and its residual becomes DQ.
+    #[serde(default = "defaults::max_pending_seconds")]
+    pub max_pending_seconds: u32,
 }
 
 impl Default for Finalize {
@@ -83,6 +93,7 @@ impl Default for Finalize {
         Self {
             idle_seconds: defaults::idle_seconds(),
             tick_seconds: defaults::tick_seconds(),
+            max_pending_seconds: defaults::max_pending_seconds(),
         }
     }
 }
@@ -177,6 +188,13 @@ mod defaults {
     }
     pub(super) fn tick_seconds() -> u32 {
         5 // §7.3
+    }
+    pub(super) fn max_pending_seconds() -> u32 {
+        // 10 minutes — generous enough to cover a real
+        // out-of-order delivery; bounded so a trace whose
+        // resolvers truly never arrive does eventually
+        // force-finalise rather than leak as 'active'.
+        600
     }
     pub(super) fn tick_minutes() -> u32 {
         60 // §7.3
@@ -306,6 +324,21 @@ impl Finalize {
             return Err(ConfigError::bad_value(
                 "finalize.tick_seconds",
                 "must be greater than zero",
+            ));
+        }
+        if self.max_pending_seconds == 0 {
+            return Err(ConfigError::bad_value(
+                "finalize.max_pending_seconds",
+                "must be greater than zero",
+            ));
+        }
+        // Cross-field: a hard cap shorter than the idle threshold
+        // would let pending-bearing traces finalise *earlier* than
+        // empty ones, which inverts the intent.
+        if self.max_pending_seconds < self.idle_seconds {
+            return Err(ConfigError::bad_value(
+                "finalize.max_pending_seconds",
+                "must be greater than or equal to finalize.idle_seconds (the pending hard cap cannot be shorter than the idle threshold)",
             ));
         }
         Ok(())
@@ -720,6 +753,47 @@ retention_days = 30
         let toml = replace_field(&full_toml(), "tick_seconds", "0");
         let err = parse(&toml).expect_err("zero tick_seconds must fail");
         assert!(format!("{err}").contains("finalize.tick_seconds"));
+    }
+
+    #[test]
+    fn max_pending_seconds_defaults_to_600() {
+        let cfg = parse(&full_toml()).expect("full config (no max_pending_seconds) must validate");
+        assert_eq!(cfg.finalize.max_pending_seconds, 600);
+    }
+
+    #[test]
+    fn zero_max_pending_seconds_is_rejected() {
+        let mut toml = full_toml();
+        toml = toml.replace(
+            "[finalize]\nidle_seconds = 30\ntick_seconds = 5",
+            "[finalize]\nidle_seconds = 30\ntick_seconds = 5\nmax_pending_seconds = 0",
+        );
+        let err = parse(&toml).expect_err("zero max_pending_seconds must fail");
+        assert!(format!("{err}").contains("finalize.max_pending_seconds"));
+    }
+
+    #[test]
+    fn max_pending_seconds_below_idle_is_rejected() {
+        let mut toml = full_toml();
+        toml = toml.replace(
+            "[finalize]\nidle_seconds = 30\ntick_seconds = 5",
+            "[finalize]\nidle_seconds = 30\ntick_seconds = 5\nmax_pending_seconds = 10",
+        );
+        let err = parse(&toml).expect_err("max_pending_seconds < idle_seconds must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("finalize.max_pending_seconds"), "{msg}");
+        assert!(msg.contains("idle_seconds"), "{msg}");
+    }
+
+    #[test]
+    fn max_pending_seconds_equal_to_idle_is_accepted() {
+        let mut toml = full_toml();
+        toml = toml.replace(
+            "[finalize]\nidle_seconds = 30\ntick_seconds = 5",
+            "[finalize]\nidle_seconds = 30\ntick_seconds = 5\nmax_pending_seconds = 30",
+        );
+        let cfg = parse(&toml).expect("== boundary must pass");
+        assert_eq!(cfg.finalize.max_pending_seconds, 30);
     }
 
     #[test]

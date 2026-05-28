@@ -155,6 +155,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         storage_for_finalize,
         config.finalize.idle_seconds,
         config.finalize.tick_seconds,
+        config.finalize.max_pending_seconds,
     ));
 
     // Retention sweeper. Same shared `Storage`; ticks once per

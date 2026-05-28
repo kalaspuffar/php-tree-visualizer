@@ -22,6 +22,18 @@ pub use error::StorageError;
 
 pub use aggregate::AggregateOutcome;
 
+/// One row from [`Storage::list_idle_active_traces`]. The
+/// finalize loop uses `pending_count` and `last_batch_at_ns` to
+/// decide between a clean finalize, a force-finalize at the
+/// `max_pending_seconds` cap, or deferring the trace to a future
+/// tick (when its pending backlog might still resolve).
+#[derive(Debug, Clone)]
+pub struct IdleCandidate {
+    pub trace_key: TraceKey,
+    pub pending_count: u32,
+    pub last_batch_at_ns: i64,
+}
+
 /// Counters surfaced by `Storage::finalize_trace`. The finalize loop
 /// reads these to write its `finalized trace …` log line; tests read
 /// them to assert the per-trace DQ-1 / DQ-2 splits and the trace's
@@ -92,6 +104,13 @@ impl Storage {
     pub fn open(data_dir: &Path, traces_dir: PathBuf) -> Result<Self, StorageError> {
         let index_path = data_dir.join("index.sqlite");
         let index_conn = open_connection(&index_path, schema::INDEX_SCHEMA)?;
+        // Additive index-schema migration: the `pending_count`
+        // column was added in the `finalize-defers-on-pending`
+        // change. user_version stays at 1; on a fresh DB the
+        // column is in INDEX_SCHEMA already; on an existing DB
+        // from an earlier build, ALTER TABLE adds it with default
+        // 0. Idempotent.
+        migrate_index_schema(&index_conn, &index_path)?;
         Ok(Self {
             index_conn,
             trace_conns: HashMap::new(),
@@ -233,18 +252,19 @@ impl Storage {
         tx.execute(
             UPSERT_TRACE_SQL,
             params![
-                key.as_str(),                // ?1 trace_key
-                &meta.trace_id,              // ?2 trace_id
-                &meta.host,                  // ?3 host
-                meta.pid as i64,             // ?4 pid (sqlite INTEGER is i64)
-                meta.start_time,             // ?5 start_time_ns
-                &meta.sapi,                  // ?6 sapi
-                &meta.uri_or_script,         // ?7 uri_or_script
-                received_at_ns,              // ?8 first_batch_at_ns / last_batch_at_ns
-                call_count,                  // ?9 call_count delta
-                total_wall_delta,            // ?10 total_wall_ns delta
-                meta.dropped_records as i64, // ?11 dropped_records
-                anomalies_delta,             // ?12 anomaly_count delta
+                key.as_str(),                 // ?1 trace_key
+                &meta.trace_id,               // ?2 trace_id
+                &meta.host,                   // ?3 host
+                meta.pid as i64,              // ?4 pid (sqlite INTEGER is i64)
+                meta.start_time,              // ?5 start_time_ns
+                &meta.sapi,                   // ?6 sapi
+                &meta.uri_or_script,          // ?7 uri_or_script
+                received_at_ns,               // ?8 first_batch_at_ns / last_batch_at_ns
+                call_count,                   // ?9 call_count delta
+                total_wall_delta,             // ?10 total_wall_ns delta
+                meta.dropped_records as i64,  // ?11 dropped_records
+                anomalies_delta,              // ?12 anomaly_count delta
+                outcome.pending_total as i64, // ?13 pending_count (absolute)
             ],
         )
         .map_err(|e| StorageError::Query {
@@ -302,19 +322,20 @@ impl Storage {
     }
 
     /// List every `'active'` trace whose `last_batch_at_ns` precedes
-    /// `cutoff_ns`. Used by the idle-finalize loop; backed by the
-    /// covering index `idx_traces_state_lastbatch` (per
-    /// `SPECIFICATION.md` §4.2). Returns owned `TraceKey`s so the
-    /// caller can then drive `finalize_trace` without holding the
-    /// statement's cursor across the per-trace work.
+    /// `cutoff_ns`, returning each as `(trace_key, pending_count,
+    /// last_batch_at_ns)`. Used by the idle-finalize loop, which
+    /// applies the two-cutoff decision (clean / force / defer) in
+    /// Rust from these columns without opening any per-trace SQLite
+    /// — see the `finalize-defers-on-pending` capability change.
+    /// Backed by `idx_traces_state_lastbatch`.
     pub fn list_idle_active_traces(
         &mut self,
         cutoff_ns: i64,
-    ) -> Result<Vec<TraceKey>, StorageError> {
+    ) -> Result<Vec<IdleCandidate>, StorageError> {
         let mut stmt = self
             .index_conn
             .prepare_cached(
-                "SELECT trace_key FROM traces \
+                "SELECT trace_key, pending_count, last_batch_at_ns FROM traces \
                  WHERE state = 'active' AND last_batch_at_ns < ?1",
             )
             .map_err(|e| StorageError::Query {
@@ -322,20 +343,30 @@ impl Storage {
                 source: e,
             })?;
         let rows = stmt
-            .query_map(params![cutoff_ns], |row| row.get::<_, String>(0))
+            .query_map(params![cutoff_ns], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
             .map_err(|e| StorageError::Query {
                 context: "query list_idle_active_traces",
                 source: e,
             })?;
-        let mut keys = Vec::new();
+        let mut out = Vec::new();
         for row in rows {
-            let raw = row.map_err(|e| StorageError::Query {
+            let (key, pending_count, last_batch_at_ns) = row.map_err(|e| StorageError::Query {
                 context: "iterate list_idle_active_traces",
                 source: e,
             })?;
-            keys.push(TraceKey::from_raw(&raw));
+            out.push(IdleCandidate {
+                trace_key: TraceKey::from_raw(&key),
+                pending_count,
+                last_batch_at_ns,
+            });
         }
-        Ok(keys)
+        Ok(out)
     }
 
     /// List every trace whose `start_time_ns` precedes `cutoff_ns`,
@@ -494,7 +525,8 @@ impl Storage {
             "UPDATE traces \
              SET state = 'finalized', \
                  anomaly_count = ?1, \
-                 cpu_snapshot_available = ?2 \
+                 cpu_snapshot_available = ?2, \
+                 pending_count = 0 \
              WHERE trace_key = ?3",
             params![
                 absolute_anomaly_count,
@@ -776,6 +808,46 @@ fn compute_cpu_snapshot_available(tx: &Connection) -> Result<bool, StorageError>
     Ok(any_cpu != 0)
 }
 
+/// Additive migrations for `index.sqlite`'s `traces` table that
+/// keep `user_version` at `1`. Each migration step is idempotent:
+/// it checks for the presence of the new column and only runs
+/// `ALTER TABLE` when it's missing. A no-op on a freshly-created
+/// DB (the column was created with the table) and on a
+/// previously-migrated one.
+fn migrate_index_schema(conn: &Connection, path: &Path) -> Result<(), StorageError> {
+    if !column_exists(conn, "traces", "pending_count").map_err(|source| StorageError::Open {
+        path: path.to_path_buf(),
+        source,
+    })? {
+        conn.execute(
+            "ALTER TABLE traces ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|source| StorageError::SchemaApply {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// `PRAGMA table_info(<table>)` returns one row per column; the
+/// second column is the column name. We don't quote the table name
+/// because the caller passes a static identifier (no SQL injection
+/// surface).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Open a SQLite file, apply pragmas, run the schema-version
 /// gate. Used for both index.sqlite and per-trace databases.
 fn open_connection(path: &Path, schema_sql: &str) -> Result<Connection, StorageError> {
@@ -840,12 +912,12 @@ INSERT INTO traces (
   trace_key, trace_id, host, pid, start_time_ns, sapi, uri_or_script,
   state, first_batch_at_ns, last_batch_at_ns,
   batch_count, call_count, total_wall_ns, dropped_records,
-  anomaly_count, cpu_snapshot_available
+  anomaly_count, cpu_snapshot_available, pending_count
 ) VALUES (
   ?1, ?2, ?3, ?4, ?5, ?6, ?7,
   'active', ?8, ?8,
   1, ?9, ?10, ?11,
-  ?12, 1
+  ?12, 1, ?13
 )
 ON CONFLICT(trace_key) DO UPDATE SET
   batch_count       = traces.batch_count + 1,
@@ -854,6 +926,12 @@ ON CONFLICT(trace_key) DO UPDATE SET
   last_batch_at_ns  = excluded.last_batch_at_ns,
   dropped_records   = excluded.dropped_records,
   anomaly_count     = traces.anomaly_count + excluded.anomaly_count,
+  -- pending_count is ABSOLUTE, not a delta: set it to the current
+  -- per-trace pending_calls row count. Self-healing under a
+  -- per-trace-committed-but-index-not crash window because the
+  -- next successful record_batch overwrites with a fresh count
+  -- rather than accumulating.
+  pending_count     = excluded.pending_count,
   -- A batch for a previously-finalized trace flips it back to active.
   -- The per-trace `trace_meta` mirror is INSERT OR REPLACE'd to
   -- 'active' on the same code path, keeping the two databases in
@@ -942,6 +1020,70 @@ mod tests {
     }
 
     // ---- open path ----
+
+    #[test]
+    fn pending_count_column_is_added_to_a_pre_change_index_sqlite() {
+        // Simulate an index.sqlite created by an earlier build that
+        // didn't have `pending_count`: build the traces table with
+        // the pre-change column set, set user_version = 1, then
+        // open via Storage::open and verify the additive migration
+        // ran (column now present, user_version still 1, existing
+        // rows have pending_count = 0). A second open is a no-op.
+        let dir = unique_dir("pending_count_migration");
+        // Pre-populate index.sqlite with the OLD schema (no pending_count).
+        {
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE traces (
+                   trace_key            TEXT    PRIMARY KEY,
+                   trace_id             TEXT    NOT NULL,
+                   host                 TEXT    NOT NULL,
+                   pid                  INTEGER NOT NULL,
+                   start_time_ns        INTEGER NOT NULL,
+                   sapi                 TEXT    NOT NULL CHECK (sapi IN ('cli','fpm-fcgi')),
+                   uri_or_script        TEXT    NOT NULL,
+                   state                TEXT    NOT NULL DEFAULT 'active',
+                   first_batch_at_ns    INTEGER NOT NULL,
+                   last_batch_at_ns     INTEGER NOT NULL,
+                   batch_count          INTEGER NOT NULL DEFAULT 0,
+                   call_count           INTEGER NOT NULL DEFAULT 0,
+                   total_wall_ns        INTEGER NOT NULL DEFAULT 0,
+                   dropped_records      INTEGER NOT NULL DEFAULT 0,
+                   anomaly_count        INTEGER NOT NULL DEFAULT 0,
+                   cpu_snapshot_available INTEGER NOT NULL DEFAULT 1
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO traces (trace_key,trace_id,host,pid,start_time_ns,sapi,uri_or_script,first_batch_at_ns,last_batch_at_ns)\
+                 VALUES ('11111111111111111111111111111111','00000000-0000-0000-0000-000000000000','h',1,1,'cli','x',1,1)",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+        }
+
+        // First open: must run the additive migration.
+        let storage = Storage::open(&dir, dir.join("traces")).expect("first open + migration");
+        assert!(super::column_exists(&storage.index_conn, "traces", "pending_count").unwrap());
+        let v: i64 = storage
+            .index_conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1, "user_version stays at 1");
+        let pc: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT pending_count FROM traces WHERE trace_key='11111111111111111111111111111111'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pc, 0, "existing rows default to pending_count = 0");
+        drop(storage);
+
+        // Second open: idempotent — column already present, ALTER TABLE not re-run.
+        let _ = Storage::open(&dir, dir.join("traces")).expect("second open is idempotent");
+    }
 
     #[test]
     fn open_creates_index_sqlite_with_user_version_1() {
@@ -1849,6 +1991,59 @@ mod tests {
     }
 
     #[test]
+    fn pending_count_is_maintained_on_record_batch_and_zeroed_on_finalize() {
+        let dir = unique_dir("pending_count_maint");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("aaaabbbbccccddddeeeeffff00001122");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        // Batch A: two calls whose parent_call_id is unknown -> they
+        // park in pending_calls. fn=7 is in dict so no DQ-1 in-batch.
+        let b_a = batch_with(
+            vec![dict_entry(7, "f")],
+            vec![call(10, 999, 7, 100), call(11, 999, 7, 100)],
+            meta("h", 1, 1),
+        );
+        storage.record_batch(&sub, &b_a, 1_000).unwrap();
+        let pc: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT pending_count FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pc, 2, "two parked calls -> pending_count = 2");
+
+        // Batch B: introduces the missing parent. Drain resolves both.
+        let b_b = batch_with(vec![], vec![call(999, 0, 7, 50)], meta("h", 1, 1));
+        storage.record_batch(&sub, &b_b, 2_000).unwrap();
+        let pc: i64 = storage
+            .index_conn
+            .query_row(
+                "SELECT pending_count FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pc, 0, "backlog drained -> pending_count = 0");
+
+        // finalize_trace must also write pending_count = 0 (already 0
+        // here; assert it stays 0 alongside state = 'finalized').
+        storage.finalize_trace(&key, 3_000).unwrap();
+        let (state, pc): (String, i64) = storage
+            .index_conn
+            .query_row(
+                "SELECT state, pending_count FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "finalized");
+        assert_eq!(pc, 0);
+    }
+
+    #[test]
     fn list_idle_active_traces_returns_expected_keys() {
         let dir = unique_dir("list_idle");
         let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
@@ -1871,15 +2066,26 @@ mod tests {
 
         // Cutoff at 250 → k1 and k2 idle, k3 not.
         let idle = storage.list_idle_active_traces(250).unwrap();
-        let idle_strs: Vec<&str> = idle.iter().map(|k| k.as_str()).collect();
+        let idle_strs: Vec<&str> = idle.iter().map(|c| c.trace_key.as_str()).collect();
         assert_eq!(idle_strs.len(), 2);
         assert!(idle_strs.contains(&k1.as_str()));
         assert!(idle_strs.contains(&k2.as_str()));
+        // Each call here folded cleanly (parent=0, fn known), so
+        // pending_count is 0 for every candidate.
+        assert!(idle.iter().all(|c| c.pending_count == 0));
+        // last_batch_at_ns is the receipt timestamp we passed.
+        for c in &idle {
+            if c.trace_key == k1 {
+                assert_eq!(c.last_batch_at_ns, 100);
+            } else if c.trace_key == k2 {
+                assert_eq!(c.last_batch_at_ns, 200);
+            }
+        }
 
         // After finalising k1, the next call returns only k2.
         storage.finalize_trace(&k1, 250).unwrap();
         let idle = storage.list_idle_active_traces(250).unwrap();
-        let idle_strs: Vec<&str> = idle.iter().map(|k| k.as_str()).collect();
+        let idle_strs: Vec<&str> = idle.iter().map(|c| c.trace_key.as_str()).collect();
         assert_eq!(idle_strs, vec![k2.as_str()]);
     }
 

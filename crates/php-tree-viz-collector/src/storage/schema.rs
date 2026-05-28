@@ -29,7 +29,13 @@ CREATE TABLE IF NOT EXISTS traces (
   total_wall_ns        INTEGER NOT NULL DEFAULT 0,
   dropped_records      INTEGER NOT NULL DEFAULT 0,
   anomaly_count        INTEGER NOT NULL DEFAULT 0,
-  cpu_snapshot_available INTEGER NOT NULL DEFAULT 1
+  cpu_snapshot_available INTEGER NOT NULL DEFAULT 1,
+  -- Denormalised count of `pending_calls` rows on the per-trace
+  -- DB, written by record_batch / finalize_trace. Lets the
+  -- idle-finalize loop apply pending-aware deferral without
+  -- opening any per-trace SQLite per tick. See the
+  -- `finalize-defers-on-pending` capability change.
+  pending_count        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_traces_start_time      ON traces (start_time_ns DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_uri             ON traces (uri_or_script);
