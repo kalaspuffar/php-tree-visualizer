@@ -2505,22 +2505,33 @@ fn anomaly_count_on_traces_row_mirrors_per_trace_anomalies_e2e() {
 }
 
 #[test]
-fn consecutive_batches_with_anomalies_accumulate_the_counter() {
-    let dir = unique_tempdir("anom_accumulate");
+fn redelivered_batch_is_a_counter_noop_and_logs_redelivered() {
+    // Direct regression for the `idempotent-ingest` capability. The
+    // new php-analyze shipper is at-least-once: POSTing the same
+    // batch twice (e.g. retry under a slow ack) must be a counter
+    // no-op. The second delivery's calls are detected via their
+    // `call_id` in `call_to_node` (or `pending_calls`) and skipped:
+    // - no double-emitted DQ-3 anomaly,
+    // - no inflated `traces.call_count`,
+    // - the `batch accepted` log line carries `redelivered = N`.
+    //
+    // Pre-`idempotent-ingest` this test (under the name
+    // `consecutive_batches_with_anomalies_accumulate_the_counter`)
+    // asserted the OPPOSITE invariant — that the same body POSTed
+    // twice would inflate the counter to `2`. That was the e7bb
+    // double-count behaviour. Replaced here with the correct one.
+    let dir = unique_tempdir("redelivered_noop");
     let data_dir = dir.join("data");
     let path = write_config(&dir, "127.0.0.1:0");
     let collector = Collector::spawn(&path);
 
-    // Two DQ-3 batches against the same host → same trace_key →
-    // counter must sum. (Pre `tolerate-out-of-order-batches` this
-    // test used DQ-1 batches; those no longer write anomalies in-
-    // batch, so the accumulation invariant is exercised here with
-    // DQ-3 — which still emits its anomaly row immediately.)
+    // POST the SAME body twice — identical call_id, identical
+    // dict, identical trace_key.
     for _ in 0..2 {
-        let body = build_test_batch_with_inverted_time("anom-acc", 7, 7);
+        let body = build_test_batch_with_inverted_time("redelivered-noop", 7, 7);
         let req = ingest_request(&collector.bound, &body);
         let (status, _) = send_raw(&collector.bound, &req);
-        assert_eq!(status, 200);
+        assert_eq!(status, 200, "both deliveries must 200");
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -2534,11 +2545,16 @@ fn consecutive_batches_with_anomalies_accumulate_the_counter() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let n_index: i64 = open_index_db_ro(&data_dir)
-        .query_row("SELECT anomaly_count FROM traces", [], |r| r.get(0))
+    // Index counters: only the FIRST delivery contributed.
+    let (anom, calls): (i64, i64) = open_index_db_ro(&data_dir)
+        .query_row("SELECT anomaly_count, call_count FROM traces", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .unwrap();
-    assert_eq!(n_index, 2, "two batches, one anomaly each, total 2");
+    assert_eq!(anom, 1, "redelivered DQ-3 must not double-emit");
+    assert_eq!(calls, 1, "redelivered call must not inflate call_count");
 
+    // Per-trace anomalies table: still exactly one row.
     let trace_key: String = open_index_db_ro(&data_dir)
         .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
         .unwrap();
@@ -2546,7 +2562,26 @@ fn consecutive_batches_with_anomalies_accumulate_the_counter() {
     let n_per_trace: i64 = conn
         .query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n_per_trace, 2);
+    assert_eq!(n_per_trace, 1);
+
+    // `batch accepted` log line: the SECOND event carries
+    // `redelivered=1`; the first carries `redelivered=0`.
+    let stdout = collector.stdout_so_far.lock().unwrap().clone();
+    let accepted_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains(EVENT_BATCH_ACCEPTED))
+        .collect();
+    assert_eq!(accepted_lines.len(), 2);
+    assert!(
+        accepted_lines[0].contains("redelivered=0"),
+        "first delivery must log redelivered=0: {}",
+        accepted_lines[0]
+    );
+    assert!(
+        accepted_lines[1].contains("redelivered=1"),
+        "second delivery must log redelivered=1: {}",
+        accepted_lines[1]
+    );
 }
 
 #[test]

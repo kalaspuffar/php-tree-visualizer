@@ -107,6 +107,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
                                     pending = outcome.pending_total,
                                     dict_pending = outcome.dict_pending_added,
                                     anomalies = outcome.anomalies_added,
+                                    redelivered = outcome.redelivered_skipped,
                                     "batch accepted"
                                 );
                             }

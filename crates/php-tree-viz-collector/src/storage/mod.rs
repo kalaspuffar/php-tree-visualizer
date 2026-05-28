@@ -140,28 +140,21 @@ impl Storage {
         let key = &submission.trace_key;
         let meta = &batch.meta;
 
-        // Sum per-batch wall ns. Clamp each call's delta to ≥ 0
-        // so a DQ-3 Call (t_out < t_in) doesn't *decrease* the
-        // running `traces.total_wall_ns`. The raw t_in / t_out
-        // values still flow through to aggregate_calls, which
-        // writes the inverted_time anomaly row with the original
-        // (signed) values in `detail`.
+        // The `call_count` and `total_wall_ns` index deltas are
+        // computed inside `aggregate_calls` and surfaced via
+        // `outcome.call_count_delta` / `outcome.total_wall_ns_delta`.
+        // They cover the **new-call subset only** — calls whose
+        // `call_id` is already in `call_to_node` or `pending_calls`
+        // are skipped per the `idempotent-ingest` capability, so a
+        // redelivered batch contributes 0 to both. Clamping is
+        // applied per-call inside the loop (`.max(0)`), preserving
+        // DI-3 for DQ-3 inverted-time calls.
         //
-        // The trace-level wall counter is computed from
-        // `batch.calls` directly — *not* from whichever subset of
-        // calls actually folded into `nodes` this batch. A call
-        // parked in `pending_calls` (because its parent or its
-        // `fn_id`'s defining `DictEntry` is in a still-to-arrive
-        // batch) contributes its wall to `traces.total_wall_ns`
-        // immediately, matching the eventual folded outcome. This
-        // keeps `total_wall_ns` independent of arrival order; the
-        // `tolerate-out-of-order-batches` change relies on this.
-        let call_count = batch.calls.len() as i64;
-        let total_wall_delta: i64 = batch
-            .calls
-            .iter()
-            .map(|c| c.t_out.saturating_sub(c.t_in).max(0))
-            .sum();
+        // Out-of-order arrival still works as before
+        // (`tolerate-out-of-order-batches`): a call parked into
+        // `pending_calls` does count toward `call_count_delta` and
+        // `total_wall_ns_delta` immediately, matching the eventual
+        // folded outcome.
 
         // ---- per-trace SQLite (runs first so its outcome feeds
         //      the index update with the actual anomaly count) ----
@@ -252,19 +245,19 @@ impl Storage {
         tx.execute(
             UPSERT_TRACE_SQL,
             params![
-                key.as_str(),                 // ?1 trace_key
-                &meta.trace_id,               // ?2 trace_id
-                &meta.host,                   // ?3 host
-                meta.pid as i64,              // ?4 pid (sqlite INTEGER is i64)
-                meta.start_time,              // ?5 start_time_ns
-                &meta.sapi,                   // ?6 sapi
-                &meta.uri_or_script,          // ?7 uri_or_script
-                received_at_ns,               // ?8 first_batch_at_ns / last_batch_at_ns
-                call_count,                   // ?9 call_count delta
-                total_wall_delta,             // ?10 total_wall_ns delta
-                meta.dropped_records as i64,  // ?11 dropped_records
-                anomalies_delta,              // ?12 anomaly_count delta
-                outcome.pending_total as i64, // ?13 pending_count (absolute)
+                key.as_str(),                    // ?1 trace_key
+                &meta.trace_id,                  // ?2 trace_id
+                &meta.host,                      // ?3 host
+                meta.pid as i64,                 // ?4 pid (sqlite INTEGER is i64)
+                meta.start_time,                 // ?5 start_time_ns
+                &meta.sapi,                      // ?6 sapi
+                &meta.uri_or_script,             // ?7 uri_or_script
+                received_at_ns,                  // ?8 first_batch_at_ns / last_batch_at_ns
+                outcome.call_count_delta as i64, // ?9 call_count delta (new calls only)
+                outcome.total_wall_ns_delta,     // ?10 total_wall_ns delta (new calls only)
+                meta.dropped_records as i64,     // ?11 dropped_records
+                anomalies_delta,                 // ?12 anomaly_count delta
+                outcome.pending_total as i64,    // ?13 pending_count (absolute)
             ],
         )
         .map_err(|e| StorageError::Query {
@@ -2041,6 +2034,74 @@ mod tests {
             .unwrap();
         assert_eq!(state, "finalized");
         assert_eq!(pc, 0);
+    }
+
+    #[test]
+    fn redelivered_batch_does_not_inflate_call_count_or_total_wall() {
+        // The e7bb regression: at-least-once delivery POSTs the same
+        // batch twice. The collector must be idempotent against
+        // `call_id` redelivery — `traces.call_count` and
+        // `traces.total_wall_ns` accumulate over genuinely-new calls
+        // only. `batch_count` keeps its semantics (it's a
+        // wire-delivery counter; redelivery does count).
+        let dir = unique_dir("redelivered_noop");
+        let mut storage = Storage::open(&dir, dir.join("traces")).unwrap();
+        let key = TraceKey::from_raw("ddddddddddddddddddddddddddddddee");
+        let sub = dummy_submission(&key, &dir.join("traces"));
+
+        let b = batch_with(
+            vec![dict_entry(7, "f")],
+            vec![call(1, 0, 7, 100), call(2, 0, 7, 200), call(3, 0, 7, 50)],
+            meta("h", 1, 1),
+        );
+
+        // First delivery: all 3 calls fold.
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+        let (cc, tw, bc, pc): (i64, i64, i64, i64) = storage
+            .index_conn
+            .query_row(
+                "SELECT call_count, total_wall_ns, batch_count, pending_count \
+                 FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cc, 3);
+        assert_eq!(tw, 350);
+        assert_eq!(bc, 1);
+        assert_eq!(pc, 0);
+
+        // Same batch again — every call is in call_to_node now;
+        // counter deltas are 0; batch_count goes 1 -> 2.
+        storage.record_batch(&sub, &b, 2_000).unwrap();
+        let (cc, tw, bc, pc): (i64, i64, i64, i64) = storage
+            .index_conn
+            .query_row(
+                "SELECT call_count, total_wall_ns, batch_count, pending_count \
+                 FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cc, 3, "redelivery must not inflate call_count");
+        assert_eq!(tw, 350, "redelivery must not inflate total_wall_ns");
+        assert_eq!(bc, 2, "batch_count is a wire-delivery counter; +1");
+        assert_eq!(pc, 0);
+
+        // Per-trace nodes row: still call_count=1 (3 sibling calls
+        // collapsed into one bucket via BR-1), unchanged by the
+        // redelivery.
+        let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
+        let conn = Connection::open(&trace_path).unwrap();
+        let (ncalls, nwall): (i64, i64) = conn
+            .query_row(
+                "SELECT call_count, total_wall_ns FROM nodes WHERE fn_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ncalls, 3, "node call_count unchanged after redelivery");
+        assert_eq!(nwall, 350, "node total_wall_ns unchanged after redelivery");
     }
 
     #[test]
