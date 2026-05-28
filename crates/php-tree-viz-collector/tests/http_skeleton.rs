@@ -2871,6 +2871,7 @@ fn idle_finalize_marks_active_trace_as_finalized() {
     let collector = Collector::spawn(&path);
 
     let body = build_test_batch_with_chain("finalize-basic", 1, 1);
+    let body_len = body.len() as u64;
     let req = ingest_request(&collector.bound, &body);
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
@@ -2889,6 +2890,23 @@ fn idle_finalize_marks_active_trace_as_finalized() {
     assert!(
         line.contains("force=false"),
         "clean finalize must log force=false: {line}"
+    );
+    // `cleanup-raw-after-finalize`: clean finalize removes
+    // `<key>.raw/`. The single POSTed batch's body length is exactly
+    // what landed under `batch-0001.msgpack`, so `raw_bytes_freed`
+    // must match it.
+    assert!(
+        line.contains(&format!("raw_bytes_freed={body_len}")),
+        "expected raw_bytes_freed={body_len} in: {line}"
+    );
+    // And the raw directory must be gone after the event fires.
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let raw_dir = data_dir.join("traces").join(format!("{trace_key}.raw"));
+    assert!(
+        !raw_dir.exists(),
+        "raw directory must be removed by clean finalize: {raw_dir:?}"
     );
 }
 
