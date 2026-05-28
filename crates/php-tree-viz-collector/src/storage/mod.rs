@@ -58,6 +58,14 @@ pub struct FinalizeOutcome {
     /// configured with `cpu_snapshot_mode = off`, or every Call was
     /// sub-µs). Drives the UI's "CPU unavailable" mode per F-6.9.
     pub cpu_snapshot_available: bool,
+    /// On clean finalize (`force == false`), the size in bytes of
+    /// `<traces_dir>/<key>.raw/` as observed immediately before the
+    /// unlink. Zero if the directory was already absent. On force
+    /// finalize (`force == true`), always zero — raw is retained for
+    /// forensic re-decode and this call did not free any bytes.
+    ///
+    /// Per the `cleanup-raw-after-finalize` capability change.
+    pub raw_bytes_freed: u64,
 }
 
 /// Counters surfaced by `Storage::delete_trace`. The retention loop
@@ -407,10 +415,25 @@ impl Storage {
     ///
     /// `now_ns` is accepted for forward compatibility (e.g. recording
     /// a finalize timestamp later) but is unused in this slice.
+    ///
+    /// `force` distinguishes the two finalize categories the loop
+    /// emits (`finalize-defers-on-pending`): `false` means a clean
+    /// finalize (the trace genuinely went idle with `pending_calls`
+    /// already drained), `true` means a force finalize (residual
+    /// pending lingered past the hard cap and was just turned into
+    /// DQ-1/DQ-2 anomalies). When `force == false` the per-trace
+    /// `<traces_dir>/<key>.raw/` directory is removed after both
+    /// SQLite transactions commit and `FinalizeOutcome.raw_bytes_freed`
+    /// reports the bytes reclaimed. When `force == true`, raw is
+    /// preserved for forensic re-decode and `raw_bytes_freed` is
+    /// always zero. Per the `cleanup-raw-after-finalize` capability
+    /// change (overrides `SPECIFICATION.md` Q-6 / AD-4 / R-7 for the
+    /// clean-finalize case only).
     pub fn finalize_trace(
         &mut self,
         key: &TraceKey,
         _now_ns: i64,
+        force: bool,
     ) -> Result<FinalizeOutcome, StorageError> {
         let trace_conn = self.ensure_trace_conn(key)?;
         let tx = trace_conn.transaction().map_err(|e| StorageError::Query {
@@ -543,10 +566,32 @@ impl Storage {
         // configured cap.
         self.trace_conns.remove(key);
 
+        // ---- Clean-finalize raw cleanup (cleanup-raw-after-finalize) ----
+        //
+        // Runs strictly AFTER both SQLite commits: if this filesystem
+        // step fails, the trace is still durably finalized in both
+        // DBs and the retention sweeper will eventually prune the raw
+        // alongside the SQLite trio. The reverse order would risk
+        // raw-gone + finalize-failed + trace-still-active, with no
+        // mechanism to find the orphan.
+        //
+        // Force finalize preserves raw for forensic re-decode — the
+        // trace failed the "clean" criterion and the operator may
+        // want to inspect the wire-level bytes.
+        let raw_bytes_freed = if force {
+            0
+        } else {
+            let raw_dir = self.traces_dir.join(format!("{}.raw", key.as_str()));
+            let bytes = directory_size_bytes(&raw_dir)?;
+            remove_dir_all_idempotent(&raw_dir)?;
+            bytes
+        };
+
         Ok(FinalizeOutcome {
             pending_dq1,
             pending_dq2,
             cpu_snapshot_available: cpu_available,
+            raw_bytes_freed,
         })
     }
 
@@ -1435,7 +1480,7 @@ mod tests {
 
         // Drive finalize to confirm DQ-1 emission now and that the
         // invariant continues to hold post-finalize.
-        let outcome = storage.finalize_trace(&key, 3_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 3_000, true).unwrap();
         assert_eq!(outcome.pending_dq1, 3, "three unknown-fn calls → 3 DQ-1");
         assert_eq!(outcome.pending_dq2, 0);
         let n_index3: i64 = storage
@@ -1493,7 +1538,7 @@ mod tests {
         );
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
-        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
         assert_eq!(outcome.pending_dq2, 1);
 
         let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
@@ -1531,7 +1576,7 @@ mod tests {
         );
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
-        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
         assert!(!outcome.cpu_snapshot_available);
 
         // Mirrored in both databases.
@@ -1569,7 +1614,7 @@ mod tests {
         );
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
-        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
         assert!(outcome.cpu_snapshot_available);
 
         let cpu_index: i64 = storage
@@ -1617,7 +1662,7 @@ mod tests {
             .unwrap();
         assert_eq!(state_before, "active");
 
-        storage.finalize_trace(&key, 2_000).unwrap();
+        storage.finalize_trace(&key, 2_000, true).unwrap();
 
         let state_after: String = storage
             .index_conn
@@ -1655,7 +1700,7 @@ mod tests {
             "record_batch caches the per-trace conn"
         );
 
-        storage.finalize_trace(&key, 2_000).unwrap();
+        storage.finalize_trace(&key, 2_000, true).unwrap();
         assert!(
             !storage.has_cached_trace_conn(&key),
             "finalize_trace evicts the per-trace conn"
@@ -1727,7 +1772,7 @@ mod tests {
         //   - call_id=10: fn=99 ∉ dict → DQ-1
         //   - call_id=20: fn=7 ∈ dict, parent=999 ∉ call_to_node → DQ-2
         //   - call_id=21: fn=7 ∈ dict, parent=999 ∉ call_to_node → DQ-2
-        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
         assert_eq!(outcome.pending_dq1, 1);
         assert_eq!(outcome.pending_dq2, 2);
 
@@ -1798,7 +1843,7 @@ mod tests {
         );
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
-        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
         assert_eq!(outcome.pending_dq1, 2);
         assert_eq!(outcome.pending_dq2, 3);
 
@@ -1845,7 +1890,7 @@ mod tests {
         );
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
-        let outcome = storage.finalize_trace(&key, 2_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
         assert_eq!(outcome.pending_dq1, 1);
         assert_eq!(outcome.pending_dq2, 0);
 
@@ -1874,7 +1919,7 @@ mod tests {
             meta("late-host", 1, 1),
         );
         storage.record_batch(&sub, &b1, 1_000).unwrap();
-        storage.finalize_trace(&key, 2_000).unwrap();
+        storage.finalize_trace(&key, 2_000, true).unwrap();
 
         // Confirm finalize landed.
         let s: String = storage
@@ -1937,7 +1982,7 @@ mod tests {
         storage.record_batch(&sub, &b, 1_000).unwrap();
 
         // First finalize: lands DQ-2 + commits both databases.
-        storage.finalize_trace(&key, 2_000).unwrap();
+        storage.finalize_trace(&key, 2_000, true).unwrap();
 
         // Roll the index back to make it look like the index update
         // never committed (simulating the crash window).
@@ -1960,7 +2005,7 @@ mod tests {
 
         // Retry. pending_calls is already empty, so no new DQ-2 rows
         // should be written. The retry should reconcile the index.
-        let outcome = storage.finalize_trace(&key, 3_000).unwrap();
+        let outcome = storage.finalize_trace(&key, 3_000, true).unwrap();
         assert_eq!(outcome.pending_dq2, 0, "no new DQ-2 inserts on retry");
 
         let n_anom_after_retry: i64 = ro
@@ -2023,7 +2068,7 @@ mod tests {
 
         // finalize_trace must also write pending_count = 0 (already 0
         // here; assert it stays 0 alongside state = 'finalized').
-        storage.finalize_trace(&key, 3_000).unwrap();
+        storage.finalize_trace(&key, 3_000, true).unwrap();
         let (state, pc): (String, i64) = storage
             .index_conn
             .query_row(
@@ -2144,10 +2189,189 @@ mod tests {
         }
 
         // After finalising k1, the next call returns only k2.
-        storage.finalize_trace(&k1, 250).unwrap();
+        storage.finalize_trace(&k1, 250, true).unwrap();
         let idle = storage.list_idle_active_traces(250).unwrap();
         let idle_strs: Vec<&str> = idle.iter().map(|c| c.trace_key.as_str()).collect();
         assert_eq!(idle_strs, vec![k2.as_str()]);
+    }
+
+    // ---- finalize_trace: cleanup-raw-after-finalize ----
+
+    #[test]
+    fn clean_finalize_removes_raw_directory_and_reports_bytes() {
+        let dir = unique_dir("clean_finalize_raw");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = TraceKey::from_raw("cf00000000000000000000000000cf01");
+        let sub = dummy_submission(&key, &traces_dir);
+
+        // Two well-formed calls — no pending residuals at finalize, so
+        // the loop would emit force = false.
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(10, 0, 7, 100), call(11, 10, 7, 50)],
+            meta("clean-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        // `record_batch` does not create `<key>.raw/` (that's the http
+        // layer's job in production). Fabricate it with two files of
+        // known size so the byte-count assertion is exact.
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        std::fs::write(raw_dir.join("batch-0001.msgpack"), vec![0u8; 256]).unwrap();
+        std::fs::write(raw_dir.join("batch-0002.msgpack"), vec![0u8; 384]).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000, false).unwrap();
+
+        assert_eq!(outcome.raw_bytes_freed, 640, "256 + 384 = 640");
+        assert!(!raw_dir.exists(), "raw directory removed on clean finalize");
+        let sqlite_path = traces_dir.join(format!("{}.sqlite", key.as_str()));
+        assert!(sqlite_path.is_file(), "per-trace sqlite still present");
+    }
+
+    #[test]
+    fn force_finalize_preserves_raw_directory_and_reports_zero() {
+        let dir = unique_dir("force_finalize_raw");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = TraceKey::from_raw("ff00000000000000000000000000ff01");
+        let sub = dummy_submission(&key, &traces_dir);
+
+        // Pending residual: a call whose parent never arrives so it
+        // sits in pending_calls past the hard cap. Force-finalize is
+        // what the production loop calls in this state.
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(42, 999, 7, 100)],
+            meta("force-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        std::fs::write(raw_dir.join("batch-0001.msgpack"), vec![0u8; 200]).unwrap();
+
+        let outcome = storage.finalize_trace(&key, 2_000, true).unwrap();
+
+        assert_eq!(
+            outcome.raw_bytes_freed, 0,
+            "force finalize must not report any bytes freed"
+        );
+        assert!(
+            raw_dir.is_dir(),
+            "raw directory preserved on force finalize"
+        );
+        let raw_file_size = std::fs::metadata(raw_dir.join("batch-0001.msgpack"))
+            .unwrap()
+            .len();
+        assert_eq!(raw_file_size, 200, "raw file untouched on force finalize");
+        // Sanity: the trace really did finalize in both DBs.
+        let index_state: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_state, "finalized");
+    }
+
+    #[test]
+    fn clean_finalize_when_raw_directory_already_absent_succeeds_with_zero_bytes() {
+        let dir = unique_dir("clean_finalize_no_raw");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = TraceKey::from_raw("cf00000000000000000000000000cf02");
+        let sub = dummy_submission(&key, &traces_dir);
+
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(10, 0, 7, 100)],
+            meta("no-raw-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        // The operator (or a previous half-completed finalize) already
+        // removed the raw directory. Clean finalize must tolerate this.
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+        assert!(
+            !raw_dir.exists(),
+            "raw never existed for this test (record_batch doesn't create it)"
+        );
+
+        let outcome = storage.finalize_trace(&key, 2_000, false).unwrap();
+        assert_eq!(outcome.raw_bytes_freed, 0, "no bytes to free");
+
+        let index_state: String = storage
+            .index_conn
+            .query_row(
+                "SELECT state FROM traces WHERE trace_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_state, "finalized");
+    }
+
+    #[test]
+    fn retry_after_clean_finalize_raw_unlink_lost_converges() {
+        let dir = unique_dir("clean_finalize_retry");
+        let traces_dir = dir.join("traces");
+        let mut storage = Storage::open(&dir, traces_dir.clone()).unwrap();
+        let key = TraceKey::from_raw("cf00000000000000000000000000cf03");
+        let sub = dummy_submission(&key, &traces_dir);
+
+        let b = batch_with(
+            vec![dict_entry(7, "ns\\seven")],
+            vec![call(10, 0, 7, 100)],
+            meta("retry-host", 1, 1),
+        );
+        storage.record_batch(&sub, &b, 1_000).unwrap();
+
+        let raw_dir = traces_dir.join(format!("{}.raw", key.as_str()));
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        std::fs::write(raw_dir.join("batch-0001.msgpack"), vec![0u8; 100]).unwrap();
+
+        // First clean finalize: removes raw, anomalies stable.
+        let outcome1 = storage.finalize_trace(&key, 2_000, false).unwrap();
+        assert_eq!(outcome1.raw_bytes_freed, 100);
+        assert!(!raw_dir.exists());
+        let anomalies_after_first: i64 = {
+            let trace_path = traces_dir.join(format!("{}.sqlite", key.as_str()));
+            let conn = Connection::open(&trace_path).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Simulate the half-state: a hypothetical first attempt
+        // crashed between SQLite commits and the raw unlink, leaving
+        // the directory behind. The trace is otherwise finalized.
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        std::fs::write(raw_dir.join("batch-0001.msgpack"), vec![0u8; 75]).unwrap();
+
+        // Retry: clean finalize on an already-finalized trace must
+        // re-attempt the raw cleanup and succeed.
+        let outcome2 = storage.finalize_trace(&key, 3_000, false).unwrap();
+        assert_eq!(
+            outcome2.raw_bytes_freed, 75,
+            "second attempt frees the recreated raw"
+        );
+        assert!(!raw_dir.exists(), "raw removed by retry");
+
+        // No new anomaly rows from the retry (pending_calls was
+        // already empty after the first attempt).
+        let anomalies_after_retry: i64 = {
+            let trace_path = traces_dir.join(format!("{}.sqlite", key.as_str()));
+            let conn = Connection::open(&trace_path).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM anomalies", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            anomalies_after_retry, anomalies_after_first,
+            "retry must not duplicate anomaly rows"
+        );
     }
 
     // ---- list_expired_traces ----
@@ -2612,7 +2836,7 @@ mod tests {
             storage.record_batch(&sub, &batches[i], t).unwrap();
             t += 1;
         }
-        storage.finalize_trace(&key, t + 1_000).unwrap();
+        storage.finalize_trace(&key, t + 1_000, true).unwrap();
 
         let trace_path = dir.join("traces").join(format!("{}.sqlite", key.as_str()));
         let conn = Connection::open(&trace_path).unwrap();

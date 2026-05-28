@@ -87,7 +87,7 @@ async fn run_one_tick(storage: &Mutex<Storage>, idle_nanos: i64, max_pending_nan
             continue;
         };
 
-        match storage.finalize_trace(&c.trace_key, now_ns) {
+        match storage.finalize_trace(&c.trace_key, now_ns, force) {
             Ok(outcome) => {
                 tracing::info!(
                     trace_key = %c.trace_key,
@@ -95,6 +95,7 @@ async fn run_one_tick(storage: &Mutex<Storage>, idle_nanos: i64, max_pending_nan
                     pending_dq1 = outcome.pending_dq1,
                     pending_dq2 = outcome.pending_dq2,
                     cpu_snapshot_available = outcome.cpu_snapshot_available,
+                    raw_bytes_freed = outcome.raw_bytes_freed,
                     "trace finalized"
                 );
             }
