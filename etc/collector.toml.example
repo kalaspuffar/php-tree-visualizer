@@ -21,6 +21,11 @@ retention_days = 30
 [finalize]
 idle_seconds = 30                  # trace marked finalized after this much silence
 tick_seconds = 5
+max_pending_seconds = 600          # hard cap before a trace with a non-empty pending
+                                   # backlog is force-finalised. Must be >= idle_seconds.
+                                   # Under out-of-order delivery, pending rows mean more
+                                   # batches are expected; the hard cap is the safety
+                                   # net for traces whose resolvers truly never arrive.
 
 [retention]
 tick_minutes = 60

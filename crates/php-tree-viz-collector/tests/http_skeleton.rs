@@ -65,9 +65,13 @@ fn write_config(dir: &Path, bind: &str) -> PathBuf {
 const TEXT_LOG_SECTION: &str = "\n[log]\nformat = \"text\"\n";
 
 /// Write a config with aggressive idle-finalize timings: `idle_seconds =
-/// 1, tick_seconds = 1`. Used by the finalize integration tests so the
-/// wait for "finalized trace …" is bounded by ~2 s + jitter instead of
-/// the 30 s default. Every other setting matches `write_config`.
+/// 1, tick_seconds = 1, max_pending_seconds = 1`. Used by the finalize
+/// integration tests so the wait for "finalized trace …" is bounded by
+/// ~2 s + jitter instead of the 30 s default. `max_pending_seconds = 1`
+/// also bounds the force-finalize path so tests that drive finalize on
+/// a pending backlog still complete fast (per
+/// `finalize-defers-on-pending`). Every other setting matches
+/// `write_config`.
 fn write_config_with_fast_finalize(dir: &Path, bind: &str) -> PathBuf {
     let data_dir = dir.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -86,6 +90,7 @@ retention_days = 30
 [finalize]
 idle_seconds = 1
 tick_seconds = 1
+max_pending_seconds = 1
 {TEXT_LOG_SECTION}"#,
         data_dir.display(),
     );
@@ -118,6 +123,7 @@ retention_days = {retention_days}
 [finalize]
 idle_seconds = 1
 tick_seconds = 1
+max_pending_seconds = 1
 
 [retention]
 tick_minutes = 60
@@ -1353,6 +1359,74 @@ fn build_test_batch_with_orphan_pending(host: &str, pid: u64, start_time: i64) -
             t_out: 100,
             cpu_u: 0, // every Call has zero CPU → cpu_snapshot_available=0
             cpu_s: 0,
+            mem_in: 0,
+            mem_out: 0,
+            abnormal_exit: false,
+        }],
+    })
+    .unwrap()
+}
+
+/// Companion to `build_test_batch_with_orphan_pending`: emits a
+/// batch under the SAME trace identity (host/pid/start_time) whose
+/// single Call is the parent that was missing — `call_id = 999`,
+/// `parent = 0`, fn 7 (already in `dict` from the parking batch).
+/// Used by the `finalize-defers-on-pending` regression test to
+/// drain the deferred backlog mid-flight.
+fn build_resolver_batch(host: &str, pid: u64, start_time: i64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct TestMeta<'a> {
+        schema_version: u32,
+        trace_id: &'a str,
+        host: &'a str,
+        pid: u64,
+        start_time: i64,
+        sapi: &'a str,
+        uri_or_script: &'a str,
+        dropped_records: u64,
+    }
+    #[derive(Serialize)]
+    struct TestCall {
+        call_id: u32,
+        parent: u32,
+        #[serde(rename = "fn")]
+        fn_id: u32,
+        depth: u32,
+        t_in: i64,
+        t_out: i64,
+        cpu_u: i64,
+        cpu_s: i64,
+        mem_in: i64,
+        mem_out: i64,
+        abnormal_exit: bool,
+    }
+    #[derive(Serialize)]
+    struct TestBatch<'a> {
+        meta: TestMeta<'a>,
+        dict: Vec<()>,
+        calls: Vec<TestCall>,
+    }
+    rmp_serde::to_vec_named(&TestBatch {
+        meta: TestMeta {
+            schema_version: 1,
+            trace_id: ALL_ZERO_TRACE_ID,
+            host,
+            pid,
+            start_time,
+            sapi: "cli",
+            uri_or_script: "/tmp/dq2.php",
+            dropped_records: 0,
+        },
+        dict: vec![],
+        calls: vec![TestCall {
+            call_id: 999,
+            parent: 0,
+            fn_id: 7,
+            depth: 1,
+            t_in: 0,
+            t_out: 200,
+            cpu_u: 1,
+            cpu_s: 1,
             mem_in: 0,
             mem_out: 0,
             abnormal_exit: false,
@@ -2766,12 +2840,21 @@ fn idle_finalize_marks_active_trace_as_finalized() {
     let (status, _) = send_raw(&collector.bound, &req);
     assert_eq!(status, 200);
     collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
-    collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
+    let stdout = collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(5));
 
     let state: String = open_index_db_ro(&data_dir)
         .query_row("SELECT state FROM traces", [], |r| r.get(0))
         .unwrap();
     assert_eq!(state, "finalized");
+    // Clean finalize path (pending_count was 0) — force=false.
+    let line = stdout
+        .lines()
+        .find(|l| l.contains(EVENT_TRACE_FINALIZED))
+        .expect("trace finalized event must be present");
+    assert!(
+        line.contains("force=false"),
+        "clean finalize must log force=false: {line}"
+    );
 }
 
 #[test]
@@ -2842,6 +2925,14 @@ fn idle_finalize_log_line_carries_pending_dq2_and_cpu_fields() {
     assert!(
         line.contains("cpu_snapshot_available=false"),
         "expected cpu_snapshot_available=false in: {line}"
+    );
+    // Per `finalize-defers-on-pending`: a trace with a non-empty
+    // pending backlog only finalises via the hard-cap force path.
+    // The fast-finalize config sets `max_pending_seconds = 1`, so
+    // this is the force-finalize path.
+    assert!(
+        line.contains("force=true"),
+        "force-finalize must log force=true: {line}"
     );
 }
 
@@ -2929,6 +3020,190 @@ fn late_batch_after_finalize_reactivates_state_e2e() {
         .query_row("SELECT state FROM trace_meta", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mirror_state, "active");
+}
+
+/// Write a config that exercises the pending-aware DEFERRAL: short
+/// idle window (so the trace becomes "idle past idle_seconds" quickly)
+/// but a longer `max_pending_seconds` window so the deferral is
+/// observable before the force-finalize cap fires. Used only by
+/// `idle_finalize_defers_trace_with_pending_then_force_finalizes`.
+fn write_config_with_deferral(dir: &Path, bind: &str) -> PathBuf {
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let body = format!(
+        r#"[server]
+bind = "{bind}"
+
+[auth]
+token = "{TOKEN}"
+session_salt = "{SALT}"
+
+[storage]
+data_dir = "{}"
+retention_days = 30
+
+[finalize]
+idle_seconds = 1
+tick_seconds = 1
+max_pending_seconds = 6
+{TEXT_LOG_SECTION}"#,
+        data_dir.display(),
+    );
+    let path = dir.join("collector.toml");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn idle_finalize_defers_trace_with_pending_then_force_finalizes() {
+    // Direct regression for the `finalize-defers-on-pending` change.
+    // A batch parks a Call (parent never observed) so `pending_count
+    // > 0`. With `idle_seconds = 1` the trace becomes "idle" almost
+    // immediately, but `max_pending_seconds = 6` defers the
+    // finalize: the trace SHALL stay 'active' beyond the idle window
+    // (no `trace finalized` event), and SHALL force-finalize once
+    // the hard cap fires, with the residual as DQ-2 and `force=true`.
+    let dir = unique_tempdir("idle_finalize_defer");
+    let data_dir = dir.join("data");
+    let path = write_config_with_deferral(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    let body = build_test_batch_with_orphan_pending("defer-host", 1, 1);
+    let req = ingest_request(&collector.bound, &body);
+    let (status, _) = send_raw(&collector.bound, &req);
+    assert_eq!(status, 200);
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
+
+    // Defer window: 3 s well past idle_seconds=1 but well inside
+    // max_pending_seconds=6. State MUST remain 'active'; no finalize
+    // event yet.
+    std::thread::sleep(Duration::from_secs(3));
+    let state: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT state FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        state, "active",
+        "trace with pending_count > 0 must defer past idle_seconds"
+    );
+    let stdout_so_far = collector.stdout_so_far.lock().unwrap().clone();
+    assert!(
+        !stdout_so_far.contains(EVENT_TRACE_FINALIZED),
+        "no trace finalized event must be emitted during the deferral window: {stdout_so_far}"
+    );
+
+    // After the hard cap fires, finalize lands with force=true and
+    // the residual pending becomes DQ-2.
+    let stdout = collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(15));
+    let state: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT state FROM traces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "finalized");
+    let line = stdout
+        .lines()
+        .find(|l| l.contains(EVENT_TRACE_FINALIZED))
+        .expect("trace finalized event must be present");
+    assert!(line.contains("force=true"), "expected force=true: {line}");
+    assert!(
+        line.contains("pending_dq2=1"),
+        "expected pending_dq2=1: {line}"
+    );
+}
+
+#[test]
+fn late_resolver_within_deferral_window_drains_pending_and_clean_finalises() {
+    // The full data-loss scenario that motivated
+    // `finalize-defers-on-pending`: under out-of-order delivery, a
+    // batch arrives whose Calls park (parent unseen). Before the
+    // hard cap fires, the resolving batch arrives and the drain
+    // resolves the backlog → pending_count drops to 0 → the next
+    // idle window produces a CLEAN finalize with zero anomalies and
+    // a fully-built tree. Pre-change, idle-finalize would have
+    // nuked the pending backlog after `idle_seconds` and the
+    // resolver could not recover it.
+    let dir = unique_tempdir("late_resolver");
+    let data_dir = dir.join("data");
+    let path = write_config_with_deferral(&dir, "127.0.0.1:0");
+    let collector = Collector::spawn(&path);
+
+    // Batch A: parks call 42 (parent=999 unseen).
+    let parking = build_test_batch_with_orphan_pending("late-resolver", 1, 1);
+    let (status, _) = send_raw(
+        &collector.bound,
+        &ingest_request(&collector.bound, &parking),
+    );
+    assert_eq!(status, 200);
+    collector.wait_for_stdout(EVENT_BATCH_ACCEPTED, Duration::from_secs(5));
+
+    // Sit inside the deferral window. idle_seconds = 1 has elapsed
+    // (so a pre-change collector would already have force-finalized
+    // with DQ-2); max_pending_seconds = 6 keeps us deferred.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Batch B: provides call 999 (parent=0) — drain resolves call
+    // 42 under call 999 → pending_count drops to 0.
+    let resolver = build_resolver_batch("late-resolver", 1, 1);
+    let (status, _) = send_raw(
+        &collector.bound,
+        &ingest_request(&collector.bound, &resolver),
+    );
+    assert_eq!(status, 200);
+    let initial_accepted = collector
+        .stdout_so_far
+        .lock()
+        .unwrap()
+        .matches(EVENT_BATCH_ACCEPTED)
+        .count();
+    // Wait until the second batch-accepted line has been emitted.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let n = collector
+            .stdout_so_far
+            .lock()
+            .unwrap()
+            .matches(EVENT_BATCH_ACCEPTED)
+            .count();
+        if n > initial_accepted {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The next idle window (idle_seconds = 1) finalises CLEANLY.
+    let stdout = collector.wait_for_stdout(EVENT_TRACE_FINALIZED, Duration::from_secs(15));
+    let line = stdout
+        .lines()
+        .find(|l| l.contains(EVENT_TRACE_FINALIZED))
+        .expect("trace finalized event must be present");
+    assert!(
+        line.contains("force=false"),
+        "drain landed before the hard cap — clean finalize expected: {line}"
+    );
+    assert!(line.contains("pending_dq1=0"), "no DQ-1 expected: {line}");
+    assert!(line.contains("pending_dq2=0"), "no DQ-2 expected: {line}");
+
+    // Tree must reflect both calls (999 under root, 42 under 999) →
+    // 2 non-root nodes, anomaly_count = 0, pending_count = 0.
+    let (anom, pc, ncalls): (i64, i64, i64) = open_index_db_ro(&data_dir)
+        .query_row(
+            "SELECT anomaly_count, pending_count, call_count FROM traces",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(anom, 0, "no anomalies after clean finalize");
+    assert_eq!(pc, 0, "pending_count must be 0 after finalize");
+    assert_eq!(ncalls, 2, "both Calls counted");
+
+    let trace_key: String = open_index_db_ro(&data_dir)
+        .query_row("SELECT trace_key FROM traces", [], |r| r.get(0))
+        .unwrap();
+    let conn = open_trace_db_ro(&data_dir, &trace_key);
+    let n_non_root: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes WHERE node_id != 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(n_non_root, 2, "tree fully built (root + 2 nodes)");
 }
 
 #[test]
